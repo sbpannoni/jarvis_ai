@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny stats agent for the RTX 5090 render worker (192.168.50.91).
+"""Tiny stats agent for a GPU render/worker machine.
 
 Serves JSON at http://0.0.0.0:8767/stats for the Jarvis HUD machines panel.
 
