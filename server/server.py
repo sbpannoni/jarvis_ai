@@ -293,6 +293,46 @@ class HermesAPI:
 # ==================================================================== Pipeline
 
 
+def _resample_pcm16(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Linear-interpolation resample of 16-bit mono PCM. Adequate quality
+    for speech; avoids adding scipy as a dependency for this one step."""
+    if src_rate == dst_rate or not pcm_bytes:
+        return pcm_bytes
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    duration = len(samples) / src_rate
+    dst_n = int(round(duration * dst_rate))
+    if dst_n <= 0:
+        return b""
+    src_idx = np.linspace(0, len(samples) - 1, num=dst_n)
+    resampled = np.interp(src_idx, np.arange(len(samples)), samples)
+    return resampled.astype(np.int16).tobytes()
+
+
+_PIPER_VOICE = None
+
+
+def _get_piper_voice():
+    global _PIPER_VOICE
+    if _PIPER_VOICE is None:
+        from piper import PiperVoice
+        model_path = os.environ.get(
+            "JARVIS_PIPER_MODEL", str(ROOT / "models" / "en_US-lessac-medium.onnx")
+        )
+        _PIPER_VOICE = PiperVoice.load(model_path)
+    return _PIPER_VOICE
+
+
+def _tts_piper_chunks(text: str) -> Iterator[bytes]:
+    """Local, free TTS via Piper, resampled to 16kHz mono to match the HUD's
+    hardcoded AudioContext sample rate (see hud/index.html). piper-tts's
+    synthesize() yields one AudioChunk per sentence (not raw per-callback
+    bytes) -- audio_int16_bytes on each chunk is the actual PCM16 payload."""
+    voice = _get_piper_voice()
+    src_rate = voice.config.sample_rate
+    for chunk in voice.synthesize(text):
+        yield _resample_pcm16(chunk.audio_int16_bytes, src_rate, 16000)
+
+
 class VoicePipelineServer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -431,45 +471,6 @@ class VoicePipelineServer:
                     yield (kind, value)
             else:
                 raise
-
-def _resample_pcm16(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
-    """Linear-interpolation resample of 16-bit mono PCM. Adequate quality
-    for speech; avoids adding scipy as a dependency for this one step."""
-    if src_rate == dst_rate or not pcm_bytes:
-        return pcm_bytes
-    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    duration = len(samples) / src_rate
-    dst_n = int(round(duration * dst_rate))
-    if dst_n <= 0:
-        return b""
-    src_idx = np.linspace(0, len(samples) - 1, num=dst_n)
-    resampled = np.interp(src_idx, np.arange(len(samples)), samples)
-    return resampled.astype(np.int16).tobytes()
-
-
-_PIPER_VOICE = None
-
-
-def _get_piper_voice():
-    global _PIPER_VOICE
-    if _PIPER_VOICE is None:
-        from piper import PiperVoice
-        model_path = os.environ.get(
-            "JARVIS_PIPER_MODEL", str(ROOT / "models" / "en_US-lessac-medium.onnx")
-        )
-        _PIPER_VOICE = PiperVoice.load(model_path)
-    return _PIPER_VOICE
-
-
-def _tts_piper_chunks(text: str) -> Iterator[bytes]:
-    """Local, free TTS via Piper, resampled to 16kHz mono to match the HUD's
-    hardcoded AudioContext sample rate (see hud/index.html). piper-tts's
-    synthesize() yields one AudioChunk per sentence (not raw per-callback
-    bytes) -- audio_int16_bytes on each chunk is the actual PCM16 payload."""
-    voice = _get_piper_voice()
-    src_rate = voice.config.sample_rate
-    for chunk in voice.synthesize(text):
-        yield _resample_pcm16(chunk.audio_int16_bytes, src_rate, 16000)
 
     # ------------------------------------------------------------------ TTS
 
