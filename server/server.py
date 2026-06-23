@@ -1044,6 +1044,48 @@ async def machines() -> JSONResponse:
     return JSONResponse({"machines": result})
 
 
+RACK_HEALTH_CACHE: dict = {"ts": 0.0, "data": {}}
+
+
+def _prometheus_query(prom_url: str, promql: str) -> list[dict]:
+    response = requests.get(f"{prom_url}/api/v1/query", params={"query": promql}, timeout=5)
+    response.raise_for_status()
+    body = response.json()
+    if body.get("status") != "success":
+        raise RuntimeError(f"Prometheus query failed: {body}")
+    return body["data"]["result"]
+
+
+@app.get("/api/rack_health")
+async def rack_health() -> JSONResponse:
+    """Custom glass-panel rack health, queried directly from Prometheus
+    (not a Grafana iframe) so the HUD owns the visual presentation."""
+    now = time.time()
+    if now - RACK_HEALTH_CACHE["ts"] < 10:
+        return JSONResponse(RACK_HEALTH_CACHE["data"])
+
+    rh_cfg = CFG.get("rack_health") or {}
+    prom_url = rh_cfg.get("prometheus_url", "http://192.168.1.157:9090")
+    queries = rh_cfg.get("queries") or {}
+
+    def fetch_all() -> dict:
+        out: dict = {}
+        for name, promql in queries.items():
+            try:
+                results = _prometheus_query(prom_url, promql)
+                out[name] = [
+                    {"labels": r["metric"], "value": float(r["value"][1])}
+                    for r in results
+                ]
+            except Exception as exc:
+                out[name] = {"error": str(exc)}
+        return out
+
+    data = await asyncio.to_thread(fetch_all)
+    RACK_HEALTH_CACHE.update(ts=now, data=data)
+    return JSONResponse(data)
+
+
 @app.get("/")
 async def root() -> RedirectResponse:
     return RedirectResponse("/hud/")

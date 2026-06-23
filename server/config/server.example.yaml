@@ -39,6 +39,14 @@ stt:
   #   token_env: JARVIS_HUD_TOKEN
   #   timeout: 6
 
+rack_health:                 # custom glass-panel rack health, queried directly
+                             # from Prometheus (not a Grafana iframe)
+  prometheus_url: http://192.168.1.157:9090
+  queries:
+    snarf_gpu_temp_c: 'nvidia_smi_temperature_gpu{instance="192.168.1.239:9835"}'
+    snarf_cpu_load1: 'node_load1{instance="192.168.1.239:9100"}'
+    beelink_cpu_load1: 'node_load1{instance="192.168.1.158:9100"}'
+
 machines:                   # polled by /api/machines for the HUD panel (optional)
   - name: "GPU WORKER"
     host: 192.168.1.50
