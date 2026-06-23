@@ -938,6 +938,10 @@ async def summon(request: Request) -> JSONResponse:
     return JSONResponse({"sent_to": sent})
 
 
+_HA_NAME_RE = re.compile(r'^[a-z0-9_]+$')
+_HA_ENTITY_RE = re.compile(r'^[a-z0-9_]+\.[a-z0-9_]+$')
+
+
 @app.post("/api/ha/call_service")
 async def ha_call_service(request: Request) -> JSONResponse:
     """Direct, deterministic Home Assistant control for dashboard UI clicks.
@@ -951,6 +955,11 @@ async def ha_call_service(request: Request) -> JSONResponse:
     service = body.get("service")
     if not domain or not service:
         return JSONResponse({"error": "domain and service are required"}, status_code=400)
+    if not _HA_NAME_RE.match(domain) or not _HA_NAME_RE.match(service):
+        return JSONResponse({"error": "domain and service must be lowercase alphanumeric/underscore"}, status_code=400)
+    entity_id = body.get("entity_id")
+    if entity_id and not _HA_ENTITY_RE.match(entity_id):
+        return JSONResponse({"error": "entity_id must match 'domain.object_id'"}, status_code=400)
 
     ha_cfg = CFG.get("homeassistant") or {}
     base_url = ha_cfg.get("base_url")

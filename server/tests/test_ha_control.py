@@ -48,3 +48,39 @@ def test_ha_call_service_posts_to_ha_rest_api(monkeypatch):
     assert captured["url"] == "http://ha.example/api/services/light/turn_on"
     assert captured["headers"]["Authorization"] == "Bearer test-token"
     assert captured["json"] == {"entity_id": "light.living_room"}
+
+
+def test_ha_call_service_rejects_path_traversal_domain(monkeypatch):
+    monkeypatch.setitem(srv.CFG, "homeassistant", {"base_url": "http://ha.example"})
+    monkeypatch.setenv("HASS_TOKEN", "test-token")
+    resp = client.post("/api/ha/call_service", json={
+        "domain": "../../etc/passwd", "service": "turn_on",
+    })
+    assert resp.status_code == 400
+
+
+def test_ha_call_service_rejects_path_traversal_service(monkeypatch):
+    monkeypatch.setitem(srv.CFG, "homeassistant", {"base_url": "http://ha.example"})
+    monkeypatch.setenv("HASS_TOKEN", "test-token")
+    resp = client.post("/api/ha/call_service", json={
+        "domain": "light", "service": "turn_on/../../shell",
+    })
+    assert resp.status_code == 400
+
+
+def test_ha_call_service_rejects_malformed_entity_id_missing_dot(monkeypatch):
+    monkeypatch.setitem(srv.CFG, "homeassistant", {"base_url": "http://ha.example"})
+    monkeypatch.setenv("HASS_TOKEN", "test-token")
+    resp = client.post("/api/ha/call_service", json={
+        "domain": "light", "service": "turn_on", "entity_id": "living_room",
+    })
+    assert resp.status_code == 400
+
+
+def test_ha_call_service_rejects_entity_id_with_traversal_chars(monkeypatch):
+    monkeypatch.setitem(srv.CFG, "homeassistant", {"base_url": "http://ha.example"})
+    monkeypatch.setenv("HASS_TOKEN", "test-token")
+    resp = client.post("/api/ha/call_service", json={
+        "domain": "light", "service": "turn_on", "entity_id": "light.../../etc",
+    })
+    assert resp.status_code == 400
