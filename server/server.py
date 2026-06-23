@@ -938,6 +938,44 @@ async def summon(request: Request) -> JSONResponse:
     return JSONResponse({"sent_to": sent})
 
 
+@app.post("/api/ha/call_service")
+async def ha_call_service(request: Request) -> JSONResponse:
+    """Direct, deterministic Home Assistant control for dashboard UI clicks.
+    Separate from Hermes's own native `homeassistant` toolset (used for
+    chat/voice-driven control) — both call the same HA instance.
+    Body: {"domain": "light", "service": "turn_on",
+           "entity_id": "light.living_room", "data": {...}}
+    """
+    body = await request.json()
+    domain = body.get("domain")
+    service = body.get("service")
+    if not domain or not service:
+        return JSONResponse({"error": "domain and service are required"}, status_code=400)
+
+    ha_cfg = CFG.get("homeassistant") or {}
+    base_url = ha_cfg.get("base_url")
+    token = os.environ.get(ha_cfg.get("token_env", "HASS_TOKEN"))
+    if not base_url or not token:
+        return JSONResponse({"error": "Home Assistant not configured"}, status_code=503)
+
+    payload = {"entity_id": body["entity_id"]} if body.get("entity_id") else {}
+    payload.update(body.get("data") or {})
+
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            f"{base_url}/api/services/{domain}/{service}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload, timeout=10,
+        )
+    except Exception as exc:
+        return JSONResponse({"error": f"Home Assistant unreachable: {exc}"}, status_code=502)
+
+    if response.status_code >= 400:
+        return JSONResponse({"error": f"HA HTTP {response.status_code}"}, status_code=502)
+    return JSONResponse({"ok": True, "result": response.json()})
+
+
 _WORKER_CACHE: dict = {"ts": 0.0, "data": [], "refreshing": False}
 
 
