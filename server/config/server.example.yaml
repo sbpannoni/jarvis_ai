@@ -87,8 +87,8 @@ persona:                     # used only by the anthropic fallback path
 activity_feed:               # Hermes session + rack-host reachability feed (/api/activity)
   poll_seconds: 30
   hosts:
-    - {name: snarf, address: 100.115.80.50, port: 22}
-    - {name: octominer, address: 100.104.84.79, port: 22}
+    - {name: snarf, address: 192.168.1.239, port: 22}
+    - {name: octominer, address: 192.168.1.50, port: 22}
     - {name: beelink, address: 192.168.1.158, port: 22}
     - {name: claude-control, address: 192.168.1.157, port: 22}
     - {name: hermes, address: 192.168.1.159, port: 22}
