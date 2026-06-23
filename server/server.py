@@ -1090,15 +1090,13 @@ ACTIVITY_LOG: list[dict] = []
 ACTIVITY_LOG_MAX = 200
 
 
-def _push_activity_event(event: dict) -> None:
+async def _push_activity_event(event: dict) -> None:
     event = {**event, "ts": time.time()}
     ACTIVITY_LOG.append(event)
     del ACTIVITY_LOG[:-ACTIVITY_LOG_MAX]
     for client in list(WS_CLIENTS):
         try:
-            asyncio.get_event_loop().create_task(
-                client.send_json({"type": "activity_event", "event": event})
-            )
+            await client.send_json({"type": "activity_event", "event": event})
         except Exception:
             WS_CLIENTS.discard(client)
 
@@ -1141,7 +1139,7 @@ async def _poll_rack_hosts_forever() -> None:
             reachable = await asyncio.to_thread(
                 _host_reachable, host["address"], host.get("port", 22)
             )
-            _push_activity_event({
+            await _push_activity_event({
                 "source": "infra",
                 "host": host["name"],
                 "status": "reachable" if reachable else "unreachable",
@@ -1172,13 +1170,13 @@ async def _poll_hermes_sessions_forever() -> None:
                     session_id = session.get("id")
                     if session_id and session_id not in seen_ids:
                         seen_ids.add(session_id)
-                        _push_activity_event({
+                        await _push_activity_event({
                             "source": "hermes_session",
                             "session_id": session_id,
                             "title": session.get("title") or "(untitled session)",
                         })
             except Exception as exc:
-                _push_activity_event({"source": "hermes_session", "status": "error", "detail": str(exc)})
+                await _push_activity_event({"source": "hermes_session", "status": "error", "detail": str(exc)})
         await asyncio.sleep(15)
 
 
