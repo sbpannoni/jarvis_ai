@@ -432,17 +432,67 @@ class VoicePipelineServer:
             else:
                 raise
 
+def _resample_pcm16(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Linear-interpolation resample of 16-bit mono PCM. Adequate quality
+    for speech; avoids adding scipy as a dependency for this one step."""
+    if src_rate == dst_rate or not pcm_bytes:
+        return pcm_bytes
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    duration = len(samples) / src_rate
+    dst_n = int(round(duration * dst_rate))
+    if dst_n <= 0:
+        return b""
+    src_idx = np.linspace(0, len(samples) - 1, num=dst_n)
+    resampled = np.interp(src_idx, np.arange(len(samples)), samples)
+    return resampled.astype(np.int16).tobytes()
+
+
+_PIPER_VOICE = None
+
+
+def _get_piper_voice():
+    global _PIPER_VOICE
+    if _PIPER_VOICE is None:
+        from piper import PiperVoice
+        model_path = os.environ.get(
+            "JARVIS_PIPER_MODEL", str(ROOT / "models" / "en_US-lessac-medium.onnx")
+        )
+        _PIPER_VOICE = PiperVoice.load(model_path)
+    return _PIPER_VOICE
+
+
+def _tts_piper_chunks(text: str) -> Iterator[bytes]:
+    """Local, free TTS via Piper, resampled to 16kHz mono to match the HUD's
+    hardcoded AudioContext sample rate (see hud/index.html). piper-tts's
+    synthesize() yields one AudioChunk per sentence (not raw per-callback
+    bytes) -- audio_int16_bytes on each chunk is the actual PCM16 payload."""
+    voice = _get_piper_voice()
+    src_rate = voice.config.sample_rate
+    for chunk in voice.synthesize(text):
+        yield _resample_pcm16(chunk.audio_int16_bytes, src_rate, 16000)
+
     # ------------------------------------------------------------------ TTS
 
     def tts_chunks_sync(self, text: str, timing: TurnTiming) -> Iterator[bytes]:
         voice = self.cfg["voice"]
+        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
+        record_usage(tts_chars=len(text))
+        provider = voice.get("provider", "elevenlabs")
+
+        if provider == "piper":
+            timing.tts_model = "piper"
+            timing.voice_id = voice.get("piper_model", "local")
+            for chunk in _tts_piper_chunks(text):
+                if timing.first_tts_audio_byte_monotonic is None:
+                    timing.first_tts_audio_byte_monotonic = time.perf_counter()
+                yield chunk
+            return
+
         key = os.environ.get("ELEVENLABS_API_KEY") or os.environ.get("ELEVEN_API_KEY") or os.environ.get("XI_API_KEY")
         if not key:
             raise RuntimeError("ElevenLabs API key not found")
         timing.tts_model = voice["model"]
         timing.voice_id = voice["voice_id"]
-        timing.tts_request_start_monotonic = timing.tts_request_start_monotonic or time.perf_counter()
-        record_usage(tts_chars=len(text))
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice['voice_id']}/stream"
         params = {"output_format": voice.get("output_format", "pcm_16000")}
         payload = {
