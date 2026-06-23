@@ -35,7 +35,7 @@ def test_tts_piper_chunks_resamples_to_16k(monkeypatch):
     class FakeVoice:
         config = FakeConfig()
 
-        def synthesize(self, text):
+        def synthesize(self, text, syn_config=None):
             # piper-tts (piper1-gpl) yields one AudioChunk per sentence,
             # not raw bytes per callback -- mock that exact shape.
             # 0.1s of silence at the voice's native 22050Hz

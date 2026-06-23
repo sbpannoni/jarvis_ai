@@ -309,17 +309,39 @@ def _resample_pcm16(pcm_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
 
 
 _PIPER_VOICE = None
+_PIPER_VOICE_MODEL = None
 
 
 def _get_piper_voice():
-    global _PIPER_VOICE
-    if _PIPER_VOICE is None:
+    global _PIPER_VOICE, _PIPER_VOICE_MODEL
+    voice_cfg = CFG.get("voice") or {}
+    model_name = os.environ.get("JARVIS_PIPER_MODEL") or voice_cfg.get("piper_model", "en_US-lessac-medium")
+    if _PIPER_VOICE is None or _PIPER_VOICE_MODEL != model_name:
         from piper import PiperVoice
-        model_path = os.environ.get(
-            "JARVIS_PIPER_MODEL", str(ROOT / "models" / "en_US-lessac-medium.onnx")
-        )
+        if model_name.endswith(".onnx"):
+            model_path = model_name
+        else:
+            model_path = str(ROOT / "models" / f"{model_name}.onnx")
         _PIPER_VOICE = PiperVoice.load(model_path)
+        _PIPER_VOICE_MODEL = model_name
     return _PIPER_VOICE
+
+
+def _piper_synthesis_config():
+    """Build a piper.SynthesisConfig from voice.* knobs in server.yaml, so
+    pacing/expressiveness are tunable without code changes. Defaults match
+    Piper's own library defaults except length_scale, which defaults
+    slightly slower (1.1) -- the bare 1.0 default reads as rushed on longer
+    text with this fork's voices, per live listening feedback 2026-06-23."""
+    from piper import SynthesisConfig
+    voice_cfg = CFG.get("voice") or {}
+    return SynthesisConfig(
+        length_scale=voice_cfg.get("length_scale", 1.1),
+        noise_scale=voice_cfg.get("noise_scale", 0.667),
+        noise_w_scale=voice_cfg.get("noise_w_scale", 0.8),
+        volume=voice_cfg.get("volume", 1.0),
+        normalize_audio=voice_cfg.get("normalize_audio", True),
+    )
 
 
 def _tts_piper_chunks(text: str) -> Iterator[bytes]:
@@ -329,7 +351,8 @@ def _tts_piper_chunks(text: str) -> Iterator[bytes]:
     bytes) -- audio_int16_bytes on each chunk is the actual PCM16 payload."""
     voice = _get_piper_voice()
     src_rate = voice.config.sample_rate
-    for chunk in voice.synthesize(text):
+    syn_config = _piper_synthesis_config()
+    for chunk in voice.synthesize(text, syn_config=syn_config):
         yield _resample_pcm16(chunk.audio_int16_bytes, src_rate, 16000)
 
 
