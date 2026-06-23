@@ -1086,6 +1086,102 @@ async def rack_health() -> JSONResponse:
     return JSONResponse(data)
 
 
+ACTIVITY_LOG: list[dict] = []
+ACTIVITY_LOG_MAX = 200
+
+
+def _push_activity_event(event: dict) -> None:
+    event = {**event, "ts": time.time()}
+    ACTIVITY_LOG.append(event)
+    del ACTIVITY_LOG[:-ACTIVITY_LOG_MAX]
+    for client in list(WS_CLIENTS):
+        try:
+            asyncio.get_event_loop().create_task(
+                client.send_json({"type": "activity_event", "event": event})
+            )
+        except Exception:
+            WS_CLIENTS.discard(client)
+
+
+@app.get("/api/activity")
+async def activity() -> JSONResponse:
+    return JSONResponse({"events": ACTIVITY_LOG[-50:]})
+
+
+def _host_reachable(address: str, port: int) -> bool:
+    import socket
+    try:
+        with socket.create_connection((address, port), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+_ACTIVITY_STARTED = False
+
+
+@app.on_event("startup")
+async def start_activity_feed() -> None:
+    """Race-locked like warm_pipeline above — this hook also fires once per
+    uvicorn listener (there are four)."""
+    global _ACTIVITY_STARTED
+    if _ACTIVITY_STARTED:
+        return
+    _ACTIVITY_STARTED = True
+    asyncio.get_running_loop().create_task(_poll_rack_hosts_forever())
+    asyncio.get_running_loop().create_task(_poll_hermes_sessions_forever())
+
+
+async def _poll_rack_hosts_forever() -> None:
+    af_cfg = CFG.get("activity_feed") or {}
+    hosts_cfg = af_cfg.get("hosts") or []
+    poll_seconds = af_cfg.get("poll_seconds", 30)
+    while True:
+        for host in hosts_cfg:
+            reachable = await asyncio.to_thread(
+                _host_reachable, host["address"], host.get("port", 22)
+            )
+            _push_activity_event({
+                "source": "infra",
+                "host": host["name"],
+                "status": "reachable" if reachable else "unreachable",
+            })
+        await asyncio.sleep(poll_seconds)
+
+
+async def _poll_hermes_sessions_forever() -> None:
+    hermes_cfg = CFG.get("hermes") or {}
+    base_url = hermes_cfg.get("base_url", "http://127.0.0.1:8642")
+    key_env = hermes_cfg.get("api_key_env", "API_SERVER_KEY")
+    seen_ids: set[str] = set()
+    while True:
+        token = os.environ.get(key_env)
+        if token:
+            try:
+                response = await asyncio.to_thread(
+                    requests.get, f"{base_url}/api/sessions",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"limit": 10}, timeout=10,
+                )
+                response.raise_for_status()
+                # Hermes's /api/sessions returns an OpenAI-style pagination
+                # envelope: {"object": "list", "data": [...], "limit",
+                # "offset", "has_more"} — NOT {"sessions": [...]} as the
+                # original brief assumed. Confirmed live 2026-06-22.
+                for session in response.json().get("data", []):
+                    session_id = session.get("id")
+                    if session_id and session_id not in seen_ids:
+                        seen_ids.add(session_id)
+                        _push_activity_event({
+                            "source": "hermes_session",
+                            "session_id": session_id,
+                            "title": session.get("title") or "(untitled session)",
+                        })
+            except Exception as exc:
+                _push_activity_event({"source": "hermes_session", "status": "error", "detail": str(exc)})
+        await asyncio.sleep(15)
+
+
 @app.get("/")
 async def root() -> RedirectResponse:
     return RedirectResponse("/hud/")

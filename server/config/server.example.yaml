@@ -83,3 +83,12 @@ persona:                     # used only by the anthropic fallback path
   system_prompt: >
     You are the spoken interface for the user's personal agent. Be direct,
     calm, and concise. Default to one to three short sentences.
+
+activity_feed:               # Hermes session + rack-host reachability feed (/api/activity)
+  poll_seconds: 30
+  hosts:
+    - {name: snarf, address: 100.115.80.50, port: 22}
+    - {name: octominer, address: 100.104.84.79, port: 22}
+    - {name: beelink, address: 192.168.1.158, port: 22}
+    - {name: claude-control, address: 192.168.1.157, port: 22}
+    - {name: hermes, address: 192.168.1.159, port: 22}
