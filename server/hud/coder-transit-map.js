@@ -15,12 +15,13 @@
    task-decomposition role). Station status dots stay teal=good/
    orange=native-but-unevaluated/dim=not-built, matching .dot.on elsewhere.
 
-   Station labels are angled (real transit-map convention -- London/NYC
-   maps do exactly this) rather than centered under each stop: at 160px
-   station spacing, horizontal centered labels for names like "DOCKER: EDIT
-   (AIDER)" overlapped their neighbors. Editor/reviewer labels angle up-
-   right into open space above their row; orchestrator angles down-right
-   into the bottom margin -- never toward another row's content.
+   Station labels are horizontal, centered, wrapped to at most two lines of
+   ~12 characters so each fits inside the 140px station spacing. (They were
+   angled until 2026-09-27; at this spacing the diagonals ran into the next
+   row's labels and the metric text.) Editor labels sit above their line,
+   reviewer and orchestrator labels below theirs, and each line's title +
+   metrics sit in the open band on the other side of it -- so no row's text
+   is ever drawn into another row's.
 
    Mirrors coder-models.js's fetch -> render -> poll shape and
    openWorkTabTurning shell.
@@ -52,42 +53,49 @@ function transitStationCircle(cx, cy, lineColorVar, status){
           <g transform="translate(${cx},${cy})">${transitStationDot(status)}</g>`;
 }
 
-// Angled label, real-subway-map style. dir "up": text starts just above-
-// right of the station and reads diagonally up-right (rotate -40). dir
-// "down": starts below-right and reads diagonally down-right (rotate 40).
-// Always text-anchor="start" so the label extends AWAY from the station,
-// never back over it or its neighbors.
-function transitAngledLabel(cx, cy, text, dir){
-  const dy = dir === "up" ? -10 : 10;
-  const x = cx + 9, y = cy + dy;
-  const angle = dir === "up" ? -40 : 40;
-  return `<text x="${x}" y="${y}" transform="rotate(${angle} ${x} ${y})" text-anchor="start" class="tm-station-label">${text}</text>`;
+// Horizontal station label, centered on the stop, word-wrapped to lines of
+// <= TRANSIT_LABEL_CHARS so neighbors 140px apart never touch. "above"
+// stacks upward from just over the station; "below" stacks downward.
+const TRANSIT_LABEL_CHARS = 12;
+const TRANSIT_LABEL_LINE = 13;
+function transitStationLabel(cx, cy, text, pos){
+  const lines = [];
+  for (const word of text.split(" ")){
+    const last = lines[lines.length - 1];
+    if (last != null && (last + " " + word).length <= TRANSIT_LABEL_CHARS) lines[lines.length - 1] = last + " " + word;
+    else lines.push(word);
+  }
+  const first = pos === "above"
+    ? cy - 16 - (lines.length - 1) * TRANSIT_LABEL_LINE
+    : cy + 28;
+  return `<text text-anchor="middle" class="tm-station-label">${lines.map((l, i) =>
+    `<tspan x="${cx}" y="${first + i * TRANSIT_LABEL_LINE}">${l}</tspan>`).join("")}</text>`;
 }
 
 function transitMetricChip(x, y, text, color){
-  return `<text x="${x}" y="${y}" text-anchor="middle" class="tm-metric-chip" fill="${color||'var(--txt-dim)'}">${text}</text>`;
+  return `<text x="${x}" y="${y}" text-anchor="start" class="tm-metric-chip" fill="${color||'var(--txt-dim)'}">${text}</text>`;
 }
 
 function buildTransitSvg(data){
   const editorTop = (data.editor.models || [])[0];
   const editorChip = editorTop
-    ? transitMetricChip(780, 205, `${editorTop.label.toUpperCase()} ${transitFmtPct(editorTop.pass_rate)} · ${transitFmtTime(editorTop.avg_elapsed_s)}`, "var(--teal)")
-    : transitMetricChip(780, 205, "no runs yet", "var(--txt-dim)");
-  const editorSub = transitMetricChip(780, 219, `${(data.editor.models||[]).length} candidates measured`, "var(--txt-dim)");
+    ? transitMetricChip(440, 88, `${editorTop.label.toUpperCase()} ${transitFmtPct(editorTop.pass_rate)} · ${transitFmtTime(editorTop.avg_elapsed_s)}`, "var(--teal)")
+    : transitMetricChip(440, 88, "no runs yet", "var(--txt-dim)");
+  const editorSub = transitMetricChip(440, 102, `${(data.editor.models||[]).length} candidates measured`, "var(--txt-dim)");
 
   const reviewGraded = (data.reviewer.models || []).filter(m => m.graded_count > 0);
   const reviewTop = reviewGraded[0];
   const reviewChip = reviewTop
-    ? transitMetricChip(780, 245, `${reviewTop.label.toUpperCase()} ${transitFmtPct(reviewTop.catch_rate)} catch · ${transitFmtPct(reviewTop.false_positive_rate)} FP`, "var(--teal)")
-    : transitMetricChip(780, 245, "no graded reviews yet", "var(--txt-dim)");
-  const reviewSub = transitMetricChip(780, 259, `${reviewGraded.length} candidates graded`, "var(--txt-dim)");
+    ? transitMetricChip(440, 258, `${reviewTop.label.toUpperCase()} ${transitFmtPct(reviewTop.catch_rate)} catch · ${transitFmtPct(reviewTop.false_positive_rate)} FP`, "var(--teal)")
+    : transitMetricChip(440, 258, "no graded reviews yet", "var(--txt-dim)");
+  const reviewSub = transitMetricChip(440, 272, `${reviewGraded.length} candidates graded`, "var(--txt-dim)");
 
   const orchGraded = (data.orchestrator.models || []).filter(m => m.graded_count > 0);
   const orchTop = orchGraded[0];
   const orchChip = orchTop
-    ? transitMetricChip(700, 495, `${orchTop.label.toUpperCase()} ${transitFmtPct(orchTop.coverage_rate)} coverage`, "var(--teal)")
-    : transitMetricChip(700, 495, "0 candidates measured", "var(--orange)");
-  const orchSub = transitMetricChip(700, 509, `${orchGraded.length} candidates graded`, "var(--txt-dim)");
+    ? transitMetricChip(440, 404, `${orchTop.label.toUpperCase()} ${transitFmtPct(orchTop.coverage_rate)} coverage`, "var(--teal)")
+    : transitMetricChip(440, 404, "0 candidates measured", "var(--orange)");
+  const orchSub = transitMetricChip(440, 418, `${orchGraded.length} candidates graded`, "var(--txt-dim)");
 
   const reviewerHasData = reviewGraded.length > 0;
   const reviewerStationStatus = reviewerHasData ? "good" : "none";
@@ -95,7 +103,7 @@ function buildTransitSvg(data){
   const orchStationStatus = orchGraded.length > 0 ? "good" : "warn";
 
   return `
-  <svg viewBox="0 0 1300 600" role="img" class="tm-svg" aria-label="Transit-style diagram of the coder-engine pipeline: a shared Kanban-and-Dispatch trunk splits into an Editor line, a Reviewer line, and an Orchestrator line, reconverging at this HUD.">
+  <svg viewBox="0 45 1300 460" role="img" class="tm-svg" aria-label="Transit-style diagram of the coder-engine pipeline: a shared Kanban-and-Dispatch trunk splits into an Editor line, a Reviewer line, and an Orchestrator line, reconverging at this HUD.">
 
     <g stroke="var(--line)" stroke-width="1" opacity="0.5">
       <line x1="40" y1="150" x2="1260" y2="150"/>
@@ -127,60 +135,60 @@ function buildTransitSvg(data){
       <path d="M 1200 308 L 1250 308" stroke="var(--amber)"/>
     </g>
 
-    <text x="440" y="118" class="tm-line-tag" fill="var(--cyan)">EDITOR — LIVE</text>
-    <text x="330" y="272" class="tm-line-tag" fill="var(--magenta)">REVIEWER — ${reviewerHasData ? "LIVE" : "NOT BUILT"}</text>
-    <text x="400" y="500" class="tm-line-tag" fill="var(--amber)">ORCHESTRATOR — NATIVE, ${orchGraded.length > 0 ? "BENCHMARKED" : "UNTESTED"}</text>
+    <text x="440" y="70" class="tm-line-tag" fill="var(--cyan)">EDITOR — LIVE</text>
+    <text x="440" y="240" class="tm-line-tag" fill="var(--magenta)">REVIEWER — ${reviewerHasData ? "LIVE" : "NOT BUILT"}</text>
+    <text x="440" y="386" class="tm-line-tag" fill="var(--amber)">ORCHESTRATOR — NATIVE, ${orchGraded.length > 0 ? "BENCHMARKED" : "UNTESTED"}</text>
 
     <circle cx="80" cy="300" r="12" fill="var(--panel)" stroke="var(--txt)" stroke-width="3"/>
     <circle cx="80" cy="300" r="4" fill="var(--teal)"/>
-    ${transitAngledLabel(80, 300, "KANBAN BOARD", "down")}
+    ${transitStationLabel(80, 300, "KANBAN BOARD", "below")}
 
     <circle cx="280" cy="300" r="12" fill="var(--panel)" stroke="var(--txt)" stroke-width="3"/>
     <circle cx="280" cy="300" r="4" fill="var(--teal)"/>
-    ${transitAngledLabel(280, 300, "CLAIM + DISPATCH", "down")}
+    ${transitStationLabel(280, 300, "CLAIM + DISPATCH", "below")}
 
     ${transitStationCircle(560, 150, "var(--cyan)", "good")}
-    ${transitAngledLabel(560, 150, "WORKTREE + BRANCH", "up")}
+    ${transitStationLabel(560, 150, "WORKTREE + BRANCH", "above")}
 
     ${transitStationCircle(700, 150, "var(--cyan)", "good")}
-    ${transitAngledLabel(700, 150, "DOCKER: EDIT (AIDER)", "up")}
+    ${transitStationLabel(700, 150, "DOCKER: EDIT (AIDER)", "above")}
     ${editorChip}${editorSub}
 
     ${transitStationCircle(840, 150, "var(--cyan)", "good")}
-    ${transitAngledLabel(840, 150, "TEST GATE", "up")}
+    ${transitStationLabel(840, 150, "TEST GATE", "above")}
 
     ${transitStationCircle(980, 150, "var(--cyan)", "good")}
-    ${transitAngledLabel(980, 150, "COMMIT + PATCH", "up")}
+    ${transitStationLabel(980, 150, "COMMIT + PATCH", "above")}
 
     ${transitStationCircle(560, 450, "var(--amber)", orchStationStatus)}
-    ${transitAngledLabel(560, 450, "TASK INTAKE", "down")}
+    ${transitStationLabel(560, 450, "TASK INTAKE", "below")}
 
     ${transitStationCircle(700, 450, "var(--amber)", orchStationStatus)}
-    ${transitAngledLabel(700, 450, "MODEL: DECOMPOSE", "down")}
+    ${transitStationLabel(700, 450, "MODEL: DECOMPOSE", "below")}
     ${orchChip}${orchSub}
 
     ${transitStationCircle(840, 450, "var(--amber)", orchStationStatus)}
-    ${transitAngledLabel(840, 450, "DEPENDENCY GRAPH", "down")}
+    ${transitStationLabel(840, 450, "DEPENDENCY GRAPH", "below")}
 
     ${transitStationCircle(980, 450, "var(--amber)", orchStationStatus)}
-    ${transitAngledLabel(980, 450, "KANBAN: CHILD TASKS", "down")}
+    ${transitStationLabel(980, 450, "KANBAN: CHILD TASKS", "below")}
 
     ${transitStationCircle(560, 300, "var(--magenta)", reviewerStationStatus)}
-    ${transitAngledLabel(560, 300, "WORKTREE INJECT", "up")}
+    ${transitStationLabel(560, 300, "WORKTREE INJECT", "below")}
 
     ${transitStationCircle(700, 300, "var(--magenta)", reviewerStationStatus)}
-    ${transitAngledLabel(700, 300, "MODEL: ANALYZE", "up")}
+    ${transitStationLabel(700, 300, "MODEL: ANALYZE", "below")}
     ${reviewChip}${reviewSub}
 
     ${transitStationCircle(840, 300, "var(--magenta)", reviewerStationStatus)}
-    ${transitAngledLabel(840, 300, "FINDINGS REPORT", "up")}
+    ${transitStationLabel(840, 300, "FINDINGS REPORT", "below")}
 
     <circle cx="980" cy="300" r="8" fill="var(--bg)" stroke="var(--magenta)" stroke-width="3" stroke-dasharray="2 4"/>
-    ${transitAngledLabel(980, 300, "KANBAN: TRIAGE CARD", "down")}
+    ${transitStationLabel(980, 300, "KANBAN: TRIAGE CARD", "below")}
 
     <circle cx="1200" cy="300" r="12" fill="var(--panel)" stroke="var(--txt)" stroke-width="3"/>
     <circle cx="1200" cy="300" r="4" fill="var(--teal)"/>
-    ${transitAngledLabel(1200, 300, "RESULT", "down")}
+    ${transitStationLabel(1232, 300, "RESULT", "below")}
   </svg>`;
 }
 

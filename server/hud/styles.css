@@ -959,7 +959,7 @@ body.view-map #work-area{display:none !important}
    fix above stops shrink-induced illegibility; this bump is the second,
    independent half of it -- these were genuinely small even at full,
    unshrunk scale. */
-.tm-station-label{font-family:'Orbitron'; font-size:14.5px; fill:var(--txt); letter-spacing:.3px}
+.tm-station-label{font-family:'Orbitron'; font-size:11.5px; fill:var(--txt); letter-spacing:.3px}
 .tm-station-sub{font-family:'Rajdhani'; font-size:11px; fill:var(--txt-dim)}
 .tm-line-tag{font-family:'Orbitron'; font-weight:700; font-size:14.5px; letter-spacing:1.5px}
 .tm-metric-chip{font-family:'Rajdhani'; font-size:12.5px; font-weight:600}
