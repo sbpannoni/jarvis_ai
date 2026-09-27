@@ -615,6 +615,100 @@ function openTerminal(host,{run=null,title=null,tmux=null}={}){
     term.open(panel);
     fitAddon.fit();  // size to the actual panel, not xterm's 80x24 default
 
+    // Shared by both clipboard writers below (copy-on-select and OSC 52).
+    // navigator.clipboard.writeText() calls are independent promises with no
+    // ordering guarantee between them -- a dense trackpad drag can make tmux
+    // emit more than one OSC 52 update as the selection grows, and nothing
+    // stops an EARLIER (shorter) write's promise from resolving AFTER a
+    // LATER (correct, full) one, silently overwriting it. Reported live as
+    // "it only copies the first word". Chaining every write onto the same
+    // promise forces them to land in call order regardless of how fast they
+    // fire or how the browser schedules them internally.
+    // Every write up to this point was wrapped in .catch(()=>{}), which
+    // silently ate a rejection with no trace. That's a real blind spot:
+    // navigator.clipboard.writeText() commonly requires a direct user
+    // gesture (transient activation), and this call fires from parsing a
+    // WebSocket message that arrived asynchronously after the mouseup --
+    // not synchronously inside a click handler -- which privacy-hardened
+    // browsers (Brave in particular) can and do silently reject. Reporting
+    // the outcome in the HUD's own chat feed turns "nothing happens" into
+    // something checkable without needing devtools on the viewer's machine.
+    let clipboardChain=Promise.resolve();
+    const writeClipboard=text=>{
+      clipboardChain=clipboardChain.then(()=>navigator.clipboard.writeText(text))
+        .then(()=>addMsg("sys",`copied ${text.length} char(s) to clipboard`))
+        .catch(err=>addMsg("sys",`clipboard write FAILED: ${err&&err.name||err}: ${err&&err.message||''}`));
+    };
+
+    // Without this, xterm.js sends Ctrl+C straight to the remote shell as
+    // SIGINT even when text is selected -- there is no built-in "copy the
+    // selection instead" fallback, so selected text could never be copied
+    // out. Only intercept when a selection exists; with none, ^C must still
+    // reach the shell as an interrupt.
+    //
+    // Checked two ways on purpose: xterm keeps its OWN selection model
+    // (term.hasSelection()) separate from the browser's native DOM selection
+    // over its accessibility text layer (window.getSelection()). They
+    // normally agree, but a report of the visible highlight not surviving
+    // mouseup in Brave suggests they can desync there -- so either counting
+    // as "something is selected" is the robust check, not just one.
+    term.attachCustomKeyEventHandler(e=>{
+      const nativeSel=(window.getSelection&&window.getSelection().toString())||"";
+      if(e.type==="keydown" && (e.ctrlKey||e.metaKey) && e.key==="c" &&
+         (term.hasSelection()||nativeSel))
+        return false;  // let the browser's native copy handle it
+      return true;
+    });
+
+    // Copy-on-select, not just Ctrl+C-after-select: on Brave the selection
+    // highlight has been reported not surviving mouse release (xterm's
+    // internal model apparently clears itself right after), so a copy
+    // triggered later by a keypress finds nothing left to copy. Writing to
+    // the clipboard the instant a selection appears sidesteps that entirely
+    // -- by the time whatever clears the highlight runs, the text is already
+    // on the clipboard. Fires on every growth of the selection during a
+    // drag, which is redundant but harmless; the last write before mouseup
+    // wins.
+    //
+    // Gated on mouseTrackingMode==="none": once a program in the pty (tmux,
+    // vim, ...) requests mouse reporting, xterm hands mouse events to THAT
+    // program instead of doing its own DOM selection -- so any selection
+    // this fires with in that mode is stale/accidental, not real intent
+    // (e.g. a leftover click-to-position-cursor state from just before
+    // tmux's mouse-tracking escape sequence took effect). Left ungated, a
+    // late async write here can race the OSC 52 handler below and clobber a
+    // correct full-line tmux copy with a one-word fragment -- reported live
+    // as "it only copies the first word".
+    term.onSelectionChange(()=>{
+      if(term.modes.mouseTrackingMode!=="none")return;
+      const s=term.getSelection();
+      if(!s)return;
+      if(navigator.clipboard&&navigator.clipboard.writeText)writeClipboard(s);
+    });
+
+    // OSC 52 clipboard handoff: tmux mouse mode (enabled server-side, see
+    // /ws/terminal's `set-option mouse on`) captures click-drag for its OWN
+    // copy-mode instead of xterm's DOM selection -- that's why the two
+    // handlers above never fire for a plain drag inside a tmux pane. tmux's
+    // `set-clipboard` defaults to "external" (tmux 2.6+), so it already
+    // EMITS an OSC 52 escape sequence on every copy-mode selection; this
+    // bundled xterm.js just registers no handler for it, so the sequence was
+    // being silently dropped. `data` arrives as "<selection-param>;<base64>"
+    // (e.g. "c;aGVsbG8="); a bare "?" payload is a clipboard READ request,
+    // which we don't support answering (would need document.execCommand or
+    // clipboard-read permission) -- just no-op it so it doesn't fall through
+    // to xterm's "unknown OSC" debug log.
+    term.parser.registerOscHandler(52,data=>{
+      const payload=data.slice(data.indexOf(";")+1);
+      if(!payload||payload==="?")return true;
+      try{
+        const bytes=Uint8Array.from(atob(payload),c=>c.charCodeAt(0));
+        const text=new TextDecoder("utf-8").decode(bytes);
+        if(navigator.clipboard&&navigator.clipboard.writeText)writeClipboard(text);
+      }catch{}
+      return true;
+    });
+
     // A full-screen program inside the terminal (the claude CLI itself, vim,
     // less, ...) uses the alternate screen buffer and asks xterm to
     // translate mouse-wheel scroll into arrow-key presses -- standard
