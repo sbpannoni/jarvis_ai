@@ -244,6 +244,25 @@ function transitModelCard(m, kind){
   </div>`;
 }
 
+// The leaderboard cards come only from the eval files, so a role's ASSIGNED
+// model with no eval runs (the llama.cpp models) had no card at all. Lead
+// each line with the assigned model: its own card tagged ASSIGNED if it has
+// been measured, or a placeholder card if not.
+function transitAssignedFirst(cards, models, assignedId, roster, cardFn){
+  if (!assignedId) return cards.join("");
+  const idx = (models || []).findIndex(m => m.id === assignedId);
+  if (idx >= 0){
+    const tagged = cards[idx].replace('<div class="mcard-head"><b>', '<div class="mcard-head"><span class="mcard-assigned">ASSIGNED</span><b>');
+    return [tagged, ...cards.filter((_, i) => i !== idx)].join("");
+  }
+  const entry = (roster || []).find(m => m.id === assignedId) || {};
+  const backend = entry.backend ? ` · ${entry.backend === "llamacpp" ? "llama.cpp" : entry.backend}` : "";
+  return `<div class="mcard mcard-unevaluated">
+      <div class="mcard-head"><span class="mcard-assigned">ASSIGNED</span><b>${entry.label || assignedId}</b></div>
+      <div class="mcard-metrics mcard-none">not yet evaluated${backend} — no eval runs in the current metrics files</div>
+    </div>` + cards.join("");
+}
+
 function transitOrchestratorCard(m){
   const heat = transitHeatColor(m.coverage_rate);
   const style = `border-top-color:${heat}`;
@@ -499,9 +518,13 @@ async function renderTransitMap(panel){
     const reviewGen = j.reviewer.generated_at ? new Date(j.reviewer.generated_at).toLocaleString() : "never";
     const orchGen = j.orchestrator.generated_at ? new Date(j.orchestrator.generated_at).toLocaleString() : "never";
 
-    const editorCards = (j.editor.models || []).map(m => transitModelCard(m, "editor")).join("");
-    const reviewerCards = (j.reviewer.models || []).map(m => transitModelCard(m, "reviewer")).join("");
-    const orchCards = (j.orchestrator.models || []).map(transitOrchestratorCard).join("");
+    const asg = roleData.assignments || {};
+    const editorCards = transitAssignedFirst((j.editor.models || []).map(m => transitModelCard(m, "editor")),
+      j.editor.models, asg.editor, roleData.roster);
+    const reviewerCards = transitAssignedFirst((j.reviewer.models || []).map(m => transitModelCard(m, "reviewer")),
+      j.reviewer.models, asg.reviewer, roleData.roster);
+    const orchCards = transitAssignedFirst((j.orchestrator.models || []).map(transitOrchestratorCard),
+      j.orchestrator.models, asg.orchestrator, roleData.roster);
 
     panel.innerHTML = `
       <div class="flow-head-bar">CODER-ENGINE TRANSIT MAP — editor ${editorGen}, reviewer ${reviewGen}, orchestrator ${orchGen}</div>

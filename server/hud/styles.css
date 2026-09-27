@@ -998,6 +998,8 @@ body.view-map #work-area{display:none !important}
   border:1px solid var(--line); border-radius:2px; padding:1px 4px}
 .tm-role-status{font-size:10px; color:var(--txt-dim); min-width:44px}
 .tm-role-status.saved{color:var(--teal)}
+.mcard-assigned{font-family:'Orbitron'; font-size:8.5px; letter-spacing:1px; color:var(--magenta); border:1px solid var(--magenta); border-radius:6px; padding:0 5px; margin-right:6px; vertical-align:1px}
+.mcard.mcard-unevaluated{border-top-color:var(--orange); border-style:dashed}
 .tm-seat-warning{font-size:11px; color:var(--amber); padding:4px 10px 8px}
 .tm-role-status.err{color:var(--red)}
 
