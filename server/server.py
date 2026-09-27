@@ -2048,6 +2048,8 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
 
 CODER_ENGINE_VENV_PY = "/ssdpool/coder-engine/.venv/bin/python3"
 DISPATCH_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_review_task.py"
+CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"
+_FENCED_FINDINGS_RE = re.compile(r"```json:review-findings\n(.*?)\n```", re.DOTALL)
 
 
 @app.post("/api/review-file")
@@ -2232,6 +2234,91 @@ async def review_file(request: Request) -> JSONResponse:
     response["chained"] = True
     response["chained_task"] = fix_task_data
     return JSONResponse(response)
+
+
+@app.post("/api/kanban/check-fix-card")
+async def check_fix_card(request: Request) -> JSONResponse:
+    """Run check_fix_card.py's two mechanical gates (finding-closure,
+    test-tamper) against a completed review-chain fix card -- the piece
+    that closes the loop /api/review-file's chain:true opened. Pure git
+    diff math on snarf, no LLM call, same "report, don't act" discipline
+    as everything else in this pipeline: this returns a verdict, it does
+    not block, comment on, or archive the card itself. Call it, read the
+    verdict, decide what to do -- same as a human reading review_text.
+
+    Body: {"task_id": "t_..."}. Reads the card's own body for the fenced
+    ```json:review-findings block server.py's chain path embeds -- a card
+    not filed that way (no such block) returns a 400, not a guess."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+
+    try:
+        rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(task_id)} --json")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": out[-2000:]}, status_code=502)
+    try:
+        card = json.loads(out.strip())
+    except json.JSONDecodeError:
+        return JSONResponse({"ok": False, "error": f"unparseable kanban output: {out[-500:]}"}, status_code=502)
+
+    task = card.get("task") or {}
+    body = task.get("body") or ""
+    m = _FENCED_FINDINGS_RE.search(body)
+    if not m:
+        return JSONResponse(
+            {"ok": False, "error": "no embedded review-findings block in this card's body -- "
+                                    "not a review-chain fix card, or filed before that feature existed"},
+            status_code=400,
+        )
+    try:
+        findings_payload = json.loads(m.group(1))
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"embedded findings block is not valid JSON: {exc}"}, status_code=500
+        )
+
+    branch_name = task.get("branch_name") or f"hermes/{task_id}"
+
+    # check_fix_card.py takes --findings-json as a file path (or '-' for
+    # stdin, which _ssh_run has no way to feed) -- write it to a task-scoped
+    # temp file on snarf first, same shape as the model_role_assignments.json
+    # write elsewhere in this file (printf, not a heredoc, to keep quoting
+    # simple for arbitrary JSON content).
+    findings_tmp_path = f"/tmp/check-fix-card-{task_id}.json"
+    write_cmd = f"printf %s {shlex.quote(json.dumps(findings_payload))} > {shlex.quote(findings_tmp_path)}"
+    try:
+        rcw, outw = await _fleet_ssh("snarf", write_cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rcw != 0:
+        return JSONResponse({"ok": False, "error": f"could not stage findings on snarf: {outw[-1000:]}"}, status_code=502)
+
+    check_cmd = (
+        f"{CODER_ENGINE_VENV_PY} {CHECK_FIX_CARD_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--branch-name {shlex.quote(branch_name)} "
+        f"--base-ref master "
+        f"--findings-json {shlex.quote(findings_tmp_path)}; "
+        f"rm -f {shlex.quote(findings_tmp_path)}"
+    )
+    try:
+        rc2, out2 = await _fleet_ssh("snarf", check_cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    brace = out2.find("{")
+    try:
+        if brace < 0:
+            raise ValueError("no JSON object in output")
+        verdict = json.loads(out2[brace:])
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": f"unparseable gate output: {out2[-2000:]}"}, status_code=502)
+
+    return JSONResponse({"ok": True, "task_id": task_id, "branch": branch_name, **verdict})
 
 
 def _parse_checkbox_md(text: str) -> dict:
