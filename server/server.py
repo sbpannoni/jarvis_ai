@@ -5580,7 +5580,16 @@ async def _darkhelix_land(task_id: str, check: str = "tests", open_pr: bool = Tr
         return result
 
     title = f"[hermes] {task_id}: kanban work"
-    body = (f"Filed from the Looking Glass HUD for kanban card `{task_id}`.\n\n"
+    fixes = ""
+    try:   # the card title carries "#N" when it was filed from an issue
+        _card = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
+        _m = _ISSUE_TITLE_RE.match(((_card.get("task") or _card).get("title") or "").strip())
+        if _m:
+            title = f"[hermes] {_m.group(0)} {task_id}: kanban work"
+            fixes = f"Fixes {_m.group(0)}\n\n"
+    except Exception:
+        pass
+    body = (fixes + f"Filed from the Looking Glass HUD for kanban card `{task_id}`.\n\n"
             f"Verification `{check}` passed before this PR was opened.\n\n"
             f"```\n{chr(10).join(verify_out.strip().splitlines()[-12:])}\n```")
     ok, out = await run(
@@ -6509,13 +6518,9 @@ async def darkhelix_downloads() -> JSONResponse:
     """The download backlog: every TODO item blocked on a database or binary,
     joined with a verified URL where we have one."""
     try:
-        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(DARKHELIX_TODO_PATH)}")
+        blocked = [i for i in await _darkhelix_items() if i.get("blocked")]
     except Exception as exc:
         return JSONResponse({"items": [], "error": str(exc)}, status_code=502)
-    if rc != 0:
-        return JSONResponse({"items": [], "error": f"cat exited {rc}"}, status_code=502)
-
-    blocked = [i for i in _parse_darkhelix_todo(out) if i.get("blocked")]
     try:
         filed, filed_titles = await _submitted_keys()
     except Exception:
@@ -6569,10 +6574,10 @@ async def darkhelix_download_schedule(request: Request) -> JSONResponse:
     payload = await request.json()
     item_id = (payload.get("item_id") or "").strip()
     try:
-        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(DARKHELIX_TODO_PATH)}")
+        _items = await _darkhelix_items()
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    item = next((i for i in _parse_darkhelix_todo(out) if i.get("id") == item_id), None)
+    item = next((i for i in _items if i.get("id") == item_id), None)
     if not item:
         return JSONResponse({"ok": False, "error": "no such TODO item"}, status_code=400)
     entry = _download_entry_for(item.get("text", ""))
@@ -6721,6 +6726,102 @@ async def darkhelix_download_progress(entry_id: str) -> JSONResponse:
                          "tail": "\n".join(lines[1:]), "dest": dest_state})
 
 
+# ----------------------------------------------- DARKHELIX work items = GitHub issues
+# Since 2026-09-27 the tracker is GitHub Issues on sbpannoni/DARKHELIX and
+# TODO.md is GENERATED from them (tracker-reconcile on snarf). Every consumer
+# that used to parse TODO.md -- the SUBMIT WORK picker, the download backlog,
+# the task-output view -- reads issues through this one function instead, in
+# the same item shape they already understood. Item titles are "#N title", so
+# a card filed from one carries the issue number in its own title: that is the
+# link card -> issue that "filed" badges, issue comments and `Fixes #N` on the
+# landing PR are all keyed on, and it survives the item being reworded.
+DARKHELIX_ISSUE_REPO = "sbpannoni/DARKHELIX"
+_AREA_SECTION = {
+    "area:blocked-db": "1. Blocked — missing database or binary",
+    "area:ready-to-run": "2. Ready to run — dependencies satisfied, flag off, never exercised",
+    "area:correctness": "3. Correctness — flags that lie about what they do",
+    "area:taxor": "4. Taxor",
+    "area:evaluation": "5. Evaluation suite",
+    "area:ui": "6. UI — needs a live Electron session against real outputs",
+    "area:outputs": "6b. Outputs that never reach the operator",
+    "area:code-quality": "7. Code quality — non-blocking",
+    "area:server-tier": "8. Optional / heavy / server-tier",
+}
+_ISSUE_ITEMS_CACHE: dict = {"ts": 0.0, "items": None}
+_ISSUE_TITLE_RE = re.compile(r"^#(\d+)\b")
+
+
+async def _darkhelix_items(max_age: float = 30.0) -> list[dict]:
+    """Open DARKHELIX issues as picker items. Raises on failure (callers report it)."""
+    now = time.time()
+    if _ISSUE_ITEMS_CACHE["items"] is not None and now - _ISSUE_ITEMS_CACHE["ts"] < max_age:
+        return [dict(i) for i in _ISSUE_ITEMS_CACHE["items"]]
+    rc, out = await _fleet_ssh(
+        "snarf", f"gh issue list -R {DARKHELIX_ISSUE_REPO} --state open --limit 500 "
+                 "--json number,title,body,labels,url")
+    if rc != 0:
+        raise RuntimeError(f"gh issue list exited {rc}: {out[-300:]}")
+    items = []
+    order = list(_AREA_SECTION)
+    for iss in json.loads(out):
+        labels = {l["name"] for l in iss.get("labels") or []}
+        area = next((l for l in order if l in labels), None)
+        section = _AREA_SECTION.get(area, "Unsorted — no area set yet")
+        body = (iss.get("body") or "").split("\n\n---\n_Migrated from", 1)[0].strip()
+        text = body or iss["title"]
+        items.append({
+            "id": f"gh-{iss['number']}", "issue": iss["number"], "url": iss.get("url"),
+            "section": section,
+            "blocked": "status:waiting" in labels,
+            "wip": "status:in-progress" in labels,
+            "needs_ui": area == "area:ui" or _todo_needs_ui(section, text),
+            "text": text,
+            "title": f"#{iss['number']} {iss['title']}"[:160],
+            "_order": (order.index(area) if area in order else len(order), iss["number"]),
+        })
+    items.sort(key=lambda i: i.pop("_order"))
+    _ISSUE_ITEMS_CACHE.update(ts=now, items=[dict(i) for i in items])
+    return items
+
+
+def _card_for_item(item: dict, filed: dict, filed_titles: dict) -> dict | None:
+    """The card already filed for this item: by submission key, exact title,
+    or -- for issue items -- any card whose title starts with its "#N"."""
+    hit = (filed.get(_submission_key(item["title"], item["text"]))
+           or filed_titles.get(item["title"].strip()))
+    if hit or not item.get("issue"):
+        return hit
+    # Cards filed before 2026-09-27 were keyed on the old TODO.md item text,
+    # which is the first line of the migrated issue body.
+    legacy_title = item["text"].split("\n")[0][:140]
+    hit = (filed.get(_submission_key(legacy_title, item["text"]))
+           or filed_titles.get(legacy_title.strip()))
+    if hit:
+        return hit
+    tag = f"#{item['issue']}"
+    for title, card in filed_titles.items():
+        m = _ISSUE_TITLE_RE.match(title)
+        if m and m.group(0) == tag:
+            return card
+    return None
+
+
+async def _issue_note_card(title: str, task_id: str, how: str) -> None:
+    """Best-effort: comment the card on its issue and mark the issue in progress."""
+    m = _ISSUE_TITLE_RE.match(title or "")
+    if not m or not _TASK_ID_RE.match(task_id or ""):
+        return
+    n = m.group(1)
+    msg = (f"Kanban card `{task_id}` filed from Looking Glass ({how}). "
+           f"This issue closes when the PR that lands it says `Fixes #{n}`.")
+    try:
+        await _fleet_ssh("snarf", f"gh issue comment {n} -R {DARKHELIX_ISSUE_REPO} --body {shlex.quote(msg)} "
+                                  f"&& gh issue edit {n} -R {DARKHELIX_ISSUE_REPO} --add-label status:in-progress")
+        _ISSUE_ITEMS_CACHE["ts"] = 0.0
+    except Exception:
+        pass
+
+
 @app.get("/api/darkhelix-todo")
 async def darkhelix_todo() -> JSONResponse:
     """Real, current TODO.md items from DARKHELIX (snarf), for the SUBMIT
@@ -6734,12 +6835,9 @@ async def darkhelix_todo() -> JSONResponse:
     it either. That is how an item whose fix is already sitting in a merged
     or open PR stays sitting in this picker looking like open work."""
     try:
-        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(DARKHELIX_TODO_PATH)}")
+        items = await _darkhelix_items()
     except Exception as exc:
         return JSONResponse({"items": [], "error": str(exc)}, status_code=502)
-    if rc != 0:
-        return JSONResponse({"items": [], "error": f"cat exited {rc}"}, status_code=502)
-    items = _parse_darkhelix_todo(out)
 
     # A board that can't be read costs the badges, not the picker.
     board_error = None
@@ -6752,10 +6850,9 @@ async def darkhelix_todo() -> JSONResponse:
         # which is how the picker files by default. Adding notes makes a
         # different card on purpose -- different instructions are a different
         # request. Title second, for the cards that predate the key.
-        item["filed_as"] = (filed.get(_submission_key(item["title"], item["text"]))
-                            or filed_titles.get(item["title"].strip()))
+        item["filed_as"] = _card_for_item(item, filed, filed_titles)
 
-    return JSONResponse({"items": items, "board_error": board_error})
+    return JSONResponse({"items": items, "board_error": board_error, "source": "github-issues"})
 
 
 # ------------------------------------------- TODO.md <- board write-back
@@ -7025,11 +7122,7 @@ async def kanban_follow_up(task_id: str) -> JSONResponse:
     items: list[dict] = []
     todo_error = None
     try:
-        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(DARKHELIX_TODO_PATH)}")
-        if rc == 0:
-            items = _parse_darkhelix_todo(out)
-        else:
-            todo_error = f"cat exited {rc}"
+        items = await _darkhelix_items()
     except Exception as exc:
         todo_error = str(exc)
 
@@ -7039,9 +7132,7 @@ async def kanban_follow_up(task_id: str) -> JSONResponse:
         except Exception:
             filed, filed_titles = {}, {}
         for item in items:
-            item["filed_as"] = (
-                filed.get(_submission_key(item["title"], item["text"]))
-                or filed_titles.get(item["title"].strip()))
+            item["filed_as"] = _card_for_item(item, filed, filed_titles)
 
     suggested = []
     if handoff and items:
@@ -7155,6 +7246,8 @@ async def kanban_create(request: Request) -> JSONResponse:
             body=body,
         )
 
+    if not duplicate:
+        await _issue_note_card(title, task_id, "single card, triage")
     return JSONResponse({"ok": True, "task": data, "duplicate": duplicate,
                          "idempotency_key": idempotency_key,
                          "isolated": bool(prov.get("isolated")),

@@ -1,6 +1,7 @@
 "use strict";
 /* ============================== SUBMIT WORK ==========================
-   One-click work submission: pick a real DARKHELIX TODO.md item, add
+   One-click work submission: pick a real DARKHELIX work item (a GitHub
+   issue since 2026-09-27; TODO.md is generated from them), add
    optional instructions, submit -- files a real kanban card via
    /api/kanban/create, always to --triage (Hermes's specifier still fleshes
    it out and decomposes it before anything executes; see server.py's
@@ -291,7 +292,10 @@ function submitWorkRenderSelected(panel){
             : ""}). Submitting with no extra
          instructions returns that same card rather than making a second one.</div>`
     : "";
-  box.innerHTML = `<div class="sw-selected-section">${submitWorkEsc(item.section || "")}</div>
+  // Issue-backed items (2026-09-27) link to their GitHub issue -- the tracker.
+  const issueLink = item.url
+    ? ` · <a href="${submitWorkEsc(item.url)}" target="_blank" rel="noopener">open issue #${item.issue} ↗</a>` : "";
+  box.innerHTML = `<div class="sw-selected-section">${submitWorkEsc(item.section || "")}${issueLink}</div>
     ${uiWarn}
     ${filed}
     <div class="sw-selected-text">${submitWorkEsc(item.text).replace(/\n/g,"<br>")}</div>`;
@@ -887,13 +891,13 @@ function openSubmitWork(){
     panel.innerHTML = `
       <div class="sw-head">
         <span class="sw-head-title">SUBMIT WORK</span>
-        <span class="sw-head-sub">DARKHELIX TODO.md · files to triage</span>
+        <span class="sw-head-sub">DARKHELIX GitHub issues · files to triage</span>
         <span class="sw-filed-note"></span>
         <span class="sw-head-spacer"></span>
         <button class="sw-blocked-toggle" type="button">show blocked</button>
         <button class="sw-ui-toggle" type="button" title="Items that need a live Electron/UI session — hidden by default because a dispatched worker has no display">show UI-run</button>
         <a class="sw-sync" href="https://github.com/users/sbpannoni/projects/1" target="_blank" rel="noopener" title="DARKHELIX work is tracked in GitHub Issues since 2026-09-27; TODO.md is generated from them hourly. Opens the tracker board.">↗ tracker</a>
-        <button class="sw-reload" type="button" title="Re-read TODO.md">⟲ reload</button>
+        <button class="sw-reload" type="button" title="Re-read the open issues">⟲ reload</button>
       </div>
       <div class="sw-body">
         <div class="sw-col sw-col-list">
