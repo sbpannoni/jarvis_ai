@@ -2237,6 +2237,112 @@ async def review_file(request: Request) -> JSONResponse:
     return JSONResponse(response)
 
 
+class _FixCardError(Exception):
+    def __init__(self, error: str, status_code: int = 502):
+        super().__init__(error)
+        self.error = error
+        self.status_code = status_code
+
+
+async def _fetch_fix_card(task_id: str) -> tuple[dict, list, str]:
+    """Fetch a fix card and extract what every review-chain gate needs:
+    the raw card dict, its structured findings (parsed from the fenced
+    ```json:review-findings block /api/review-file's chain path embeds),
+    and its branch name. Shared by check-fix-card, closure-review, and
+    process-fix-card so the extraction logic lives in exactly one place."""
+    try:
+        rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(task_id)} --json")
+    except Exception as exc:
+        raise _FixCardError(str(exc)) from exc
+    if rc != 0:
+        raise _FixCardError(out[-2000:])
+    try:
+        card = json.loads(out.strip())
+    except json.JSONDecodeError:
+        raise _FixCardError(f"unparseable kanban output: {out[-500:]}")
+
+    task = card.get("task") or {}
+    body = task.get("body") or ""
+    m = _FENCED_FINDINGS_RE.search(body)
+    if not m:
+        raise _FixCardError(
+            "no embedded review-findings block in this card's body -- "
+            "not a review-chain fix card, or filed before that feature existed",
+            status_code=400,
+        )
+    try:
+        findings_payload = json.loads(m.group(1))
+    except json.JSONDecodeError as exc:
+        raise _FixCardError(f"embedded findings block is not valid JSON: {exc}", status_code=500) from exc
+
+    branch_name = task.get("branch_name") or f"hermes/{task_id}"
+    return card, findings_payload.get("findings", []), branch_name
+
+
+async def _stage_findings_on_snarf(task_id: str, findings: list, suffix: str) -> str:
+    """check_fix_card.py/dispatch_closure_review_task.py both take
+    --findings-json as a file path (or '-' for stdin, which _ssh_run has
+    no way to feed) -- write it to a task-scoped temp file on snarf first,
+    same shape as the model_role_assignments.json write elsewhere in this
+    file. Caller is responsible for `rm -f`'ing it once done (folded into
+    the same ssh command that reads it, so one round trip covers both)."""
+    tmp_path = f"/tmp/{suffix}-{task_id}.json"
+    write_cmd = f"printf %s {shlex.quote(json.dumps({'findings': findings}))} > {shlex.quote(tmp_path)}"
+    rcw, outw = await _fleet_ssh("snarf", write_cmd)
+    if rcw != 0:
+        raise _FixCardError(f"could not stage findings on snarf: {outw[-1000:]}")
+    return tmp_path
+
+
+async def _run_mechanical_gates(task_id: str, findings: list, branch_name: str) -> dict:
+    tmp_path = await _stage_findings_on_snarf(task_id, findings, "check-fix-card")
+    check_cmd = (
+        f"{CODER_ENGINE_VENV_PY} {CHECK_FIX_CARD_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--branch-name {shlex.quote(branch_name)} "
+        f"--base-ref master "
+        f"--findings-json {shlex.quote(tmp_path)}; "
+        f"rm -f {shlex.quote(tmp_path)}"
+    )
+    rc2, out2 = await _fleet_ssh("snarf", check_cmd)
+    brace = out2.find("{")
+    if brace < 0:
+        raise _FixCardError(f"unparseable gate output: {out2[-2000:]}")
+    try:
+        return json.loads(out2[brace:])
+    except json.JSONDecodeError as exc:
+        raise _FixCardError(f"unparseable gate output: {out2[-2000:]}") from exc
+
+
+async def _resolve_reviewer_model() -> str:
+    rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
+    model = json.loads(out0).get("reviewer") if rc0 == 0 else None
+    if not model:
+        raise _FixCardError("could not resolve reviewer's assigned model")
+    return model
+
+
+async def _run_closure_review(task_id: str, findings: list, branch_name: str, model: str) -> dict:
+    tmp_path = await _stage_findings_on_snarf(task_id, findings, "closure-review")
+    closure_cmd = (
+        f"{CODER_ENGINE_VENV_PY} {DISPATCH_CLOSURE_REVIEW_TASK_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--branch-name {shlex.quote(branch_name)} "
+        f"--base-ref master "
+        f"--model {shlex.quote(model)} "
+        f"--findings-json {shlex.quote(tmp_path)}; "
+        f"rm -f {shlex.quote(tmp_path)}"
+    )
+    rc2, out2 = await _fleet_ssh("snarf", closure_cmd)
+    brace = out2.find("{")
+    if brace < 0:
+        raise _FixCardError(f"unparseable closure-review output: {out2[-2000:]}")
+    try:
+        return json.loads(out2[brace:])
+    except json.JSONDecodeError as exc:
+        raise _FixCardError(f"unparseable closure-review output: {out2[-2000:]}") from exc
+
+
 @app.post("/api/kanban/check-fix-card")
 async def check_fix_card(request: Request) -> JSONResponse:
     """Run check_fix_card.py's two mechanical gates (finding-closure,
@@ -2256,68 +2362,12 @@ async def check_fix_card(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
 
     try:
-        rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(task_id)} --json")
+        _card, findings, branch_name = await _fetch_fix_card(task_id)
+        verdict = await _run_mechanical_gates(task_id, findings, branch_name)
+    except _FixCardError as exc:
+        return JSONResponse({"ok": False, "error": exc.error}, status_code=exc.status_code)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    if rc != 0:
-        return JSONResponse({"ok": False, "error": out[-2000:]}, status_code=502)
-    try:
-        card = json.loads(out.strip())
-    except json.JSONDecodeError:
-        return JSONResponse({"ok": False, "error": f"unparseable kanban output: {out[-500:]}"}, status_code=502)
-
-    task = card.get("task") or {}
-    body = task.get("body") or ""
-    m = _FENCED_FINDINGS_RE.search(body)
-    if not m:
-        return JSONResponse(
-            {"ok": False, "error": "no embedded review-findings block in this card's body -- "
-                                    "not a review-chain fix card, or filed before that feature existed"},
-            status_code=400,
-        )
-    try:
-        findings_payload = json.loads(m.group(1))
-    except json.JSONDecodeError as exc:
-        return JSONResponse(
-            {"ok": False, "error": f"embedded findings block is not valid JSON: {exc}"}, status_code=500
-        )
-
-    branch_name = task.get("branch_name") or f"hermes/{task_id}"
-
-    # check_fix_card.py takes --findings-json as a file path (or '-' for
-    # stdin, which _ssh_run has no way to feed) -- write it to a task-scoped
-    # temp file on snarf first, same shape as the model_role_assignments.json
-    # write elsewhere in this file (printf, not a heredoc, to keep quoting
-    # simple for arbitrary JSON content).
-    findings_tmp_path = f"/tmp/check-fix-card-{task_id}.json"
-    write_cmd = f"printf %s {shlex.quote(json.dumps(findings_payload))} > {shlex.quote(findings_tmp_path)}"
-    try:
-        rcw, outw = await _fleet_ssh("snarf", write_cmd)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    if rcw != 0:
-        return JSONResponse({"ok": False, "error": f"could not stage findings on snarf: {outw[-1000:]}"}, status_code=502)
-
-    check_cmd = (
-        f"{CODER_ENGINE_VENV_PY} {CHECK_FIX_CARD_PY} "
-        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
-        f"--branch-name {shlex.quote(branch_name)} "
-        f"--base-ref master "
-        f"--findings-json {shlex.quote(findings_tmp_path)}; "
-        f"rm -f {shlex.quote(findings_tmp_path)}"
-    )
-    try:
-        rc2, out2 = await _fleet_ssh("snarf", check_cmd)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-
-    brace = out2.find("{")
-    try:
-        if brace < 0:
-            raise ValueError("no JSON object in output")
-        verdict = json.loads(out2[brace:])
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"ok": False, "error": f"unparseable gate output: {out2[-2000:]}"}, status_code=502)
 
     return JSONResponse({"ok": True, "task_id": task_id, "branch": branch_name, **verdict})
 
@@ -2343,76 +2393,248 @@ async def closure_review(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
 
     try:
-        rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(task_id)} --json")
+        _card, findings, branch_name = await _fetch_fix_card(task_id)
+        model = await _resolve_reviewer_model()
+        verdict = await _run_closure_review(task_id, findings, branch_name, model)
+    except _FixCardError as exc:
+        return JSONResponse({"ok": False, "error": exc.error}, status_code=exc.status_code)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    if rc != 0:
-        return JSONResponse({"ok": False, "error": out[-2000:]}, status_code=502)
-    try:
-        card = json.loads(out.strip())
-    except json.JSONDecodeError:
-        return JSONResponse({"ok": False, "error": f"unparseable kanban output: {out[-500:]}"}, status_code=502)
-
-    task = card.get("task") or {}
-    body = task.get("body") or ""
-    m = _FENCED_FINDINGS_RE.search(body)
-    if not m:
-        return JSONResponse(
-            {"ok": False, "error": "no embedded review-findings block in this card's body -- "
-                                    "not a review-chain fix card, or filed before that feature existed"},
-            status_code=400,
-        )
-    try:
-        findings_payload = json.loads(m.group(1))
-    except json.JSONDecodeError as exc:
-        return JSONResponse(
-            {"ok": False, "error": f"embedded findings block is not valid JSON: {exc}"}, status_code=500
-        )
-
-    branch_name = task.get("branch_name") or f"hermes/{task_id}"
-
-    try:
-        rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
-        model = json.loads(out0).get("reviewer") if rc0 == 0 else None
-    except Exception:
-        model = None
-    if not model:
-        return JSONResponse(
-            {"ok": False, "error": "could not resolve reviewer's assigned model"}, status_code=502
-        )
-
-    findings_tmp_path = f"/tmp/closure-review-{task_id}.json"
-    write_cmd = f"printf %s {shlex.quote(json.dumps(findings_payload))} > {shlex.quote(findings_tmp_path)}"
-    try:
-        rcw, outw = await _fleet_ssh("snarf", write_cmd)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-    if rcw != 0:
-        return JSONResponse({"ok": False, "error": f"could not stage findings on snarf: {outw[-1000:]}"}, status_code=502)
-
-    closure_cmd = (
-        f"{CODER_ENGINE_VENV_PY} {DISPATCH_CLOSURE_REVIEW_TASK_PY} "
-        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
-        f"--branch-name {shlex.quote(branch_name)} "
-        f"--base-ref master "
-        f"--model {shlex.quote(model)} "
-        f"--findings-json {shlex.quote(findings_tmp_path)}; "
-        f"rm -f {shlex.quote(findings_tmp_path)}"
-    )
-    try:
-        rc2, out2 = await _fleet_ssh("snarf", closure_cmd)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-
-    brace = out2.find("{")
-    try:
-        if brace < 0:
-            raise ValueError("no JSON object in output")
-        verdict = json.loads(out2[brace:])
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"ok": False, "error": f"unparseable closure-review output: {out2[-2000:]}"}, status_code=502)
 
     return JSONResponse({"ok": True, "task_id": task_id, "branch": branch_name, "model": model, **verdict})
+
+
+_REVIEW_CHAIN_MAX_ATTEMPTS = 3
+_FINDING_FIELDS = ("file", "line", "summary", "failure_scenario", "suggested_fix")
+
+
+def _clean_finding(f: dict) -> dict:
+    """Strip a finding dict back to the canonical Finding shape, dropping
+    any bookkeeping keys a gate added (check_fix_card.py's `addressed`/
+    `evidence`) before it goes into a new card's embedded findings block."""
+    return {k: f.get(k) for k in _FINDING_FIELDS if k in f}
+
+
+async def _fix_card_attempt_number(task_id: str) -> int:
+    """How many review-chain fix-card attempts precede this one, counting
+    this one as the last: 1 for the original chain-glue-filed card, 2 for
+    its first retry, etc. Walks --parent links upward only through cards
+    that are THEMSELVES fix cards (have the embedded findings block) --
+    stops at the [Review] card, which has none, or at a missing/deleted
+    parent."""
+    seen = 0
+    current = task_id
+    for _ in range(_REVIEW_CHAIN_MAX_ATTEMPTS + 2):  # hard cap, never loop forever on a cycle
+        seen += 1
+        try:
+            rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(current)} --json")
+            if rc != 0:
+                break
+            card = json.loads(out.strip())
+        except Exception:
+            break
+        parents = card.get("parents") or []
+        if not parents:
+            break
+        parent_id = parents[0]
+        try:
+            rc2, out2 = await _kanban_ssh(f"hermes kanban show {shlex.quote(parent_id)} --json")
+            if rc2 != 0:
+                break
+            parent_card = json.loads(out2.strip())
+        except Exception:
+            break
+        parent_body = (parent_card.get("task") or {}).get("body") or ""
+        if not _FENCED_FINDINGS_RE.search(parent_body):
+            break  # parent is the [Review] card, not another fix-card attempt
+        current = parent_id
+    return seen
+
+
+@app.post("/api/kanban/process-fix-card")
+async def process_fix_card(request: Request) -> JSONResponse:
+    """The orchestration this chain has been missing: run both gates on a
+    completed fix card in order, and ACT on the combined verdict --
+    accept, retry (file a new linked fix card with the objections), or
+    escalate (block the card with `--kind needs_input`, for a human).
+    Unlike check-fix-card/closure-review, this one takes real,
+    board-visible action -- everything upstream of it only reports.
+
+    Decision logic, cheapest check first:
+    - test_tamper flagged -> escalate immediately (a diff that touches
+      tests alongside source needs a human's judgment on whether the
+      test change is legitimate, no amount of automation should decide
+      that on its own).
+    - any finding mechanically never touched by the diff -> retry without
+      spending a model call on closure-review; the mechanical gate
+      already answered the question closure-review exists to ask.
+    - mechanical gates clean -> run closure-review. Any unresolved finding
+      or newly introduced issue -> retry with the specific objections. A
+      closure-review that could not produce a structured verdict
+      (used_unstructured_fallback) -> escalate; an unverifiable verdict is
+      not grounds to either accept or safely retry.
+    - everything resolved, nothing new -> accept (leaves the card as-is;
+      accepting means "ready for a human to merge", not auto-merge --
+      that boundary stays exactly where dispatch_review_task.py's
+      docstring already drew it).
+
+    Retry is capped at 3 attempts total (counted by walking --parent
+    links through prior fix-card attempts); the 3rd failing attempt
+    escalates instead of retrying a 4th time.
+
+    Body: {"task_id": "t_..."} (a fix card, not the original review card).
+    """
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+
+    try:
+        card, findings, branch_name = await _fetch_fix_card(task_id)
+        mechanical = await _run_mechanical_gates(task_id, findings, branch_name)
+    except _FixCardError as exc:
+        return JSONResponse({"ok": False, "error": exc.error}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    task = card.get("task") or {}
+    target_file = (task.get("title") or "").removeprefix("[Fix] ").strip() or "the target file"
+    attempt = await _fix_card_attempt_number(task_id)
+
+    async def _act(action: str, reason: str, extra: dict | None = None) -> JSONResponse:
+        result = {
+            "ok": True, "task_id": task_id, "branch": branch_name, "attempt": attempt,
+            "action": action, "reason": reason, "mechanical": mechanical, **(extra or {}),
+        }
+        if action == "escalate":
+            # Positional `reason` must precede `--kind` -- hermes's argparse
+            # (task_id [reason ...] --kind X) rejects the reverse order as
+            # an unrecognized argument, confirmed live.
+            block_cmd = (
+                f"hermes kanban block {shlex.quote(task_id)} "
+                f"{shlex.quote(f'Review chain could not auto-resolve after {attempt} attempt(s): {reason}')} "
+                f"--kind needs_input"
+            )
+            try:
+                rcb, outb = await _kanban_ssh(block_cmd)
+            except Exception as exc:
+                result["ok"] = False
+                result["escalate_error"] = str(exc)
+                return JSONResponse(result)
+            if rcb != 0:
+                # Do not report a successful escalation the board doesn't
+                # reflect -- a card that failed to block (e.g. never
+                # claimed, already archived) needs that surfaced, not
+                # silently swallowed.
+                result["ok"] = False
+                result["escalate_error"] = outb[-1000:]
+        return JSONResponse(result)
+
+    if mechanical.get("test_tamper", {}).get("flagged"):
+        return await _act("escalate", "diff touches test files alongside source in the same change")
+
+    unaddressed = [f for f in mechanical.get("finding_closure", []) if not f.get("addressed")]
+    if unaddressed:
+        reason = "; ".join(f"{f.get('file')}:{f.get('line')} not addressed" for f in unaddressed)
+        if attempt >= _REVIEW_CHAIN_MAX_ATTEMPTS:
+            return await _act("escalate", f"{attempt} attempts exhausted, still unaddressed: {reason}")
+        # Strip check_fix_card.py's own added keys (addressed/evidence) back
+        # to the clean Finding shape before it goes into a new card's
+        # embedded findings block -- otherwise every retry cycle would
+        # accumulate one more generation's worth of stale bookkeeping keys.
+        retry_findings = [_clean_finding(f) for f in unaddressed]
+        return await _file_retry_card(task_id, branch_name, target_file, retry_findings, reason, attempt, mechanical)
+
+    try:
+        model = await _resolve_reviewer_model()
+        closure = await _run_closure_review(task_id, findings, branch_name, model)
+    except _FixCardError as exc:
+        return JSONResponse({"ok": False, "error": exc.error}, status_code=exc.status_code)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    if closure.get("used_unstructured_fallback"):
+        return await _act(
+            "escalate", "closure-review could not produce a structured verdict", {"closure": closure}
+        )
+
+    verdicts = closure.get("verdicts") or []
+    new_issues = closure.get("new_issues_introduced") or []
+    unresolved_idx = {v["finding_index"] for v in verdicts if not v.get("resolved")}
+    unresolved_findings = [f for i, f in enumerate(findings) if i in unresolved_idx]
+    if unresolved_findings or new_issues:
+        objections = "; ".join(
+            v.get("rationale", "") for v in verdicts if not v.get("resolved")
+        ) or "closure-review flagged new issues"
+        if attempt >= _REVIEW_CHAIN_MAX_ATTEMPTS:
+            return await _act(
+                "escalate", f"{attempt} attempts exhausted, still unresolved: {objections}", {"closure": closure}
+            )
+        retry_findings = unresolved_findings + new_issues
+        return await _file_retry_card(
+            task_id, branch_name, target_file, retry_findings, objections, attempt, mechanical, closure
+        )
+
+    return await _act("accept", "all findings resolved, no new issues introduced", {"closure": closure})
+
+
+async def _file_retry_card(
+    parent_task_id: str, parent_branch: str, target_file: str, retry_findings: list,
+    reason: str, prior_attempt: int, mechanical: dict, closure: dict | None = None,
+) -> JSONResponse:
+    """File attempt N+1: a new fix card, --parent'd to the failing attempt
+    (not the original [Review] card), carrying only the findings that are
+    still outstanding plus anything closure-review newly flagged. Same
+    body shape /api/review-file's chain path uses, so this new card is
+    itself processable by process-fix-card again."""
+    fix_lines = [
+        f"Attempt {prior_attempt} did not fully resolve `{target_file}` -- {reason}\n",
+        f"Fix the {len(retry_findings)} outstanding issue(s) below. See the linked "
+        f"parent card ({parent_task_id}) for what was tried last.\n",
+    ]
+    for i, f in enumerate(retry_findings, 1):
+        loc = f"{f.get('file', target_file)}:{f['line']}" if f.get("line") is not None else f.get("file", target_file)
+        fix_lines.append(f"{i}. {loc} -- {f.get('summary', '')}")
+        if f.get("failure_scenario"):
+            fix_lines.append(f"   Failure scenario: {f['failure_scenario']}")
+        if f.get("suggested_fix"):
+            fix_lines.append(f"   Suggested fix: {f['suggested_fix']}")
+    fix_lines.append("\n```json:review-findings")
+    fix_lines.append(json.dumps({"source_task": parent_task_id, "target_file": target_file, "findings": retry_findings}, indent=2))
+    fix_lines.append("```")
+    fix_title = f"[Fix] {target_file} (attempt {prior_attempt + 1})"
+    fix_body = "\n".join(fix_lines)
+    idempotency_key = _submission_key(fix_title, fix_body)
+
+    retry_cmd = (
+        "hermes kanban create "
+        f"{shlex.quote(fix_title[:200])} "
+        f"--body {shlex.quote(fix_body)} "
+        "--workspace scratch "
+        f"--idempotency-key {shlex.quote(idempotency_key)} "
+        f"--assignee {shlex.quote(_darkhelix_assignee())} "
+        f"--parent {shlex.quote(parent_task_id)} "
+        "--created-by looking-glass --json"
+    )
+    result = {
+        "ok": True, "task_id": parent_task_id, "branch": parent_branch, "attempt": prior_attempt,
+        "action": "retry", "reason": reason, "mechanical": mechanical,
+    }
+    if closure is not None:
+        result["closure"] = closure
+    try:
+        rc, out = await _kanban_ssh(retry_cmd)
+    except Exception as exc:
+        result["retry_error"] = str(exc)
+        return JSONResponse(result)
+    if rc != 0:
+        result["retry_error"] = out[-2000:]
+        return JSONResponse(result)
+    try:
+        result["retry_task"] = json.loads(out.strip())
+    except json.JSONDecodeError:
+        result["retry_error"] = f"unparseable kanban output: {out[-500:]}"
+    return JSONResponse(result)
 
 
 def _parse_checkbox_md(text: str) -> dict:
