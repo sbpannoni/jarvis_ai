@@ -892,7 +892,7 @@ function openSubmitWork(){
         <span class="sw-head-spacer"></span>
         <button class="sw-blocked-toggle" type="button">show blocked</button>
         <button class="sw-ui-toggle" type="button" title="Items that need a live Electron/UI session — hidden by default because a dispatched worker has no display">show UI-run</button>
-        <button class="sw-sync" type="button" title="Write the board's state back into TODO.md on snarf: tick items whose card is done, tag items whose card is in flight **WIP**. Never unticks anything.">⇄ sync TODO.md</button>
+        <a class="sw-sync" href="https://github.com/users/sbpannoni/projects/1" target="_blank" rel="noopener" title="DARKHELIX work is tracked in GitHub Issues since 2026-09-27; TODO.md is generated from them hourly. Opens the tracker board.">↗ tracker</a>
         <button class="sw-reload" type="button" title="Re-read TODO.md">⟲ reload</button>
       </div>
       <div class="sw-body">
@@ -949,7 +949,7 @@ function openSubmitWork(){
       swPrefSave(SW_SHOW_UI_KEY, !swPrefLoad(SW_SHOW_UI_KEY, false));
       submitWorkRenderList(panel);
     };
-    panel.querySelector(".sw-sync").onclick = () => submitWorkSync(panel);
+    // TODO.md sync retired 2026-09-27: .sw-sync is now a link to the issue tracker.
     panel.querySelector(".sw-submit").onclick = () =>
       (state.mode === "swarm" ? submitWorkSwarm(panel) : submitWorkSubmit(panel));
 

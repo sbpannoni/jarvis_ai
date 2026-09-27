@@ -6837,7 +6837,17 @@ async def darkhelix_todo_sync() -> JSONResponse:
     file on snarf still hashes to what was just read. TODO.md is edited by
     hand as the single tracker, and clobbering an edit made in the seconds
     this took would be a far worse bug than the staleness being fixed. A
-    `.bak` is kept alongside regardless."""
+    `.bak` is kept alongside regardless.
+
+    RETIRED 2026-09-27: DARKHELIX work is tracked in GitHub Issues and TODO.md
+    is generated from them by tracker-reconcile on snarf. Writing ticks into the
+    working checkout's TODO.md now only creates a dirty file that blocks git
+    pull and is overwritten anyway, so this refuses. Kept (not deleted) so an
+    old HUD tab gets an explanation instead of a 404."""
+    return JSONResponse({"ok": False, "retired": True,
+                         "error": "TODO.md sync is retired: the tracker is GitHub Issues "
+                                  "(https://github.com/users/sbpannoni/projects/1); TODO.md is generated hourly."},
+                        status_code=410)
     try:
         rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(DARKHELIX_TODO_PATH)}")
     except Exception as exc:
