@@ -5467,6 +5467,10 @@ _DH_LAND_STATUS: dict = {
     "enabled": False, "seeded": False, "last_tick": None, "last_error": None,
     "note": None, "landed": 0, "recent": [],
 }
+# Fire-and-forget landing tasks must keep a live reference somewhere, or
+# asyncio is free to garbage-collect them mid-flight (documented behavior,
+# not a hypothetical) -- discarded from this set in _run_one's own finally.
+_DH_LAND_TASKS: set[asyncio.Task] = set()
 
 
 def _dh_land_load_state() -> None:
@@ -5506,15 +5510,58 @@ def _dh_land_record(entry: dict) -> None:
     _DH_LAND_STATUS["recent"] = ([entry] + _DH_LAND_STATUS["recent"])[:20]
 
 
-async def _dh_reviewed(task_id: str) -> bool:
-    """True once the card's history carries a review_requested event -- see
-    the module comment above for why this is the gate rather than just
-    checking `status == "done"`."""
+class _DhOutage(Exception):
+    """The reviewed-check itself failed (network/API), distinct from a
+    genuine 'not reviewed yet'. Callers must not treat this the same as
+    False -- see _land_darkhelix_tick, which must not mark a card seen (and
+    so permanently skip it) on a transient outage, only on an honest
+    negative answer."""
+
+
+async def _dh_reviewed(task_id: str) -> int | None:
+    """The latest review_requested event's created_at (unix seconds) if the
+    card's history carries one, else None. An int, not a bool: callers that
+    need to know whether the review is still CURRENT (see
+    _dh_review_still_fresh below) need the timestamp, not just presence --
+    a stale review from before later commits must not satisfy the gate.
+
+    Raises _DhOutage on a failed lookup rather than swallowing to a bare
+    False/None -- an outage and a genuine "never reviewed" must be
+    distinguishable to the caller, per the same reasoning _kanban_block's
+    three-way return already documents for its own failure mode."""
     try:
         detail = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
-    except Exception:
-        return False
-    return any(e.get("kind") == "review_requested" for e in detail.get("events") or [])
+    except Exception as exc:
+        raise _DhOutage(str(exc)) from exc
+    review_events = [e for e in (detail.get("events") or []) if e.get("kind") == "review_requested"]
+    if not review_events:
+        return None
+    return max(int(e.get("created_at") or 0) for e in review_events)
+
+
+async def _dh_review_still_fresh(task_id: str, review_ts: int, repo_path: str, branch: str) -> tuple[bool, str]:
+    """True if nothing was committed to this branch after the review that
+    's supposed to cover it. Ties correctness to git state (which this
+    function can check exactly) rather than trying to enumerate every
+    kanban event kind that would mean "more work happened since review" --
+    a card reviewed, then resumed for more commits, then completed via a
+    path that never re-requests review, must not silently pass on the
+    strength of its now-stale first review."""
+    cmd = f"cd {shlex.quote(repo_path)} && git log -1 --format=%ct {shlex.quote(branch)}"
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return False, f"could not read {branch}'s last commit time: {exc}"
+    if rc != 0:
+        return False, f"git log failed on {branch}: {out[-300:]}"
+    try:
+        commit_ts = int(out.strip())
+    except ValueError:
+        return False, f"unparseable commit timestamp: {out[-200:]!r}"
+    if commit_ts > review_ts:
+        return False, (f"branch has a commit ({commit_ts}) after the review "
+                       f"({review_ts}) -- review is stale, more work happened since")
+    return True, ""
 
 
 def _dh_pr_number(pr_url: str) -> str:
@@ -5552,35 +5599,82 @@ async def _dh_wait_for_checks(pr_number: str, cfg: dict) -> tuple[bool, str]:
     """Poll gh's own view of the PR's checks until they resolve. See the
     module comment: this loop IS the merge gate, not a convenience on top of
     one GitHub already enforces -- branch protection is unavailable on this
-    repo."""
+    repo. Treat false negatives (calling a not-actually-green PR "green")
+    as the failure mode to design against, not "took an extra poll"."""
     timeout = int(cfg.get("merge_check_timeout_seconds") or 1800)
     interval = int(cfg.get("merge_check_poll_seconds") or 30)
     deadline = time.monotonic() + timeout
     cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
            f"gh pr checks {shlex.quote(pr_number)} --json name,state,bucket")
+    # `gh pr checks`'s own bucket values (per `gh pr checks --help`): pass,
+    # fail, pending, skipping, cancel. Only `pass`/`skipping` are non-blocking
+    # -- a run cancelled by a re-push, a manual cancel, or an infra timeout
+    # must be read the same as a failure, not as "nothing pending, must be
+    # green" (confirmed bug: a fully-cancelled check set has no "fail"
+    # bucket and doesn't intersect {"pending",""}, so the original version
+    # of this function returned green on CI that never actually ran).
+    FAIL_BUCKETS = {"fail", "cancel"}
+    PENDING_BUCKETS = {"pending", ""}
+    consecutive_tool_errors = 0
     while True:
         try:
             rc, out = await _fleet_ssh("snarf", cmd)
         except Exception as exc:
             return False, f"could not read checks: {exc}"
-        checks: list[dict] = []
         # `gh pr checks` exits 1 the instant nothing has run yet on a brand
-        # new PR ("no checks reported") -- that is pending, not a failure, so
-        # only attempt to parse when there is plausibly JSON to parse.
-        if "no checks reported" not in out.lower():
+        # new PR ("no checks reported") -- that is pending, not a failure.
+        # Any OTHER nonzero exit (expired auth, rate limiting, a broken gh
+        # config on snarf) must not be silently folded into "still pending"
+        # -- that previously masked a persistent, easily-fixed root cause
+        # behind a 30-minute timeout on every single autonomous attempt.
+        no_checks_yet = "no checks reported" in out.lower()
+        if rc != 0 and not no_checks_yet:
+            consecutive_tool_errors += 1
+            if consecutive_tool_errors >= 3:
+                return False, f"gh pr checks failing repeatedly, not a pending-check state: {out[-400:]}"
+            await asyncio.sleep(interval)
+            continue
+        consecutive_tool_errors = 0
+        checks: list[dict] = []
+        if not no_checks_yet:
             try:
                 checks = json.loads(out)
             except Exception:
                 checks = []
         buckets = {c.get("bucket") for c in checks}
-        if checks and "fail" in buckets:
-            failed = [c["name"] for c in checks if c.get("bucket") == "fail"]
-            return False, f"check(s) failed: {', '.join(failed)}"
-        if checks and not ({"pending", ""} & buckets):
+        if checks and (buckets & FAIL_BUCKETS):
+            failed = [c["name"] for c in checks if c.get("bucket") in FAIL_BUCKETS]
+            return False, f"check(s) failed or cancelled: {', '.join(failed)}"
+        if checks and not (buckets & PENDING_BUCKETS):
             return True, f"{len(checks)} check(s) green"
         if time.monotonic() >= deadline:
             return False, f"timed out after {timeout}s waiting for checks"
         await asyncio.sleep(interval)
+
+
+_DH_LANDING_IN_FLIGHT: set[str] = set()
+
+
+async def _dh_pr_actually_merged(pr_number: str) -> bool:
+    """Ground truth for whether a PR landed, independent of gh's exit code
+    -- `gh pr merge`'s own exit is nonzero both when the merge genuinely
+    failed AND when it succeeded but the follow-on --delete-branch step
+    failed (permissions hiccup, already-deleted branch, a transient API
+    error). Conflating those risks a human re-landing an already-merged,
+    now-diverged branch on the strength of a "merge failed" message that
+    was actually true only of branch cleanup."""
+    cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+           f"gh pr view {shlex.quote(pr_number)} --json state")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception:
+        return False
+    if rc != 0:
+        return False
+    try:
+        return json.loads(out).get("state") == "MERGED"
+    except Exception:
+        return False
 
 
 async def _darkhelix_autoland_one(task_id: str) -> dict:
@@ -5590,7 +5684,21 @@ async def _darkhelix_autoland_one(task_id: str) -> dict:
 
     Callers (the poller and the manual trigger below) both gate on
     _dh_reviewed first -- this function does not check it itself, so the
-    reason a card was skipped is visible at the call site."""
+    reason a card was skipped is visible at the call site. Guards against
+    running twice for the same card concurrently (the poller and the
+    manual "Land Autonomously" trigger have no other way to know about
+    each other) with a simple in-process set -- good enough for a single
+    server process, which this always runs as."""
+    if task_id in _DH_LANDING_IN_FLIGHT:
+        return {"ok": False, "stage": "in-flight", "error": "already landing this card"}
+    _DH_LANDING_IN_FLIGHT.add(task_id)
+    try:
+        return await _darkhelix_autoland_one_locked(task_id)
+    finally:
+        _DH_LANDING_IN_FLIGHT.discard(task_id)
+
+
+async def _darkhelix_autoland_one_locked(task_id: str) -> dict:
     cfg = _dh_land_cfg()
     land = await _darkhelix_land(task_id)
     if not land.get("pr_url"):
@@ -5601,31 +5709,80 @@ async def _darkhelix_autoland_one(task_id: str) -> dict:
 
     pr_url = land["pr_url"]
     pr_number = _dh_pr_number(pr_url)
+    branch = _dh_branch(task_id)
+
+    # Freshness: the review this whole path is gated on must still cover
+    # what's actually about to merge -- the commit step above just ran, so
+    # this is the earliest point the true final commit timestamp is known.
+    try:
+        review_ts = await _dh_reviewed(task_id)
+    except _DhOutage as exc:
+        outcome = await _kanban_block(task_id, f"opened {pr_url} but could not "
+                                       f"re-confirm review: {exc}", kind="needs_input")
+        return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
+                "reason": str(exc), "block_result": outcome}
+    if review_ts is None:
+        outcome = await _kanban_block(task_id, f"opened {pr_url} but its review_requested "
+                                       "event disappeared between the gate check and landing",
+                                       kind="needs_input")
+        return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
+                "reason": "no review event found on recheck", "block_result": outcome}
+    fresh, fresh_reason = await _dh_review_still_fresh(task_id, review_ts, DARKHELIX_REPO_PATH, branch)
+    if not fresh:
+        outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
+                                       f"{fresh_reason}", kind="needs_input")
+        return {"ok": False, "stage": "stale-review", "pr_url": pr_url,
+                "reason": fresh_reason, "block_result": outcome}
 
     size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg)
     if not size_ok:
-        await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
-                            f"{size_reason}", kind="needs_input")
-        return {"ok": False, "stage": "size-cap", "pr_url": pr_url, "reason": size_reason}
+        outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
+                                       f"{size_reason}", kind="needs_input")
+        return {"ok": False, "stage": "size-cap", "pr_url": pr_url,
+                "reason": size_reason, "block_result": outcome}
 
     checks_ok, checks_reason = await _dh_wait_for_checks(pr_number, cfg)
     if not checks_ok:
-        await _kanban_block(task_id, f"opened {pr_url}, CI did not pass: "
-                            f"{checks_reason}", kind="needs_input")
-        return {"ok": False, "stage": "checks", "pr_url": pr_url, "reason": checks_reason}
+        outcome = await _kanban_block(task_id, f"opened {pr_url}, CI did not pass: "
+                                       f"{checks_reason}", kind="needs_input")
+        return {"ok": False, "stage": "checks", "pr_url": pr_url,
+                "reason": checks_reason, "block_result": outcome}
+
+    # Re-verify size immediately before merge, not just at PR-open time: the
+    # CI wait above can run up to merge_check_timeout_seconds (default 30m),
+    # long enough for another commit (a bot, an accepted suggestion, a human
+    # amending the open PR) to push the diff past the cap with nothing
+    # having re-checked it since.
+    size_ok2, size_reason2 = await _dh_pr_diff_within_cap(pr_number, cfg)
+    if not size_ok2:
+        outcome = await _kanban_block(task_id, f"opened {pr_url}, CI passed, but grew past "
+                                       f"the size cap during the wait: {size_reason2}", kind="needs_input")
+        return {"ok": False, "stage": "size-cap-recheck", "pr_url": pr_url,
+                "reason": size_reason2, "block_result": outcome}
 
     cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
            f"gh pr merge {shlex.quote(pr_number)} --squash --delete-branch")
+    merge_failed = False
+    merge_error = ""
     try:
         rc, out = await _fleet_ssh("snarf", cmd)
+        if rc != 0:
+            merge_failed, merge_error = True, out[-1500:]
     except Exception as exc:
-        await _kanban_block(task_id, f"opened {pr_url}, CI passed, merge failed: "
-                            f"{exc}", kind="needs_input")
-        return {"ok": False, "stage": "merge", "pr_url": pr_url, "error": str(exc)}
-    if rc != 0:
-        await _kanban_block(task_id, f"opened {pr_url}, CI passed, merge failed: "
-                            f"{out[-500:]}", kind="needs_input")
-        return {"ok": False, "stage": "merge", "pr_url": pr_url, "error": out[-1500:]}
+        merge_failed, merge_error = True, str(exc)
+
+    if merge_failed and await _dh_pr_actually_merged(pr_number):
+        # gh's exit was nonzero, but the PR is actually MERGED on GitHub --
+        # only the follow-on --delete-branch step (or a transport hiccup
+        # after the merge itself succeeded) failed. Treat as success rather
+        # than blocking a card whose work already landed, which would risk
+        # a human re-landing an already-merged, now-diverged branch.
+        merge_failed = False
+    if merge_failed:
+        outcome = await _kanban_block(task_id, f"opened {pr_url}, CI passed, merge failed: "
+                                       f"{merge_error}", kind="needs_input")
+        return {"ok": False, "stage": "merge", "pr_url": pr_url,
+                "error": merge_error, "block_result": outcome}
 
     try:
         await asyncio.to_thread(
@@ -5663,11 +5820,21 @@ async def _land_darkhelix_tick() -> None:
 
     limit = int(_dh_land_cfg().get("land_max_per_tick") or 3)
     for task_id in fresh[:limit]:
-        # Claimed regardless of outcome below -- a background task now owns
-        # this card, same "only ever judged once" contract as verify's seen
-        # set.
+        # Mark seen only on an HONEST answer (reviewed or genuinely not),
+        # never on an outage -- _verify_completions_tick already draws this
+        # line ("leave the card unseen so the next tick retries it") and
+        # this poller's own comment claimed the same parity without actually
+        # having it: mark-seen ran unconditionally before the reviewed
+        # check, so a transient API blip permanently excluded an eligible
+        # card from every future tick.
+        try:
+            review_ts = await _dh_reviewed(task_id)
+        except _DhOutage as exc:
+            _dh_land_record({"task_id": task_id, "verdict": "outage",
+                             "error": str(exc)[:300]})
+            continue  # not marked seen -- retried next tick
         _dh_land_mark_seen(task_id)
-        if not await _dh_reviewed(task_id):
+        if review_ts is None:
             _dh_land_record({"task_id": task_id, "verdict": "skipped",
                              "reason": "no review_requested event on this card"})
             continue
@@ -5685,12 +5852,18 @@ async def _land_darkhelix_tick() -> None:
             except Exception as exc:
                 _dh_land_record({"task_id": tid, "verdict": "error",
                                  "error": str(exc)[:300]})
+            finally:
+                _DH_LAND_TASKS.discard(asyncio.current_task())
 
         # Fired as its own task, not awaited here: a merge-check wait can run
         # up to merge_check_timeout_seconds (default 30m) and must not stall
         # this tick from noticing the NEXT card that clears review in the
-        # meantime.
-        asyncio.get_running_loop().create_task(_run_one())
+        # meantime. Reference retained in _DH_LAND_TASKS -- per asyncio's own
+        # documented behavior, an unreferenced task can be garbage-collected
+        # mid-flight, silently cancelling a merge that may have already run
+        # on GitHub with nothing ever recording the outcome.
+        task = asyncio.get_running_loop().create_task(_run_one())
+        _DH_LAND_TASKS.add(task)
     _dh_land_save_state()
 
 
@@ -5736,8 +5909,13 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
     task_id = (payload.get("task_id") or "").strip()
     if not _TASK_ID_RE.match(task_id):
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
-    reviewed = await _dh_reviewed(task_id)
-    if not reviewed and not bool(payload.get("skip_review_check")):
+    if task_id in _DH_LANDING_IN_FLIGHT:
+        return JSONResponse({"ok": False, "error": "already landing this card"}, status_code=409)
+    try:
+        review_ts = await _dh_reviewed(task_id)
+    except _DhOutage as exc:
+        return JSONResponse({"ok": False, "error": f"could not check review status: {exc}"}, status_code=502)
+    if review_ts is None and not bool(payload.get("skip_review_check")):
         return JSONResponse({
             "ok": False,
             "error": ("this card has no review_requested event -- it has not been "
@@ -5758,8 +5936,11 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
         except Exception as exc:
             _dh_land_record({"task_id": task_id, "verdict": "error",
                              "error": str(exc)[:300], "trigger": "manual"})
+        finally:
+            _DH_LAND_TASKS.discard(asyncio.current_task())
 
-    asyncio.get_running_loop().create_task(_run())
+    task = asyncio.get_running_loop().create_task(_run())
+    _DH_LAND_TASKS.add(task)
     return JSONResponse({"ok": True, "started": True, "task_id": task_id})
 
 
