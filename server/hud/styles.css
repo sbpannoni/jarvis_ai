@@ -823,6 +823,9 @@ button.btn.kb-land-btn:disabled{opacity:.45; cursor:default}
 .svc-row + .svc-row{border-top:1px solid var(--line); margin-top:4px}
 .svc-btns{display:flex; gap:4px; margin-top:4px}
 .svc-btns .btn{flex:1; padding:5px 4px; font-size:9px; letter-spacing:1px}
+.seat-btns .seat-select{flex:2.4; min-width:0; background:var(--panel); color:var(--txt);
+  border:1px solid var(--line); font-size:10.5px; padding:3px 4px}
+.seat-btns .btn{flex:1}
 
 /* The netmap control bar is pinned to the top of the centre column, so make
    room for it rather than letting it sit on top of the work-area tab strip. */

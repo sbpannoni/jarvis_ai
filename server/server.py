@@ -1345,34 +1345,93 @@ BRAIN_CACHE: dict = {"ts": 0.0, "data": {}}
 
 @app.get("/api/brain")
 async def brain() -> JSONResponse:
-    """What model Hermes is actually thinking with.
+    """What model is in snarf's GPU seat right now, and on which backend.
 
-    The served model name exists only in vLLM's unit file on snarf; the Hermes
-    dashboard just proxies the gateway and never sees it, which is why nothing
-    in the stack could answer "which model is this?". Ask vLLM directly.
+    Asks model-seat (which spans vLLM and llama.cpp) rather than :8000's
+    /v1/models, which only says a model name and nothing about the backend,
+    and which reads as "offline" whenever the seat is simply EMPTY -- the
+    normal idle state now that hermes-model-proxy loads models on demand.
+    /v1/models is still used for vLLM's max_model_len when something is loaded.
     """
     now = time.time()
-    if now - BRAIN_CACHE["ts"] < 60:
+    if now - BRAIN_CACHE["ts"] < 20:
         return JSONResponse(BRAIN_CACHE["data"])
 
-    url = (CFG.get("brain") or {}).get("models_url", "http://192.168.1.239:8000/v1/models")
-
-    def fetch() -> dict:
-        try:
-            r = requests.get(url, timeout=3)
-            r.raise_for_status()
-            entry = (r.json().get("data") or [{}])[0]
-            return {
-                "model": entry.get("id"),
-                "max_model_len": entry.get("max_model_len"),
-                "online": True,
-            }
-        except Exception as exc:
-            return {"model": None, "online": False, "error": str(exc)}
-
-    data = await asyncio.to_thread(fetch)
+    seat = await _seat_status()
+    data = {"model": seat.get("model"), "backend": seat.get("backend"),
+            "ready": seat.get("ready"), "online": bool(seat.get("model")),
+            "seat_empty": seat.get("ok") is True and not seat.get("model")}
+    if seat.get("error"):
+        data["error"] = seat["error"]
+    if data["model"]:
+        url = (CFG.get("brain") or {}).get("models_url", "http://192.168.1.239:8000/v1/models")
+        def fetch_len():
+            try:
+                r = requests.get(url, timeout=3)
+                return ((r.json().get("data") or [{}])[0]).get("max_model_len")
+            except Exception:
+                return None
+        data["max_model_len"] = await asyncio.to_thread(fetch_len)
     BRAIN_CACHE.update(ts=now, data=data)
     return JSONResponse(data)
+
+
+# ---- GPU seat (model-seat on snarf) -----------------------------------------
+# snarf has ONE inference seat on :8000, shared by every vllm-* and llamacpp-*
+# unit. model-seat is the only thing allowed to change it: it holds the lock,
+# drains in-flight requests, stops whatever is resident and waits for ready.
+# The HUD used to expose `vllm-qwen36-27b.service` as a plain START/STOP row in
+# BACKEND SERVICES -- a raw systemctl that bypassed that lock and could start
+# vLLM on top of a loaded llama.cpp model. This replaces it.
+SEAT_CMD = "/home/sam/bin/model-seat"
+
+
+async def _seat_status() -> dict:
+    try:
+        rc, out = await _fleet_ssh("snarf", f"{SEAT_CMD} --json status")
+        return json.loads(out)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/seat")
+async def seat_get() -> JSONResponse:
+    """Seat occupant + the installed catalog (both backends)."""
+    status = await _seat_status()
+    catalog = await _model_seat_catalog()
+    return JSONResponse({
+        "status": status,
+        "models": sorted(({"model": k, **v} for k, v in (catalog or {}).items()),
+                         key=lambda m: (m.get("backend") != "vllm", m["model"])),
+    })
+
+
+@app.post("/api/seat")
+async def seat_post(request: Request) -> JSONResponse:
+    """Body: {"action": "switch", "model": "<id>"} or {"action": "stop"}.
+    switch blocks until the model reports ready (minutes for a large GGUF)."""
+    body = await request.json()
+    action = body.get("action")
+    if action == "stop":
+        cmd = f"{SEAT_CMD} --json stop"
+    elif action == "switch":
+        model = (body.get("model") or "").strip()
+        catalog = await _model_seat_catalog() or {}
+        if model not in catalog:
+            return JSONResponse({"ok": False, "error": f"unknown model {model!r}"}, status_code=400)
+        cmd = f"{SEAT_CMD} --json switch {shlex.quote(model)}"
+    else:
+        return JSONResponse({"ok": False, "error": "action must be switch or stop"}, status_code=400)
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    BRAIN_CACHE["ts"] = 0.0
+    try:
+        detail = json.loads(out)
+    except Exception:
+        detail = {"output": out[-1000:]}
+    return JSONResponse({"ok": rc == 0 and detail.get("ok", True) is not False, **detail})
 
 
 # `node`/`checkout` say where the code actually is, so the HUD can show which

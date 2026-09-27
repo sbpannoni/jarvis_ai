@@ -195,10 +195,16 @@ async function refreshBrain(){
   try{
     const r=await fetch("/api/brain"); const j=await r.json();
     const el=document.getElementById("mBrainModel"); if(!el) return;
+    // Seat state from model-seat: model + backend when loaded; "empty" is the
+    // normal idle state (the Hermes proxy loads on demand), not an outage.
+    const be={vllm:"vLLM",llamacpp:"llama.cpp"}[j.backend]||j.backend;
     if(j.model){
-      const ctx=j.max_model_len?` · ${Math.round(j.max_model_len/1024)}k ctx`:"";
-      el.textContent=j.model+ctx; el.className="";
-    }else{ el.textContent="offline"; el.className="err"; }
+      const ctx=j.max_model_len?` · ${Math.round(j.max_model_len/1024)}k`:"";
+      el.textContent=`${j.model} · ${be}${ctx}`; el.className=j.ready===false?"warn":"";
+      el.title=el.textContent;
+    }else if(j.seat_empty){ el.textContent="seat empty · loads on demand"; el.className=""; el.style.color="var(--txt-dim)"; }
+    else{ el.textContent="unreachable"; el.className="err"; }
+    if(j.model) el.style.color="";
   }catch{}
 }
 registerPanel({id:"brain", refresh:refreshBrain, intervalMs:60000});

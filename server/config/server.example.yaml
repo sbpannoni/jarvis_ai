@@ -153,12 +153,10 @@ service_control:              # start/stop/restart backend services from the HUD
                               # terminal panel's SSH key is reused, no new credentials.
                               # scope: system = sudo systemctl; user = systemctl --user
                               # (the Hermes gateway is a *user* unit under user@0.service).
-  - id: vllm
-    label: "vLLM · GPU brain"
-    host: snarf
-    unit: vllm-qwen36-27b.service
-    scope: system
-    critical: true            # stopping this takes Hermes' brain offline
+  # The GPU seat is NOT listed here: a plain systemctl row for one vllm-* unit
+  # bypassed model-seat's lock and could start vLLM on top of a loaded
+  # llama.cpp model. The panel's GPU SEAT row drives model-seat instead
+  # (/api/seat).
   - id: hermes-gateway
     label: "Hermes gateway · API"
     host: hermes

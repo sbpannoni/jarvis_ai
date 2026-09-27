@@ -960,7 +960,7 @@ $("chatInput").addEventListener("keydown",e=>{if(e.key==="Enter")sendChat()});
 
 /* Panel widgets (health/skills/jobs/machines/usage/projects) live in
    panels.js now — see its top-of-file comment for the pattern to follow
-   when adding a new one. vLLM control lives in vllm-control.js. Network
+   when adding a new one. Service + GPU seat control lives in service-control.js. Network
    topology map lives in network-map.js. */
 
 /* ====================== holographic media panels ==================== */
