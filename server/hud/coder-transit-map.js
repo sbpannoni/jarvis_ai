@@ -231,22 +231,52 @@ function transitRoleOptions(roster, selected){
   // /api/model-role-assignments) can't emit structured tool calls, so it can't
   // fill any role -- render it disabled with a visible reason. The server
   // rejects it too (POST guard), since this endpoint is callable directly.
-  return (roster || []).map(m => {
+  // Grouped by model-seat backend; "●" marks the model currently in the GPU
+  // seat. Catalog models with no CODER_MODELS_ROSTER entry (unverified) are
+  // listed so a new unit is visible, but disabled until tool calling is
+  // verified -- the server's POST guard rejects them too.
+  const option = m => {
     const noTools = m.tool_calling === false;
-    const label = noTools ? `${m.label} — no tool calls (can't be assigned)` : m.label;
+    const why = m.unverified ? " — not in roster, tool calls unverified"
+      : noTools ? " — no tool calls (can't be assigned)"
+      : m.in_seat_catalog === false ? " — not installed in model-seat" : "";
+    const label = `${m.loaded ? "● " : ""}${m.label}${why}`;
     return `<option value="${m.id}"${m.id === selected ? " selected" : ""}`
-      + `${noTools ? " disabled" : ""}>${label}</option>`;
-  }).join("");
+      + `${noTools || m.unverified ? " disabled" : ""}>${label}</option>`;
+  };
+  const groups = {};
+  (roster || []).forEach(m => { (groups[m.backend || "other"] ||= []).push(m); });
+  const order = ["vllm", "llamacpp", "other"];
+  const names = {vllm: "vLLM", llamacpp: "llama.cpp", other: "not in model-seat"};
+  const keys = Object.keys(groups).sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  if (keys.length === 1) return groups[keys[0]].map(option).join("");
+  return keys.map(k => `<optgroup label="${names[k] || k}">${groups[k].map(option).join("")}</optgroup>`).join("");
+}
+
+// All three roles run on snarf's single GPU seat (model-seat), so roles on
+// different models mean a cold swap every time the pipeline hands off between
+// them -- minutes for a large llama.cpp model. Say so next to the dropdowns.
+function transitSeatWarning(panel, roster){
+  const el = panel.querySelector(".tm-seat-warning");
+  if (!el) return;
+  const byId = Object.fromEntries((roster || []).map(m => [m.id, m]));
+  const picks = [...panel.querySelectorAll(".tm-role-select")].map(sel => sel.value);
+  const distinct = [...new Set(picks)];
+  if (distinct.length <= 1){ el.textContent = ""; el.hidden = true; return; }
+  const heavy = distinct.filter(id => (byId[id] || {}).backend === "llamacpp");
+  el.hidden = false;
+  el.textContent = `⚠ ${distinct.length} different models share one GPU seat — every role hand-off is a cold swap`
+    + (heavy.length ? ` (${heavy.map(id => (byId[id] || {}).label || id).join(", ")} on llama.cpp loads slowest)` : "")
+    + ". Assign the same model to roles that run back-to-back to avoid it.";
 }
 
 // Dropdown bar surfacing the model actually configured per role and
 // letting it be changed live -- separate from the leaderboard cards below,
 // which rank candidates by eval score but don't say what's actually set.
 // Backed by model_role_assignments.json on snarf (see server.py's
-// /api/model-role-assignments docstring): "editor" is the only role a real
-// dispatch reads today, so its LIVE/NOT WIRED tag tells you which changes
-// actually take effect on the next dispatch vs. are just recorded for when
-// reviewer/orchestrator get a real dispatch path.
+// /api/model-role-assignments docstring). The LIVE/NOT WIRED tag comes from
+// the server's live_roles, so it says which changes take effect on the next
+// dispatch vs. are only recorded.
 function transitRoleBar(roleData){
   const roster = roleData.roster || [];
   const assignments = roleData.assignments || {};
@@ -259,7 +289,8 @@ function transitRoleBar(roleData){
       <span class="${live.has(key) ? "tm-role-live" : "tm-role-notlive"}">${live.has(key) ? "LIVE" : "NOT WIRED"}</span>
       <span class="tm-role-status" data-role-status="${key}"></span>
     </div>`).join("")}
-  </div>`;
+  </div>
+  <div class="tm-seat-warning" hidden></div>`;
 }
 
 async function saveRoleAssignment(role, model, statusEl){
@@ -282,9 +313,11 @@ async function saveRoleAssignment(role, model, statusEl){
   }
 }
 
-function wireRoleBar(panel){
+function wireRoleBar(panel, roster){
+  transitSeatWarning(panel, roster);
   panel.querySelectorAll(".tm-role-select").forEach(sel => {
     sel.addEventListener("change", () => {
+      transitSeatWarning(panel, roster);
       const role = sel.dataset.role;
       const statusEl = panel.querySelector(`[data-role-status="${role}"]`);
       saveRoleAssignment(role, sel.value, statusEl);
@@ -459,7 +492,7 @@ async function renderTransitMap(panel){
         <div class="kv" style="padding:6px 10px"><span style="color:var(--txt-dim); font-size:11px">${j.orchestrator.note}</span></div>
       </details>
     `;
-    wireRoleBar(panel);
+    wireRoleBar(panel, roleData.roster);
     wireReviewTrigger(panel);
     wireProcessFixCardTrigger(panel);
   }catch(err){

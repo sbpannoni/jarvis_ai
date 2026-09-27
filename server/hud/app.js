@@ -1109,9 +1109,29 @@ async function bootSequence(full){
   setTimeout(()=>{boot.style.display="none"},900);
   bootRunning=false;
 }
+// Boot replay is cosmetic and was easy to hit by accident as a bare "b";
+// Shift+B keeps it available without that.
 addEventListener("keydown",e=>{
-  if((e.key==="b"||e.key==="B") && !isTypingContext())bootSequence(true);
+  if(e.key==="B" && e.shiftKey && !isTypingContext())bootSequence(true);
 });
+// "?" lists every global shortcut -- they were otherwise only discoverable
+// by reading tooltips or this file.
+(function initShortcutHelp(){
+  const el=document.createElement("div");
+  el.className="kb-help"; el.hidden=true;
+  el.innerHTML=`<div class="kb-help-box"><h3>SHORTCUTS</h3>
+    <div><span>Talk (voice)</span><kbd>Space</kbd></div>
+    <div><span>Hide / show side panels</span><kbd>S</kbd></div>
+    <div><span>Close panels · else stop run</span><kbd>Esc</kbd></div>
+    <div><span>Replay boot sequence</span><kbd>Shift+B</kbd></div>
+    <div><span>This help</span><kbd>?</kbd></div></div>`;
+  el.addEventListener("click",()=>{el.hidden=true});
+  document.body.appendChild(el);
+  addEventListener("keydown",e=>{
+    if(e.key==="?" && !isTypingContext()){e.preventDefault(); el.hidden=!el.hidden;}
+    else if(e.key==="Escape" && !el.hidden){el.hidden=true; e.stopImmediatePropagation();}
+  },true);
+})();
 bootSequence(new URLSearchParams(location.search).get("boot")==="full");
 
 addMsg("sys","Looking Glass HUD online. Click the ring or press Space to talk.");

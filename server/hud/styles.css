@@ -216,6 +216,14 @@ button.btn.amber{color:var(--amber); border-color:#7a5a1a; background:#241c0a}
 .appr .row{display:flex; gap:10px}
 .msg.live{opacity:.65; font-style:italic}
 .viewBtn{display:block; width:100%; text-align:left; margin-bottom:6px}
+.view-group{font-family:'Orbitron'; font-size:9px; letter-spacing:1.4px; color:var(--txt-dim); margin:10px 0 4px}
+.view-group:first-of-type{margin-top:2px}
+.kb-help{position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.55); z-index:9999}
+.kb-help[hidden]{display:none}
+.kb-help-box{background:var(--panel); border:1px solid var(--cyan); padding:16px 22px; min-width:280px; font-size:12px}
+.kb-help-box h3{font-family:'Orbitron'; font-size:11px; letter-spacing:1.4px; margin:0 0 10px; color:var(--cyan)}
+.kb-help-box div{display:flex; justify-content:space-between; gap:24px; padding:3px 0}
+.kb-help-box kbd{color:var(--amber); font-family:inherit}
 
 /* ---- SSH terminal quick-access tiles ---- */
 .terminal-tiles{display:grid; grid-template-columns:repeat(auto-fill,minmax(90px,1fr)); gap:6px}
@@ -973,6 +981,7 @@ body.view-map #work-area{display:none !important}
   border:1px solid var(--line); border-radius:2px; padding:1px 4px}
 .tm-role-status{font-size:10px; color:var(--txt-dim); min-width:44px}
 .tm-role-status.saved{color:var(--teal)}
+.tm-seat-warning{font-size:11px; color:var(--amber); padding:4px 10px 8px}
 .tm-role-status.err{color:var(--red)}
 
 /* Reviewer role's live trigger (POST /api/review-file -> a --triage kanban

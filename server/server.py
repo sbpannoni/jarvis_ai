@@ -2008,14 +2008,47 @@ async def model_role_assignments() -> JSONResponse:
     except Exception as exc:
         assignments["_orchestrator_error"] = str(exc)
 
+    # model-seat's catalog is what can actually be put in the GPU seat, so it
+    # supplies backend/loaded state. CODER_MODELS_ROSTER still supplies labels
+    # and the verified tool_calling flag. A catalog model missing from the
+    # roster is still listed (so a new llama.cpp/vLLM unit is never invisible
+    # again) but disabled until tool calling is verified and a roster entry
+    # added -- the POST guard only accepts roster ids.
+    seat = await _model_seat_catalog()
+    roster = []
+    for e in CODER_MODELS_ROSTER:
+        info = seat.get(e["id"]) if seat is not None else None
+        roster.append({
+            "id": e["id"], "label": e["label"], "tool_calling": e.get("tool_calling", True),
+            "backend": info["backend"] if info else None,
+            "loaded": bool(info and info.get("loaded")),
+            "in_seat_catalog": None if seat is None else info is not None,
+        })
+    for mid, info in sorted((seat or {}).items()):
+        if mid not in _CODER_ROSTER_BY_ID:
+            roster.append({
+                "id": mid, "label": mid, "tool_calling": None, "unverified": True,
+                "backend": info.get("backend"), "loaded": bool(info.get("loaded")),
+                "in_seat_catalog": True,
+            })
     return JSONResponse({
         "assignments": assignments,
         "live_roles": sorted(MODEL_ROLE_LIVE),
-        "roster": [
-            {"id": e["id"], "label": e["label"], "tool_calling": e.get("tool_calling", True)}
-            for e in CODER_MODELS_ROSTER
-        ],
+        "seat_catalog_ok": seat is not None,
+        "roster": roster,
     })
+
+
+async def _model_seat_catalog() -> dict | None:
+    """{model_id: {backend, unit, loaded}} from `model-seat --json list` on
+    snarf, or None if it can't be read (the HUD then falls back to the static
+    roster with no backend/loaded info rather than failing the whole panel)."""
+    try:
+        rc, out = await _fleet_ssh("snarf", "/home/sam/bin/model-seat --json list")
+        data = json.loads(out)
+        return {m["model"]: m for m in data.get("models", [])}
+    except Exception:
+        return None
 
 
 @app.post("/api/model-role-assignments")

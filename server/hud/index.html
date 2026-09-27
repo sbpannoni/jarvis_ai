@@ -74,20 +74,24 @@
       <div id="activity"><div>— no activity yet —</div></div>
     </div>
     <div class="panel"><h2><span>VIEWS</span><span class="num">04</span></h2>
+      <div class="view-group">AGENT WORK</div>
+      <button class="btn viewBtn" data-action="pair" style="border-color:var(--magenta); color:var(--magenta)">◧ AGENT WORK + CLAUDE</button>
       <button class="btn viewBtn" data-action="kanban" style="border-color:var(--amber); color:var(--amber)">▤ AGENT WORK (KANBAN)</button>
-      <button class="btn viewBtn" data-view="HERMES DASHBOARD" data-path="/">▸ HERMES DASHBOARD</button>
-      <button class="btn viewBtn" data-view="CHAT" data-path="/chat">▸ DASHBOARD CHAT</button>
-      <button class="btn viewBtn" id="netmapToggleBtn" data-action="netmap">▸ NETWORK MAP</button>
-      <button class="btn viewBtn" data-action="flow" style="border-color:var(--orange); color:var(--orange)">◈ PROJECT FLOW</button>
-      <button class="btn viewBtn" data-action="coder-models" style="border-color:var(--cyan); color:var(--cyan)" title="coder-engine Phase 3 eval roster: what each candidate model is for, and how it's performing">◇ CODER MODELS</button>
-      <button class="btn viewBtn" data-action="coder-transit-map" style="border-color:var(--magenta); color:var(--magenta)" title="Subway-map view of every role the coder-engine pipeline needs a model for: editor, reviewer, orchestrator">☷ TRANSIT MAP</button>
       <button class="btn viewBtn" data-action="submit-work" style="border-color:var(--teal); color:var(--teal)" title="Submit a real DARKHELIX TODO.md item to Hermes as a kanban card (files to triage)">▸ SUBMIT WORK</button>
       <button class="btn viewBtn" data-action="downloads" style="border-color:var(--amber); color:var(--amber)" title="TODO.md items blocked on a database or binary: verified URLs, what is already on disk, and a scheduled card that never takes the model seat">⇩ DOWNLOADS</button>
-      <button class="btn viewBtn" data-action="pair" style="border-color:var(--magenta); color:var(--magenta)">◧ AGENT WORK + CLAUDE</button>
-      <button class="btn viewBtn" data-action="hermes-live" title="The HUD's own chat thread — not where kanban work runs">▸ HUD CHAT THREAD</button>
       <button class="btn viewBtn" data-action="claude" data-host="snarf"
               data-title="claude · DARKHELIX"
               data-run="cd /ssdpool/DARKHELIX && bash -lc claude">▸ CLAUDE (REVIEW)</button>
+      <div class="view-group">MODELS</div>
+      <button class="btn viewBtn" data-action="coder-transit-map" style="border-color:var(--magenta); color:var(--magenta)" title="Subway-map view of every role the coder-engine pipeline needs a model for: editor, reviewer, orchestrator">☷ TRANSIT MAP</button>
+      <button class="btn viewBtn" data-action="coder-models" style="border-color:var(--cyan); color:var(--cyan)" title="coder-engine Phase 3 eval roster: what each candidate model is for, and how it's performing">◇ CODER MODELS</button>
+      <div class="view-group">HERMES</div>
+      <button class="btn viewBtn" data-view="HERMES DASHBOARD" data-path="/">▸ HERMES DASHBOARD</button>
+      <button class="btn viewBtn" data-view="CHAT" data-path="/chat">▸ DASHBOARD CHAT</button>
+      <button class="btn viewBtn" data-action="hermes-live" title="The HUD's own chat thread — not where kanban work runs">▸ HUD CHAT THREAD</button>
+      <div class="view-group">MAPS</div>
+      <button class="btn viewBtn" id="netmapToggleBtn" data-action="netmap">▸ NETWORK MAP</button>
+      <button class="btn viewBtn" data-action="flow" style="border-color:var(--orange); color:var(--orange)">◈ PROJECT FLOW</button>
     </div>
     <div class="panel collapsible collapsed"><h2><span>SESSION</span><span class="num">05</span></h2>
       <div class="kv"><span>Conversation</span><b>looking-glass-main</b></div>
