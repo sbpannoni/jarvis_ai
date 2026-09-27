@@ -45,6 +45,10 @@ rack_health:                 # custom glass-panel rack health, queried directly
   queries:
     snarf_gpu_temp_c: 'nvidia_smi_temperature_gpu{instance="192.168.1.239:9835"}'
     snarf_cpu_load1: 'node_load1{instance="192.168.1.239:9100"}'
+    # Per-thread busy fraction for snarf's CPU grid (Threadripper PRO 3995WX:
+    # 64 cores / 128 threads -- 128 series, `cpu` label 0..127; SMT siblings
+    # are N and N+64). 1m rate so a brief spike doesn't flash the whole grid.
+    snarf_cpu_busy: '1 - rate(node_cpu_seconds_total{instance="192.168.1.239:9100",mode="idle"}[1m])'
     beelink_cpu_load1: 'node_load1{instance="192.168.1.158:9100"}'
 
 machines:                   # polled by /api/machines for the HUD panel (optional)

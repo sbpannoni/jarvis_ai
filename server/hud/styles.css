@@ -1377,6 +1377,15 @@ button.btn.sw-submit:disabled{opacity:.4; cursor:not-allowed}
 .gpu-stats{font-size:10px; color:var(--txt-dim); text-align:center; line-height:1.35}
 .gpu-stats b{font-weight:600}
 .gpu-t-ok{color:var(--teal)} .gpu-t-warm{color:var(--amber)} .gpu-t-hot{color:var(--red)}
+.cpu-grid-wrap{margin-top:8px; border-top:1px solid var(--line); padding-top:7px}
+.cpu-grid-wrap:empty{display:none}
+.cpu-grid-head{display:flex; justify-content:space-between; font-size:9.5px; letter-spacing:1px;
+  color:var(--txt-dim); margin-bottom:5px; font-family:'Orbitron'}
+.cpu-grid-head b{color:var(--teal)}
+.cpu-grid{display:grid; grid-template-columns:repeat(16, 1fr); gap:2px}
+.cpu-core{display:flex; flex-direction:column; gap:1px; aspect-ratio:1; border:1px solid var(--line);
+  border-radius:2px; padding:1px; background:color-mix(in srgb, var(--bg) 60%, transparent)}
+.cpu-core i{flex:1; border-radius:1px; transition:background .6s ease}
 .gpu-offline{font-size:11px; color:var(--txt-dim); text-align:center; padding:14px 0}
 
 /* ---- MACHINES: fixed metric columns ------------------------------------

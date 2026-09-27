@@ -81,10 +81,51 @@ function renderGpuPanel(rh) {
   }).join("");
 }
 
+/* ---- shared CPU grid ---------------------------------------------------
+   snarf's CPU is shared by everything that isn't on the GPUs (llama.cpp's
+   CPU-offloaded experts, DARKHELIX pipelines, builds), so it sits under the
+   GPU bars. One cell per PHYSICAL core (64), split top/bottom into its two
+   SMT threads (N and N+64 on this box, per thread_siblings_list), shaded by
+   each thread's 1m busy fraction. A core with both halves lit is saturated;
+   one half lit is a single thread on it. Data: snarf_cpu_busy in
+   /api/rack_health (128 series with a `cpu` label). */
+function cpuCellColor(b) {
+  if (b == null) return "transparent";
+  const pct = Math.round(Math.max(0, Math.min(1, b)) * 100);
+  if (pct >= 85) return "var(--amber)";
+  return `color-mix(in srgb, var(--cyan) ${pct < 3 ? 0 : 18 + pct * 0.82}%, transparent)`;
+}
+
+function renderCpuGrid(rh) {
+  const host = document.getElementById("cpuGrid");
+  if (!host) return;
+  const series = rh && rh.snarf_cpu_busy;
+  if (!Array.isArray(series) || !series.length) { host.innerHTML = ""; return; }
+  const busy = {};
+  series.forEach(r => { const c = r && r.labels && r.labels.cpu; if (c != null) busy[Number(c)] = r.value; });
+  const n = Object.keys(busy).length;
+  const cores = Math.ceil(n / 2);
+  const vals = Object.values(busy);
+  const avg = vals.reduce((a, b) => a + b, 0) / (vals.length || 1);
+  const active = vals.filter(v => v >= 0.5).length;
+  const load = ((rh.snarf_cpu_load1 || [])[0] || {}).value;
+  const pct = b => b == null ? "—" : Math.round(b * 100) + "%";
+  let cells = "";
+  for (let c = 0; c < cores; c++) {
+    const a = busy[c], b = busy[c + cores];
+    cells += `<div class="cpu-core" title="core ${c} · cpu${c} ${pct(a)} · cpu${c + cores} ${pct(b)}">`
+      + `<i style="background:${cpuCellColor(a)}"></i><i style="background:${cpuCellColor(b)}"></i></div>`;
+  }
+  host.innerHTML = `
+    <div class="cpu-grid-head"><span>CPU · ${cores}C/${n}T</span>
+      <span><b>${Math.round(avg * 100)}%</b> · ${active} busy${load == null ? "" : ` · load ${load.toFixed(1)}`}</span></div>
+    <div class="cpu-grid">${cells}</div>`;
+}
+
 async function pollGpuPanel() {
   try {
     const r = await fetch("/api/rack_health", { credentials: "same-origin" });
-    if (r.ok) renderGpuPanel(await r.json());
+    if (r.ok) { const rh = await r.json(); renderGpuPanel(rh); renderCpuGrid(rh); }
   } catch { /* transient; keep the last good render rather than blanking */ }
 }
 
