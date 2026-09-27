@@ -54,10 +54,10 @@ body.netmap-on #bgDepth .bgGlow{opacity:.12; transition:opacity .6s}
 #netmapLayer{position:fixed; inset:0; z-index:-1; display:block}
 #netmapLayer canvas{display:block}
 /* Both overlays are confined to the centre grid column (the side columns are
-   320px + 8px gap + 8px padding = 336px), so they can never sit on top of the
+   var(--side) + 8px gap + 8px padding), so they can never sit on top of the
    status panels the way an earlier right-anchored version did. */
 #netmapControls{
-  position:fixed; top:64px; left:344px; right:344px; z-index:6;
+  position:fixed; top:64px; left:calc(var(--side) + 24px); right:calc(var(--side) + 24px); z-index:6;
   display:none; align-items:center; justify-content:center; gap:14px;
   flex-wrap:wrap; padding:8px 14px; border-radius:10px;
   background:color-mix(in srgb, var(--panel) 78%, transparent); border:1px solid var(--line);
@@ -68,7 +68,7 @@ body.netmap-on #bgDepth .bgGlow{opacity:.12; transition:opacity .6s}
 #netmapControls label{display:flex; align-items:center; gap:4px; cursor:pointer; user-select:none}
 .netmap-zoom input[type=range]{width:90px; accent-color:var(--magenta)}
 #netmapInfo{
-  position:fixed; top:118px; left:352px; z-index:6; width:236px; display:none;
+  position:fixed; top:118px; left:calc(var(--side) + 32px); z-index:6; width:236px; display:none;
   background:color-mix(in srgb, var(--panel) 88%, transparent); border:1px solid var(--line);
   border-radius:10px; padding:10px 12px; backdrop-filter:blur(8px);
   box-shadow:0 8px 24px -8px #000c;
@@ -92,7 +92,7 @@ body.netmap-on #bgDepth .bgGlow{opacity:.12; transition:opacity .6s}
 #grid{transition:grid-template-columns .28s ease}
 body.sidebars-hidden #grid{grid-template-columns:0 1fr 0}
 body.sidebars-hidden .col{
-  position:fixed; top:62px; bottom:34px; width:320px; z-index:30;
+  position:fixed; top:62px; bottom:34px; width:var(--side); z-index:30;
   opacity:0; pointer-events:none; transition:transform .28s ease, opacity .28s ease;
 }
 body.sidebars-hidden #colLeft{left:8px; transform:translateX(-110%)}
@@ -108,7 +108,11 @@ body.sidebars-hidden #colRight{right:8px; transform:translateX(110%)}
 #sidebarToggleBtn:hover{border-color:var(--magenta); color:var(--magenta); background:color-mix(in srgb, var(--magenta) 14%, transparent)}
 
 #theme-toggle:hover, .dock-icon:hover{border-color:var(--cyan); color:var(--cyan); background:color-mix(in srgb, var(--cyan) 18%, transparent)}
-#grid{display:grid; grid-template-columns:320px 1fr 320px; grid-template-rows:54px 1fr 26px; height:100vh; gap:8px; padding:8px}
+/* Sidebar width, one place: the grid columns, the hidden-sidebar overlay
+   and the map controls that must clear the sidebars all derive from it.
+   Was a hard-coded 320px in each (narrowed to 288px 2026-09-27). */
+:root{--side:288px}
+#grid{display:grid; grid-template-columns:var(--side) 1fr var(--side); grid-template-rows:54px 1fr 26px; height:100vh; gap:8px; padding:8px}
 header{
   grid-column:1/4; display:flex; align-items:center; justify-content:space-between; gap:18px;
   border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:0 18px;
@@ -837,7 +841,7 @@ body.view-map #work-area{display:none !important}
 .mach-row b{font-size:10px}
 /* Guests indent under the host whose hardware they share. The rule is the tree
    connector, so the relationship reads at a glance rather than by inference. */
-.mach-row.mach-child > span:first-child{padding-left:14px; position:relative}
+.mach-row.mach-child > span:first-child{padding-left:11px; position:relative}
 .mach-row.mach-child > span:first-child::before{content:""; position:absolute;
   left:4px; top:50%; width:6px; height:1px; background:var(--line)}
 .mach-row.mach-child > span:first-child::after{content:""; position:absolute;
@@ -1382,6 +1386,8 @@ button.btn.sw-submit:disabled{opacity:.4; cursor:not-allowed}
 .cpu-grid-head{display:flex; justify-content:space-between; font-size:9.5px; letter-spacing:1px;
   color:var(--txt-dim); margin-bottom:5px; font-family:'Orbitron'}
 .cpu-grid-head b{color:var(--teal)}
+.cpu-grid-head span{white-space:nowrap}
+.cpu-grid-head span:last-child{font-family:'Rajdhani'; font-size:11.5px; letter-spacing:.3px; font-weight:600}
 .cpu-grid{display:grid; grid-template-columns:repeat(16, 1fr); gap:2px}
 .cpu-core{display:flex; flex-direction:column; gap:1px; aspect-ratio:1; border:1px solid var(--line);
   border-radius:2px; padding:1px; background:color-mix(in srgb, var(--bg) 60%, transparent)}
@@ -1393,8 +1399,8 @@ button.btn.sw-submit:disabled{opacity:.4; cursor:not-allowed}
    on every line and comparing two machines meant reading instead of glancing.
    Fixed columns make the panel scannable down each metric. The name column
    flexes; the five metric cells do not. */
-.mach-hdr, .mach-row{display:grid; grid-template-columns:1fr repeat(5, 30px);
-  gap:3px; align-items:center}
+.mach-hdr, .mach-row{display:grid; grid-template-columns:1fr repeat(5, 24px);
+  gap:2px; align-items:center}
 .mach-hdr{font-size:8px; letter-spacing:.6px; color:var(--txt-dim);
   padding:0 0 3px; border-bottom:1px solid var(--line); margin-bottom:3px}
 .mach-hdr span{text-align:right}

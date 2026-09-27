@@ -87,7 +87,13 @@ function renderGpuPanel(rh) {
    GPU bars. One cell per PHYSICAL core (64), split top/bottom into its two
    SMT threads (N and N+64 on this box, per thread_siblings_list), shaded by
    each thread's 1m busy fraction. A core with both halves lit is saturated;
-   one half lit is a single thread on it. Data: snarf_cpu_busy in
+   one half lit is a single thread on it.
+
+   Cores are SORTED by activity and fill from the bottom-left, so the grid
+   reads like the GPU bars: the lit area rises with load. Within a core the
+   busier thread takes the bottom half for the same reason. Position is
+   therefore not core number -- hover a cell for which core it is. Data:
+   snarf_cpu_busy in
    /api/rack_health (128 series with a `cpu` label). */
 function cpuCellColor(b) {
   if (b == null) return "transparent";
@@ -110,12 +116,21 @@ function renderCpuGrid(rh) {
   const active = vals.filter(v => v >= 0.5).length;
   const load = ((rh.snarf_cpu_load1 || [])[0] || {}).value;
   const pct = b => b == null ? "—" : Math.round(b * 100) + "%";
-  let cells = "";
+  const list = [];
   for (let c = 0; c < cores; c++) {
     const a = busy[c], b = busy[c + cores];
-    cells += `<div class="cpu-core" title="core ${c} · cpu${c} ${pct(a)} · cpu${c + cores} ${pct(b)}">`
-      + `<i style="background:${cpuCellColor(a)}"></i><i style="background:${cpuCellColor(b)}"></i></div>`;
+    list.push({c, a, b, sum: (a || 0) + (b || 0)});
   }
+  list.sort((x, y) => y.sum - x.sum || x.c - y.c);
+  const COLS = 16;
+  const rows = [];
+  for (let i = 0; i < list.length; i += COLS) rows.push(list.slice(i, i + COLS));
+  // Busiest row last in the DOM = bottom of the grid.
+  const cells = rows.reverse().map(row => row.map(({c, a, b}) => {
+    const [top, bottom] = (a || 0) >= (b || 0) ? [b, a] : [a, b];
+    return `<div class="cpu-core" title="core ${c} · cpu${c} ${pct(a)} · cpu${c + cores} ${pct(b)}">`
+      + `<i style="background:${cpuCellColor(top)}"></i><i style="background:${cpuCellColor(bottom)}"></i></div>`;
+  }).join("")).join("");
   host.innerHTML = `
     <div class="cpu-grid-head"><span>CPU · ${cores}C/${n}T</span>
       <span><b>${Math.round(avg * 100)}%</b> · ${active} busy${load == null ? "" : ` · load ${load.toFixed(1)}`}</span></div>
