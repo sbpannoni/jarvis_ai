@@ -1693,6 +1693,36 @@ CODER_MODELS_ROSTER = [
                      "restarts (RuntimeError: cancelled on the KV-cache-spec RPC "
                      "handshake) before it would stay up.",
     },
+    {
+        "id": "deepseek-v4-flash-0731", "label": "DeepSeek-V4-Flash-0731", "license": "MIT",
+        "tool_calling": True,
+        "params": "284B total / 13B active MoE (256 experts, 6 routed), MLA-style compression + "
+                     "sparse indexer attention, 16K ctx (served)",
+        "status": "resident (llama.cpp) -- frontier-class reviewer, live since 2026-09-26",
+        "good_for": "Only frontier-sized model in the roster and the first llama.cpp-served "
+                     "(not vLLM) entry -- custom `deepseek4` architecture with a genuinely tiny "
+                     "KV cache (llama_kv_cache_dsv4: 0.00MiB buffer, ~23MB fixed DSV4 state "
+                     "instead) rather than a traditional linear cache. Currently the live "
+                     "reviewer role model. VERIFIED 2026-09-27: emits correctly structured "
+                     "OpenAI-style tool_calls over llama-server's --jinja endpoint, live curl "
+                     "test against a real tool schema. Slot-prompt-similarity cross-request "
+                     "contamination (the source of an earlier observed same-input/different-"
+                     "output non-determinism) fixed via --slot-prompt-similarity 0.",
+    },
+    {
+        "id": "gpt-oss-20b", "label": "GPT-OSS 20B", "license": "Apache 2.0",
+        "tool_calling": True,
+        "params": "20B total MoE, MXFP4, fully GPU-resident, 8K ctx (served)",
+        "status": "resident (llama.cpp), untested in the pipeline's own eval harness yet",
+        "good_for": "OpenAI's open-weight MoE, native harmony tool-calling format -- second "
+                     "llama.cpp-served entry alongside deepseek-v4-flash-0731, both cold-swap "
+                     "with the vLLM-served models via model-seat on the same port. VERIFIED "
+                     "2026-09-27: emits correctly structured OpenAI-style tool_calls over "
+                     "llama-server's --jinja endpoint, live curl test against a real tool "
+                     "schema. Not yet run through the pipeline's own eval/tasks harness against "
+                     "the vLLM roster, so no pass-rate numbers yet -- MXFP4 quant and small "
+                     "active-param MoE make it a speed/cost-floor candidate to test next.",
+    },
 ]
 
 
