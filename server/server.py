@@ -1756,17 +1756,37 @@ CODER_MODELS_ROSTER = [
         "id": "deepseek-v4-flash-0731", "label": "DeepSeek-V4-Flash-0731", "license": "MIT",
         "tool_calling": True,
         "params": "284B total / 13B active MoE (256 experts, 6 routed), MLA-style compression + "
-                     "sparse indexer attention, 16K ctx (served)",
+                     "sparse indexer attention, 16K ctx (served; 1M trained)",
         "status": "resident (llama.cpp) -- frontier-class reviewer, live since 2026-09-26",
         "good_for": "Only frontier-sized model in the roster and the first llama.cpp-served "
-                     "(not vLLM) entry -- custom `deepseek4` architecture with a genuinely tiny "
-                     "KV cache (llama_kv_cache_dsv4: 0.00MiB buffer, ~23MB fixed DSV4 state "
-                     "instead) rather than a traditional linear cache. Currently the live "
+                     "(not vLLM) entry -- custom `deepseek4` architecture with a compressed "
+                     "KV cache (llama_kv_cache_dsv4) far smaller than a traditional one, but "
+                     "NOT fixed: CORRECTED 2026-09-27 -- a 256K-ctx load OOM-crashed at ~25.6K "
+                     "prompt tokens (4 expert layers per GPU leave ~0.8GB), so it stays at 16K; "
+                     "prefill ~90 tok/s (PCIe-bound). Long prompts go to the REAP entry below. "
+                     "Currently the live "
                      "reviewer role model. VERIFIED 2026-09-27: emits correctly structured "
                      "OpenAI-style tool_calls over llama-server's --jinja endpoint, live curl "
                      "test against a real tool schema. Slot-prompt-similarity cross-request "
                      "contamination (the source of an earlier observed same-input/different-"
                      "output non-determinism) fixed via --slot-prompt-similarity 0.",
+    },
+    {
+        "id": "deepseek-v4-flash-reap150b", "label": "DeepSeek-V4-Flash REAP-150B (256K ctx)", "license": "MIT",
+        "tool_calling": True,
+        "params": "~150B MoE: 132 of 256 experts kept per layer (REAP pruning), MXFP4 = the "
+                     "benchmarked checkpoint bit-for-bit, 256K ctx (served)",
+        "status": "installed (llama.cpp) 2026-09-27 -- long-context / lighter backup for V4-Flash",
+        "good_for": "Router-weighted expert pruning of deepseek-v4-flash-0731 "
+                     "(puwaer/DeepSeek-V4-Flash-0731-reap-150b-gguf). Publisher's benchmarks "
+                     "put it level with the base model (mean +0.8 pts over GSM8K/MATH-500/"
+                     "HumanEval+/MBPP+); no MTP heads. Half the expert bytes, so it keeps 6 "
+                     "expert layers per GPU AND has VRAM left for context. MEASURED 2026-09-27: "
+                     "89.7K-token needle test correct (passphrase at 75% depth + last file), "
+                     "prefill 212 tok/s at -ub 2048 (vs ~90 for the base model), decode ~7.5 "
+                     "tok/s, VRAM grew ~0.4GB over 90K tokens with 2-3GB still free -- 256K "
+                     "fits. Tool calls VERIFIED (structured tool_calls, live curl). Not yet "
+                     "run through the pipeline eval harness.",
     },
     {
         "id": "gpt-oss-20b", "label": "GPT-OSS 20B", "license": "Apache 2.0",
