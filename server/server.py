@@ -3464,7 +3464,11 @@ DARKHELIX_BASE_BRANCH = "master"
 # in ~6 MB; these are shared back by symlink so a card can actually RUN.
 # Outputs are deliberately absent from this list: DARKHELIX_output/ and
 # testruns/ stay per-worktree so two cards cannot overwrite each other.
-DARKHELIX_SHARED = ("database", "thirdParty", "testData", ".venv-dev")
+# bin/ (added 2026-09-27) holds the installer-generated launchers for tools that
+# live in their OWN conda envs (genomad, checkm2, gtdbtk, ...). run_pipeline.py
+# puts $DARKHELIX_HOME/bin first on PATH, and in a worktree it was absent, so a
+# card's code could run the darkhelix env's tools but not those.
+DARKHELIX_SHARED = ("database", "thirdParty", "testData", ".venv-dev", "bin")
 
 # Artefacts the toolchain drops in the tree that must never reach a commit.
 #
@@ -3875,7 +3879,7 @@ def _dispatch_target_note(task_id: str, wt: dict,
         "it for you, on snarf. Call that. Only if you need to READ something\n"
         "first, go over ssh with ~/.hermes/profiles/coder/snarf_key as sam.\n\n"
         "It is a real git worktree on its own branch off\n"
-        f"{base}, with database/, thirdParty/, testData/ and .venv-dev/\n"
+        f"{base}, with database/, thirdParty/, testData/, .venv-dev/ and bin/\n"
         "symlinked in. Do NOT edit /ssdpool/DARKHELIX — and note that on snarf\n"
         "/home/sam/code/projects/DARKHELIX is the SAME checkout by another\n"
         "path, so editing there corrupts every other card's view of the tree.\n\n"
