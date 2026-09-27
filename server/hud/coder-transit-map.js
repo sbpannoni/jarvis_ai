@@ -76,26 +76,52 @@ function transitMetricChip(x, y, text, color){
   return `<text x="${x}" y="${y}" text-anchor="start" class="tm-metric-chip" fill="${color||'var(--txt-dim)'}">${text}</text>`;
 }
 
-function buildTransitSvg(data){
-  const editorTop = (data.editor.models || [])[0];
-  const editorChip = editorTop
-    ? transitMetricChip(440, 88, `${editorTop.label.toUpperCase()} ${transitFmtPct(editorTop.pass_rate)} · ${transitFmtTime(editorTop.avg_elapsed_s)}`, "var(--teal)")
-    : transitMetricChip(440, 88, "no runs yet", "var(--txt-dim)");
-  const editorSub = transitMetricChip(440, 102, `${(data.editor.models||[]).length} candidates measured`, "var(--txt-dim)");
+// Each line's text leads with the model ASSIGNED to that role (from
+// /api/model-role-assignments) and its own eval numbers -- or "not yet
+// evaluated" when the eval files predate it (the llama.cpp models, for one).
+// It used to show only the leaderboard's top scorer, so reassigning a role
+// changed nothing on the map. The top scorer is still shown underneath when
+// it isn't the assigned model.
+function transitLineText(models, assignedId, roster, fmt, isMeasured, noun){
+  const measured = (models || []).filter(isMeasured);
+  const rosterEntry = (roster || []).find(m => m.id === assignedId);
+  const assigned = (models || []).find(m => m.id === assignedId);
+  const label = (assigned || rosterEntry || {}).label || assignedId;
+  const main = !assignedId
+    ? {text: "no model assigned", color: "var(--txt-dim)"}
+    : assigned && isMeasured(assigned)
+      ? {text: `${label.toUpperCase()} ${fmt(assigned)}`, color: "var(--teal)"}
+      : {text: `${label.toUpperCase()} — not yet evaluated`, color: "var(--orange)"};
+  const top = measured[0];
+  const sub = top && top.id !== assignedId
+    ? `best measured: ${top.label} ${fmt(top)} · ${measured.length} ${noun}`
+    : `${measured.length} ${noun}`;
+  return {main, sub};
+}
+
+function buildTransitSvg(data, roleData){
+  const assignments = (roleData && roleData.assignments) || {};
+  const roster = (roleData && roleData.roster) || [];
+
+  const ed = transitLineText(data.editor.models, assignments.editor, roster,
+    m => `${transitFmtPct(m.pass_rate)} · ${transitFmtTime(m.avg_elapsed_s)}`,
+    m => m.total_runs > 0, "candidates measured");
+  const editorChip = transitMetricChip(440, 88, ed.main.text, ed.main.color);
+  const editorSub = transitMetricChip(440, 102, ed.sub, "var(--txt-dim)");
 
   const reviewGraded = (data.reviewer.models || []).filter(m => m.graded_count > 0);
-  const reviewTop = reviewGraded[0];
-  const reviewChip = reviewTop
-    ? transitMetricChip(440, 258, `${reviewTop.label.toUpperCase()} ${transitFmtPct(reviewTop.catch_rate)} catch · ${transitFmtPct(reviewTop.false_positive_rate)} FP`, "var(--teal)")
-    : transitMetricChip(440, 258, "no graded reviews yet", "var(--txt-dim)");
-  const reviewSub = transitMetricChip(440, 272, `${reviewGraded.length} candidates graded`, "var(--txt-dim)");
+  const rv = transitLineText(data.reviewer.models, assignments.reviewer, roster,
+    m => `${transitFmtPct(m.catch_rate)} catch · ${transitFmtPct(m.false_positive_rate)} FP`,
+    m => m.graded_count > 0, "candidates graded");
+  const reviewChip = transitMetricChip(440, 258, rv.main.text, rv.main.color);
+  const reviewSub = transitMetricChip(440, 272, rv.sub, "var(--txt-dim)");
 
   const orchGraded = (data.orchestrator.models || []).filter(m => m.graded_count > 0);
-  const orchTop = orchGraded[0];
-  const orchChip = orchTop
-    ? transitMetricChip(440, 404, `${orchTop.label.toUpperCase()} ${transitFmtPct(orchTop.coverage_rate)} coverage`, "var(--teal)")
-    : transitMetricChip(440, 404, "0 candidates measured", "var(--orange)");
-  const orchSub = transitMetricChip(440, 418, `${orchGraded.length} candidates graded`, "var(--txt-dim)");
+  const or = transitLineText(data.orchestrator.models, assignments.orchestrator, roster,
+    m => `${transitFmtPct(m.coverage_rate)} coverage`,
+    m => m.graded_count > 0, "candidates graded");
+  const orchChip = transitMetricChip(440, 404, or.main.text, or.main.color);
+  const orchSub = transitMetricChip(440, 418, or.sub, "var(--txt-dim)");
 
   const reviewerHasData = reviewGraded.length > 0;
   const reviewerStationStatus = reviewerHasData ? "good" : "none";
@@ -321,12 +347,23 @@ async function saveRoleAssignment(role, model, statusEl){
   }
 }
 
+// Redraw just the SVG with the new assignment, so the line text tracks the
+// dropdown immediately instead of on the next full panel render.
+function transitRefreshSvg(panel, role, model){
+  const st = panel._transit;
+  if (!st) return;
+  st.roleData.assignments = {...(st.roleData.assignments || {}), [role]: model};
+  const wrap = panel.querySelector(".tm-svg-wrap");
+  if (wrap) wrap.innerHTML = buildTransitSvg(st.data, st.roleData);
+}
+
 function wireRoleBar(panel, roster){
   transitSeatWarning(panel, roster);
   panel.querySelectorAll(".tm-role-select").forEach(sel => {
     sel.addEventListener("change", () => {
       transitSeatWarning(panel, roster);
       const role = sel.dataset.role;
+      transitRefreshSvg(panel, role, sel.value);
       const statusEl = panel.querySelector(`[data-role-status="${role}"]`);
       saveRoleAssignment(role, sel.value, statusEl);
     });
@@ -469,7 +506,7 @@ async function renderTransitMap(panel){
     panel.innerHTML = `
       <div class="flow-head-bar">CODER-ENGINE TRANSIT MAP — editor ${editorGen}, reviewer ${reviewGen}, orchestrator ${orchGen}</div>
       ${transitRoleBar(roleData)}
-      <div class="tm-svg-wrap">${buildTransitSvg(j)}</div>
+      <div class="tm-svg-wrap">${buildTransitSvg(j, roleData)}</div>
       <details class="tm-line-section">
         <summary class="flow-head-bar">EDITOR LINE — ranked by pass rate</summary>
         <div class="flow-grid mcard-grid">${editorCards || '<div class="kv"><span>no runs yet</span></div>'}</div>
@@ -500,6 +537,7 @@ async function renderTransitMap(panel){
         <div class="kv" style="padding:6px 10px"><span style="color:var(--txt-dim); font-size:11px">${j.orchestrator.note}</span></div>
       </details>
     `;
+    panel._transit = {data: j, roleData};
     wireRoleBar(panel, roleData.roster);
     wireReviewTrigger(panel);
     wireProcessFixCardTrigger(panel);
