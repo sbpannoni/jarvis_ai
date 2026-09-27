@@ -145,12 +145,57 @@ function kanbanColumnsFromTasks(tasks){
 /* Everything a card displays. If this string is unchanged the card's DOM is
    left completely alone — that is what keeps scroll and hover stable across
    a poll. */
+/* ---- review chain + model seat ----------------------------------------
+   Review-chain cards are only recognisable by title prefix ("[Review] <file>",
+   "[Fix] <file> (attempt N)" -- server.py's review-file / process-fix-card),
+   which read as noise in a lane. Show them as a chip and strip the prefix.
+
+   Runs don't record which model served them, so the only honest model to
+   show is the one in snarf's GPU seat right now -- and only on RUNNING cards,
+   where "the seat's model" and "this card's model" are the same thing. */
+const KB_SEAT_TTL_MS = 30000;
+let kbSeat = {label: null, at: 0, inflight: null};
+
+async function kbRefreshSeat(){
+  if(kbSeat.inflight || Date.now() - kbSeat.at < KB_SEAT_TTL_MS) return kbSeat.inflight;
+  kbSeat.inflight = (async () => {
+    try{
+      const r = await fetch("/api/model-role-assignments");
+      const j = await r.json();
+      const m = (j.roster || []).find(x => x.loaded);
+      kbSeat.label = m ? `${m.label}${m.backend ? " · " + m.backend : ""}` : "seat empty";
+    }catch{ kbSeat.label = null; }
+    kbSeat.at = Date.now();
+    kbSeat.inflight = null;
+  })();
+  return kbSeat.inflight;
+}
+
+function kbChainKind(t){
+  const title = t.title || "";
+  if(title.startsWith("[Review] ")) return {kind: "review", rest: title.slice(9)};
+  if(title.startsWith("[Fix] ")){
+    const rest = title.slice(6);
+    const m = rest.match(/^(.*) \(attempt (\d+)\)$/);
+    return {kind: "fix", rest: m ? m[1] : rest, attempt: m ? +m[2] : 1};
+  }
+  return null;
+}
+
+function kbChainChip(c){
+  if(!c) return "";
+  return c.kind === "review"
+    ? `<span class="kb-chip kb-chain review" title="Review-chain review card: findings only, filed to triage. Never edits code">REVIEW</span>`
+    : `<span class="kb-chip kb-chain fix" title="Review-chain fix card: dispatchable, the editor works it unsupervised once it is ready. Process it after it finishes to run the gates + closure review">FIX${c.attempt > 1 ? " #" + c.attempt : ""}</span>`;
+}
+
 function kbCardSignature(t){
   const lc = t.link_counts || {};
   const pr = t.progress || {};
   return [t.status, t.title, t.assignee, t.comment_count, t.completed_at,
           t.started_at, t.block_kind, t.last_failure_error,
-          lc.parents, lc.children, pr.done, pr.total].join("|");
+          lc.parents, lc.children, pr.done, pr.total,
+          t.status === "running" ? kbSeat.label : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -191,6 +236,10 @@ function kbDepChips(t){
 }
 
 function kbCardInner(t){
+  const chain = kbChainKind(t);
+  const seat = (t.status === "running" && kbSeat.label)
+    ? `<div class="kb-seat" title="Model in snarf's GPU seat right now -- runs don't record their model, so this is only shown while the card is running">● ${kanbanEsc(kbSeat.label)}</div>`
+    : "";
   const comments = t.comment_count ? `<span class="kb-chip">${t.comment_count}c</span>` : "";
   // The lane header already says what the status is, so the card doesn't
   // repeat it — that word was most of the old card's height.
@@ -213,15 +262,19 @@ function kbCardInner(t){
       // Findings first: on a finished card the question is almost always
       // "what did it produce", and the answer used to be reachable only by
       // reading the run log to the end -- a transcript, not a result.
-      ? `<button class="btn kb-card-btn" data-action="output" data-id="${kanbanEsc(t.id)}"
+      ? (chain && chain.kind === "fix"
+          ? `<button class="btn kb-card-btn" data-action="process-fix" data-id="${kanbanEsc(t.id)}"
+               title="Run the review chain on this finished fix: mechanical gates, then closure review, then ACT -- accept (left for a human to merge), retry (files a new linked attempt), or escalate. Never auto-lands from here; use the transit map's auto-land box for that.">Process</button>`
+          : "")
+        + `<button class="btn kb-card-btn" data-action="output" data-id="${kanbanEsc(t.id)}"
            title="What this card produced: its completion summary, the structured facts it recorded, the swarm blackboard if it was part of one, and any file it named — checked against disk">Findings</button>
          <button class="btn kb-card-btn" data-action="archive" data-id="${kanbanEsc(t.id)}">Archive</button>`
       : t.status === "running"
         ? `<button class="btn kb-card-btn" data-action="reclaim" data-id="${kanbanEsc(t.id)}"
              title="Kill this card's worker and reset it to ready — the dispatcher then starts a FRESH run on its next pass, which costs another model run. Use when a run is wedged: the worker died, the runtime cap fired, or the model endpoint went away, and the card is still marked running. Does not count as a failure, so the retry limit is unaffected.">Reclaim</button>`
         : "";
-  return `<div class="kb-title">${kanbanEsc(t.title)}</div>
-    ${note}
+  return `<div class="kb-title">${kbChainChip(chain)}${kanbanEsc(chain ? chain.rest : t.title)}</div>
+    ${note}${seat}
     <div class="kb-meta"><span class="kb-who">${kanbanEsc(t.assignee) || "—"}</span>
       <span class="kb-meta-r">${kbDepChips(t)}${comments}<span class="kb-age">${kanbanAge(t)}</span></span></div>
     ${action}`;
@@ -395,11 +448,32 @@ async function refreshKanbanPause(panel){
   }catch{ /* a failed state read must not disturb the board */ }
 }
 
+// Same endpoint as the transit map's PROCESS FIX CARD, but auto_land is sent
+// as an explicit false: landing to master stays a deliberate opt-in there,
+// not something a card button can do. Takes a minute or two (closure review
+// is a model run), so the button reports the verdict in place.
+async function kbProcessFix(panel, btn){
+  btn.disabled = true;
+  btn.textContent = "processing…";
+  try{
+    const r = await fetch("/api/kanban/process-fix-card", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id, auto_land: false}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "failed — retry"; btn.title = j.error || j.escalate_error || ""; return; }
+    btn.textContent = `→ ${j.action || "done"}`;
+    btn.title = j.reason || "";
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = "failed — retry"; btn.title = err.message; }
+}
+
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
     const r = await fetch("/api/kanban");
     const j = await r.json();
+    if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
   }catch(err){ renderKanban(panel, {}, err.message); }
 }
@@ -408,7 +482,7 @@ function openKanbanBoard(){
   openWorkTabTurning("kanban","board","KANBAN",(panel,tab)=>{
     panel.innerHTML = `<div class="kb-head">
         <span class="kb-head-title">BOARD</span>
-        <span class="kb-head-sub">click a card for its run log · ⛓ = waiting on unfinished parents · n/m = children done</span>
+        <span class="kb-head-sub">click a card for its run log · ⛓ = waiting on unfinished parents · n/m = children done · REVIEW/FIX = review chain</span>
         <span class="kb-head-spacer"></span>
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
         <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
@@ -429,6 +503,7 @@ function openKanbanBoard(){
         // Findings opens a pane; the rest POST to the board and rewrite the
         // button in place, which is why they go through a different path.
         if(btn.dataset.action === "output"){ openTaskOutput(btn.dataset.id); return; }
+        if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;
