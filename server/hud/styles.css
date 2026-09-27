@@ -97,22 +97,25 @@ body.sidebars-hidden .col{
 }
 body.sidebars-hidden #colLeft{left:8px; transform:translateX(-110%)}
 body.sidebars-hidden #colRight{right:8px; transform:translateX(110%)}
-#sidebarToggleBtn{
-  background:none; border:1px solid var(--line); border-radius:8px; color:var(--txt-dim);
-  width:30px; height:30px; cursor:pointer; font-size:13px; line-height:1; margin-right:6px;
+/* Header icon buttons: were --txt-dim on a --line border, which nearly
+   vanished against the header. Full text color, a cyan border and a faint
+   cyan fill so they read as buttons in both themes. */
+#sidebarToggleBtn, #theme-toggle, .dock-icon{
+  background:color-mix(in srgb, var(--cyan) 10%, transparent);
+  border:1px solid var(--cyan-dim); border-radius:8px; color:var(--txt);
+  width:32px; height:32px; cursor:pointer; font-size:14px; line-height:1; flex-shrink:0;
 }
-#sidebarToggleBtn:hover{border-color:var(--magenta); color:var(--magenta)}
+#sidebarToggleBtn:hover{border-color:var(--magenta); color:var(--magenta); background:color-mix(in srgb, var(--magenta) 14%, transparent)}
 
-#theme-toggle{
-  background:none; border:1px solid var(--line); border-radius:8px; color:var(--txt-dim);
-  width:30px; height:30px; cursor:pointer; font-size:14px; line-height:1;
-}
-#theme-toggle:hover{ border-color:var(--cyan); color:var(--cyan); }
+#theme-toggle:hover, .dock-icon:hover{border-color:var(--cyan); color:var(--cyan); background:color-mix(in srgb, var(--cyan) 18%, transparent)}
 #grid{display:grid; grid-template-columns:320px 1fr 320px; grid-template-rows:54px 1fr 26px; height:100vh; gap:8px; padding:8px}
 header{
-  grid-column:1/4; display:flex; align-items:center; justify-content:space-between;
+  grid-column:1/4; display:flex; align-items:center; justify-content:space-between; gap:18px;
   border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:0 18px;
 }
+header h1{flex-shrink:0}
+.hdr-right{display:flex; align-items:center; gap:10px; flex-shrink:0}
+.hdr-conn{font-family:'Orbitron'; font-size:9px; letter-spacing:2px; color:var(--txt-dim)}
 header h1{font-family:'Orbitron'; font-size:19px; letter-spacing:6px; color:var(--cyan)}
 header .sub{font-size:12px; letter-spacing:3px; color:var(--txt-dim)}
 #clock{font-family:'Orbitron'; font-size:15px; letter-spacing:2px; color:var(--teal)}
@@ -158,44 +161,41 @@ header .sub{font-size:12px; letter-spacing:3px; color:var(--txt-dim)}
 .msg.looking-glass{align-self:flex-start; border-left:2px solid var(--cyan)}
 .msg.sys{align-self:center; color:var(--txt-dim); font-size:12px; border:none; background:none; padding:2px}
 
-/* ---- compact bottom dock (was: a full centered voice console — now a
-   thin strip so the moonscape/network map behind it stays the main view) */
+/* ---- Hermes composer, inline in the header's middle zone (was a floating
+   bar at the bottom of #center, which cost every view a strip of height) */
 #hermesDock{
-  display:flex; align-items:center; gap:8px; padding:8px 10px; margin:0 auto 12px;
-  width:min(680px,94%); flex-shrink:0; border-radius:12px;
-  background:color-mix(in srgb, var(--panel) 85%, transparent); border:1px solid var(--line);
-  backdrop-filter:blur(8px); box-shadow:0 8px 24px -10px #000c, 0 0 0 1px #0000004d;
+  display:flex; align-items:center; gap:8px; flex:1; min-width:0; max-width:860px; margin:0 auto;
 }
-.dock-icon{
-  background:none; border:1px solid var(--line); border-radius:8px; color:var(--txt-dim);
-  width:32px; height:32px; flex-shrink:0; cursor:pointer; font-size:14px; line-height:1;
-}
-.dock-icon:hover{border-color:var(--cyan); color:var(--cyan)}
 #reactorWrap{
   position:relative; cursor:pointer; flex-shrink:0;
   display:flex; flex-direction:row; align-items:center; gap:8px; padding:0 4px;
 }
 #coreState{display:flex; flex-direction:column; align-items:flex-start; justify-content:center; pointer-events:none; font-family:'Orbitron'}
 #coreState .st{font-size:10px; letter-spacing:2px; color:var(--cyan)}
-#coreState .hint{font-size:8px; letter-spacing:1px; color:var(--txt-dim); margin-top:2px; white-space:nowrap}
+#coreState .hint{font-size:8px; letter-spacing:1px; color:var(--txt); opacity:.75; margin-top:2px; white-space:nowrap}
 #hermesDock #chatInput{
   flex:1; min-width:0; background:#06101c; border:1px solid var(--line); color:#cfeefb;
-  padding:8px 10px; font-family:'Rajdhani'; font-size:14px; outline:none;
+  padding:7px 10px; font-family:'Rajdhani'; font-size:14px; outline:none; border-radius:6px;
+  border-color:var(--cyan-dim);
 }
 #hermesDock #chatInput:focus{border-color:var(--cyan-dim); box-shadow:0 0 8px #00e5ff33}
-#hermesDock .btn{padding:8px 12px; font-size:10px; flex-shrink:0}
+#hermesDock .btn{padding:8px 12px; font-size:10px; flex-shrink:0; font-weight:700}
 
 /* chat history: collapsed by default (toggled via the 💬 dock icon), sits
    just above the dock instead of permanently eating the center of the screen */
 #feed{
-  width:min(680px,94%); max-height:0; overflow:hidden; margin:0 auto; padding:0 10px;
+  position:fixed; top:62px; left:50%; transform:translateX(-50%); z-index:7;
+  width:min(860px,94%); max-height:0; overflow:hidden; margin:0; padding:0 10px;
+  background:color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter:blur(8px);
+  border-radius:0 0 10px 10px;
   display:flex; flex-direction:column; gap:6px; scrollbar-width:thin; flex-shrink:0;
   transition:max-height .25s ease, padding .25s ease;
 }
 #feed.open{max-height:36vh; overflow-y:auto; padding:10px}
 /* When the feed is living inside a work pane it should fill it, not be
    capped at the small docked height. */
-#feed.in-pane{max-height:none; height:100%; width:100%; overflow-y:auto; padding:10px}
+#feed.in-pane{position:static; transform:none; background:none; backdrop-filter:none;
+  max-height:none; height:100%; width:100%; overflow-y:auto; padding:10px}
 .hermes-pane{min-height:0}
 .work-panel.active.hermes-pane{display:flex; flex-direction:column}
 button.btn{
@@ -463,7 +463,9 @@ body.booted header{animation:panelIn .4s backwards}
   #grid{display:flex; flex-direction:column; height:auto; min-height:100dvh; gap:8px}
   header{position:sticky; top:0; z-index:15; flex-shrink:0}
   header h1{font-size:15px; letter-spacing:4px}
-  header .sub{display:none}
+  header{flex-wrap:wrap; padding:8px 12px; gap:8px}
+  #hermesDock{order:3; flex-basis:100%; max-width:none}
+  #coreState{display:none}
   #clock{font-size:12px}
   #center{order:1; min-height:0}
   #hermesDock{flex-wrap:wrap}
@@ -821,6 +823,10 @@ button.btn.kb-land-btn:disabled{opacity:.45; cursor:default}
 /* The netmap control bar is pinned to the top of the centre column, so make
    room for it rather than letting it sit on top of the work-area tab strip. */
 body.netmap-on #center{padding-top:44px}
+/* The map filter bar is position:fixed outside #center (whose perspective
+   and #feed are both fixed at root level) -- keep the history below the bar
+   rather than covering the link filters. */
+body.netmap-on #feed:not(.in-pane){top:104px}
 body.view-map #work-area{display:none !important}
 
 /* MACHINES rows: the fleet is now the real 11-node inventory, so each row needs

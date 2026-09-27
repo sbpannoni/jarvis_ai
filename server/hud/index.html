@@ -49,11 +49,30 @@
 <div id="grid">
   <header>
     <h1>LOOKING GLASS</h1>
-    <div class="sub">HERMES AGENT INTERFACE &nbsp;//&nbsp; <span id="connState">LINK DOWN</span></div>
-    <div id="clock">--:--:--</div>
-    <button id="sidebarToggleBtn" data-action="sidebars" title="Hide side panels (S)" aria-label="Toggle side panels">▤</button>
-    <button id="theme-toggle" data-action="theme" aria-label="Toggle light/dark theme">🌓</button>
+    <!-- The Hermes composer lives in the header (2026-09-27): as a floating
+         bar at the bottom of #center it took a permanent strip off every
+         view, while the header's middle was a line of static text. -->
+    <div id="hermesDock">
+      <button class="dock-icon" id="feedToggleBtn" title="Toggle chat history">💬</button>
+      <div id="reactorWrap" title="Click to talk (STOP is on the VOICE LINK panel, or press Esc)">
+        <div id="status-indicator" class="status-dot"></div>
+        <div id="coreState"><div class="st" id="stateLabel">STANDBY</div><div class="hint" id="stateHint">CLICK OR SPACE TO TALK</div></div>
+      </div>
+      <input id="chatInput" placeholder="Type to Hermes… (/new resets)" autocomplete="off">
+      <button class="btn" id="sendBtn">SEND</button>
+      <button class="btn" id="clearBtn" title="Clear the visible chat (history stays in Hermes)">CLR</button>
+    </div>
+    <div class="hdr-right">
+      <span id="connState" class="hdr-conn">LINK DOWN</span>
+      <div id="clock">--:--:--</div>
+      <button id="sidebarToggleBtn" data-action="sidebars" title="Hide side panels (S)" aria-label="Toggle side panels">▤</button>
+      <button id="theme-toggle" data-action="theme" aria-label="Toggle light/dark theme">🌓</button>
+    </div>
   </header>
+  <!-- Chat history drops down under the header composer. It lives at the
+       #grid level, not in #center: #center (perspective) is its own stacking
+       context, and the full-screen network map layer paints over it. -->
+  <div id="feed"></div>
 
   <!-- LEFT COLUMN -->
   <div class="col" id="colLeft">
@@ -120,17 +139,6 @@
     <div id="work-area">
       <div id="work-tabs"></div>
       <div id="work-content"></div>
-    </div>
-    <div id="feed"></div>
-    <div id="hermesDock">
-      <button class="dock-icon" id="feedToggleBtn" title="Toggle chat history">💬</button>
-      <div id="reactorWrap" title="Click to talk (STOP is on the VOICE LINK panel, or press Esc)">
-        <div id="status-indicator" class="status-dot"></div>
-        <div id="coreState"><div class="st" id="stateLabel">STANDBY</div><div class="hint" id="stateHint">CLICK OR SPACE TO TALK</div></div>
-      </div>
-      <input id="chatInput" placeholder="Type to Hermes… (/new resets)" autocomplete="off">
-      <button class="btn" id="sendBtn">SEND</button>
-      <button class="btn" id="clearBtn" title="Clear the visible chat (history stays in Hermes)">CLR</button>
     </div>
   </div>
 

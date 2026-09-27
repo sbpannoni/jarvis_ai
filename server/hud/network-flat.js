@@ -156,7 +156,9 @@ function fnInsets(W,H){
   // that is the whole centre column, so its top sits near the header, the
   // >H*0.5 guard rejected it, and bottom silently fell back to the minimum --
   // which put the OOB node row straight through the composer at reduced
-  // heights. Measure the bar itself.
+  // heights. Measure the bar itself. Since the composer moved into the
+  // header (2026-09-27) its top is above H*0.4, so this is skipped and the
+  // bottom inset is just PAD -- the map gets the full height.
   const dock=fnMeasure("hermesDock");
   if(dock && dock.top>H*0.4 && dock.top<H) bottom=(H-dock.top)+PAD;
   // Never let the insets collapse the canvas to nothing.

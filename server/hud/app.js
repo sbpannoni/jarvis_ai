@@ -596,7 +596,7 @@ function openHermesChatPane(){
       // a panel that is about to be removed from the document.
       const home=anchor.parentNode
         ? {parent:anchor.parentNode, before:anchor}
-        : {parent:$("center"), before:$("hermesDock")};
+        : {parent:$("grid"), before:null};
       home.parent.insertBefore(feed, home.before);
       anchor.remove();
     };
