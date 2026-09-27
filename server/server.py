@@ -2049,6 +2049,7 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
 CODER_ENGINE_VENV_PY = "/ssdpool/coder-engine/.venv/bin/python3"
 DISPATCH_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_review_task.py"
 CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"
+DISPATCH_CLOSURE_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_closure_review_task.py"
 _FENCED_FINDINGS_RE = re.compile(r"```json:review-findings\n(.*?)\n```", re.DOTALL)
 
 
@@ -2319,6 +2320,99 @@ async def check_fix_card(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": f"unparseable gate output: {out2[-2000:]}"}, status_code=502)
 
     return JSONResponse({"ok": True, "task_id": task_id, "branch": branch_name, **verdict})
+
+
+@app.post("/api/kanban/closure-review")
+async def closure_review(request: Request) -> JSONResponse:
+    """Run dispatch_closure_review_task.py -- the last piece of the review
+    chain -- against a completed fix card: given the findings it was
+    supposed to address and its actual diff, get a per-finding
+    resolved/unresolved verdict plus any newly introduced issues. A real
+    model call (unlike check-fix-card's pure git math), so intended to run
+    AFTER check-fix-card's mechanical gates pass, not instead of them --
+    this endpoint doesn't enforce that ordering itself, same "caller
+    decides" discipline as everything else here. Report only: does not
+    retry, comment on, or archive the card.
+
+    Body: {"task_id": "t_..."}. Same findings-extraction path as
+    check-fix-card (the fenced json:review-findings block in the card
+    body) and the same reviewer model as /api/review-file."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+
+    try:
+        rc, out = await _kanban_ssh(f"hermes kanban show {shlex.quote(task_id)} --json")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": out[-2000:]}, status_code=502)
+    try:
+        card = json.loads(out.strip())
+    except json.JSONDecodeError:
+        return JSONResponse({"ok": False, "error": f"unparseable kanban output: {out[-500:]}"}, status_code=502)
+
+    task = card.get("task") or {}
+    body = task.get("body") or ""
+    m = _FENCED_FINDINGS_RE.search(body)
+    if not m:
+        return JSONResponse(
+            {"ok": False, "error": "no embedded review-findings block in this card's body -- "
+                                    "not a review-chain fix card, or filed before that feature existed"},
+            status_code=400,
+        )
+    try:
+        findings_payload = json.loads(m.group(1))
+    except json.JSONDecodeError as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"embedded findings block is not valid JSON: {exc}"}, status_code=500
+        )
+
+    branch_name = task.get("branch_name") or f"hermes/{task_id}"
+
+    try:
+        rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
+        model = json.loads(out0).get("reviewer") if rc0 == 0 else None
+    except Exception:
+        model = None
+    if not model:
+        return JSONResponse(
+            {"ok": False, "error": "could not resolve reviewer's assigned model"}, status_code=502
+        )
+
+    findings_tmp_path = f"/tmp/closure-review-{task_id}.json"
+    write_cmd = f"printf %s {shlex.quote(json.dumps(findings_payload))} > {shlex.quote(findings_tmp_path)}"
+    try:
+        rcw, outw = await _fleet_ssh("snarf", write_cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rcw != 0:
+        return JSONResponse({"ok": False, "error": f"could not stage findings on snarf: {outw[-1000:]}"}, status_code=502)
+
+    closure_cmd = (
+        f"{CODER_ENGINE_VENV_PY} {DISPATCH_CLOSURE_REVIEW_TASK_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--branch-name {shlex.quote(branch_name)} "
+        f"--base-ref master "
+        f"--model {shlex.quote(model)} "
+        f"--findings-json {shlex.quote(findings_tmp_path)}; "
+        f"rm -f {shlex.quote(findings_tmp_path)}"
+    )
+    try:
+        rc2, out2 = await _fleet_ssh("snarf", closure_cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+    brace = out2.find("{")
+    try:
+        if brace < 0:
+            raise ValueError("no JSON object in output")
+        verdict = json.loads(out2[brace:])
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"ok": False, "error": f"unparseable closure-review output: {out2[-2000:]}"}, status_code=502)
+
+    return JSONResponse({"ok": True, "task_id": task_id, "branch": branch_name, "model": model, **verdict})
 
 
 def _parse_checkbox_md(text: str) -> dict:
