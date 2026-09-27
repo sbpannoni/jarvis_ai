@@ -2066,12 +2066,37 @@ async def review_file(request: Request) -> JSONResponse:
     attempt" discipline as dispatch_task.py.
 
     Body: {"target_file": "path/inside/DARKHELIX", "task_description":
-    optional override of the default review prompt}."""
+    optional override of the default review prompt, "chain": optional bool,
+    default false}.
+
+    `chain: true` (2026-09-26) is the one new thing this endpoint can do,
+    and it is opt-in for a reason: every existing caller of this endpoint
+    (the HUD's own review button) gets byte-identical behavior with `chain`
+    omitted or false. When true, and the review actually found something
+    (findings non-empty, no_issues_found false), this ALSO files a second,
+    normally-dispatchable card (no --triage) assigned to the editor's
+    profile, with --parent set to the review card so the board shows the
+    relationship and (today, incidentally -- see kanban's own --parent
+    semantics) the editor card waits for the review card, which is already
+    done by the time this fires. The editor card's body embeds the
+    structured findings as a fenced JSON block, not just prose, because a
+    later closure-review pass (not yet built) needs to check the eventual
+    diff against these SPECIFIC findings, not re-derive them from text.
+
+    This does not weaken review_file's own existing safety line -- the
+    review card is still filed exactly as before, still --triage, still a
+    proposal a human reads. The NEW card this can file is real editor work
+    that runs unsupervised, same as any other editor-assigned kanban card
+    always has -- reviewer still never merges anything itself, it can now
+    just also hand off a well-specified todo instead of only a read-only
+    note. See dispatch_review_task.py's own docstring for why reviewer
+    itself still never executes or merges."""
     payload = await request.json()
     target_file = (payload.get("target_file") or "").strip()
     if not target_file:
         return JSONResponse({"ok": False, "error": "target_file is required"}, status_code=400)
     task_description = (payload.get("task_description") or "").strip()
+    chain = bool(payload.get("chain"))
 
     try:
         rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
@@ -2112,6 +2137,8 @@ async def review_file(request: Request) -> JSONResponse:
         )
 
     review_text = result.get("review_text") or ""
+    findings = result.get("findings") or []
+    no_issues_found = bool(result.get("no_issues_found"))
     title = f"[Review] {target_file}"
     body = (
         f"Automated review by {model} (reviewer role) -- a proposal, not a "
@@ -2138,7 +2165,73 @@ async def review_file(request: Request) -> JSONResponse:
             status_code=502,
         )
 
-    return JSONResponse({"ok": True, "task": task_data, "model": model, "review_text": review_text})
+    response = {
+        "ok": True, "task": task_data, "model": model, "review_text": review_text,
+        "findings": findings, "no_issues_found": no_issues_found, "chained": False,
+    }
+    if not chain:
+        return JSONResponse(response)
+    if no_issues_found or not findings:
+        response["chain_skipped_reason"] = "no actionable findings"
+        return JSONResponse(response)
+
+    review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
+    if not _TASK_ID_RE.match(review_task_id):
+        response["chain_skipped_reason"] = f"review card id unparseable: {review_task_id!r}"
+        return JSONResponse(response)
+
+    fix_lines = [
+        f"Fix the {len(findings)} issue(s) below in `{target_file}`, found by an "
+        f"automated review ({model}, reviewer role). This card was filed "
+        f"automatically from that review -- see the linked parent card "
+        f"({review_task_id}) for the full review text.\n",
+    ]
+    for i, f in enumerate(findings, 1):
+        loc = f"{f.get('file', target_file)}:{f['line']}" if f.get("line") is not None else f.get("file", target_file)
+        fix_lines.append(f"{i}. {loc} -- {f.get('summary', '')}")
+        if f.get("failure_scenario"):
+            fix_lines.append(f"   Failure scenario: {f['failure_scenario']}")
+        if f.get("suggested_fix"):
+            fix_lines.append(f"   Suggested fix: {f['suggested_fix']}")
+    fix_lines.append(
+        "\nEach finding above is a specific, checkable claim -- address the "
+        "location named, don't just touch the file. A closure check will "
+        "later verify the diff actually reaches these lines."
+    )
+    fix_lines.append("\n```json:review-findings")
+    fix_lines.append(json.dumps({"source_task": review_task_id, "target_file": target_file, "findings": findings}, indent=2))
+    fix_lines.append("```")
+    fix_title = f"[Fix] {target_file}"
+    fix_body = "\n".join(fix_lines)
+    idempotency_key = _submission_key(fix_title, fix_body)
+
+    fix_cmd = (
+        "hermes kanban create "
+        f"{shlex.quote(fix_title[:200])} "
+        f"--body {shlex.quote(fix_body)} "
+        "--workspace scratch "
+        f"--idempotency-key {shlex.quote(idempotency_key)} "
+        f"--assignee {shlex.quote(_darkhelix_assignee())} "
+        f"--parent {shlex.quote(review_task_id)} "
+        "--created-by looking-glass --json"
+    )
+    try:
+        rc3, out3 = await _kanban_ssh(fix_cmd)
+    except Exception as exc:
+        response["chain_error"] = str(exc)
+        return JSONResponse(response)
+    if rc3 != 0:
+        response["chain_error"] = out3[-2000:]
+        return JSONResponse(response)
+    try:
+        fix_task_data = json.loads(out3.strip())
+    except json.JSONDecodeError:
+        response["chain_error"] = f"unparseable kanban output: {out3[-500:]}"
+        return JSONResponse(response)
+
+    response["chained"] = True
+    response["chained_task"] = fix_task_data
+    return JSONResponse(response)
 
 
 def _parse_checkbox_md(text: str) -> dict:
