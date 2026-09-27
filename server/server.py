@@ -2451,6 +2451,26 @@ async def _fix_card_attempt_number(task_id: str) -> int:
     return seen
 
 
+def _review_chain_land_cfg() -> dict:
+    return CFG.get("review_chain") or {}
+
+
+def _review_chain_auto_land_enabled(payload: dict) -> bool:
+    """The override toggle: whether "accept" should go all the way through
+    PR submit and merge, or stop at "ready for a human," per
+    dispatch_review_task.py's original boundary. Two levels, most specific
+    wins: an explicit `auto_land` in THIS request's payload (test the
+    override on one card without flipping the global switch), falling back
+    to `review_chain.auto_land` in server.yaml (off by default -- same
+    opt-in contract as darkhelix.auto_land, for the same sharper reason:
+    this does not just move a card, it pushes to GitHub and merges to
+    master unattended)."""
+    override = payload.get("auto_land")
+    if override is not None:
+        return bool(override)
+    return bool(_review_chain_land_cfg().get("auto_land"))
+
+
 @app.post("/api/kanban/process-fix-card")
 async def process_fix_card(request: Request) -> JSONResponse:
     """The orchestration this chain has been missing: run both gates on a
@@ -2473,16 +2493,29 @@ async def process_fix_card(request: Request) -> JSONResponse:
       closure-review that could not produce a structured verdict
       (used_unstructured_fallback) -> escalate; an unverifiable verdict is
       not grounds to either accept or safely retry.
-    - everything resolved, nothing new -> accept (leaves the card as-is;
-      accepting means "ready for a human to merge", not auto-merge --
-      that boundary stays exactly where dispatch_review_task.py's
-      docstring already drew it).
+    - everything resolved, nothing new -> accept. By default this leaves
+      the card as-is: "ready for a human to merge," not auto-merge, the
+      same boundary dispatch_review_task.py's docstring already drew.
+
+    Override toggle (2026-09-27): accept can go all the way through PR
+    submit, CI wait, and merge instead of stopping at "ready for a human"
+    -- see _review_chain_auto_land_enabled. This reuses
+    _darkhelix_autoland_one (the same, now-hardened, autonomous-landing
+    machinery DARKHELIX's own pipeline uses -- verify/commit/push/PR/
+    CI-wait/merge, the diff-size circuit breaker, the CI-poll-IS-the-gate
+    design since branch protection is unavailable on this private repo)
+    with skip_review_check=True: this call's own mechanical gates and
+    closure-review, both just run synchronously above, ARE this card's
+    review -- a generic review_requested kanban event is not how it
+    happened and checking for one would just fail every accept. OFF by
+    default; explicit opt-in per-request or via review_chain.auto_land.
 
     Retry is capped at 3 attempts total (counted by walking --parent
     links through prior fix-card attempts); the 3rd failing attempt
     escalates instead of retrying a 4th time.
 
-    Body: {"task_id": "t_..."} (a fix card, not the original review card).
+    Body: {"task_id": "t_...", "auto_land": optional bool override}
+    (task_id is a fix card, not the original review card).
     """
     payload = await request.json()
     task_id = (payload.get("task_id") or "").strip()
@@ -2528,6 +2561,14 @@ async def process_fix_card(request: Request) -> JSONResponse:
                 # silently swallowed.
                 result["ok"] = False
                 result["escalate_error"] = outb[-1000:]
+        elif action == "accept" and _review_chain_auto_land_enabled(payload):
+            land_result = await _darkhelix_autoland_one(task_id, skip_review_check=True)
+            result["auto_land"] = land_result
+            if not land_result.get("ok"):
+                # A failed landing attempt is still a real outcome the
+                # caller must see as such -- accept-the-verdict succeeded,
+                # but the thing this toggle exists to do did not.
+                result["ok"] = False
         return JSONResponse(result)
 
     if mechanical.get("test_tamper", {}).get("flagged"):
@@ -5677,28 +5718,37 @@ async def _dh_pr_actually_merged(pr_number: str) -> bool:
         return False
 
 
-async def _darkhelix_autoland_one(task_id: str) -> dict:
+async def _darkhelix_autoland_one(task_id: str, skip_review_check: bool = False) -> dict:
     """The whole unattended sequence for one card:
 
         verify -> commit -> push -> PR -> wait for CI -> merge
 
     Callers (the poller and the manual trigger below) both gate on
-    _dh_reviewed first -- this function does not check it itself, so the
-    reason a card was skipped is visible at the call site. Guards against
-    running twice for the same card concurrently (the poller and the
-    manual "Land Autonomously" trigger have no other way to know about
-    each other) with a simple in-process set -- good enough for a single
-    server process, which this always runs as."""
+    _dh_reviewed first -- this function ALSO re-checks it itself (freshness,
+    not just presence -- see _dh_review_still_fresh) unless the caller
+    passes skip_review_check=True, which means the caller has already
+    established equivalent-or-stronger review currency by its own means and
+    a DARKHELIX-specific review_requested kanban event is not how that
+    caller's review happened. The review chain's process-fix-card is
+    exactly this case: its own mechanical gates + closure-review just ran,
+    synchronously, in the same call that decided to land -- there is no
+    staleness window for a generic event-presence check to protect against
+    that this caller has not already covered more specifically.
+
+    Guards against running twice for the same card concurrently (the
+    poller and the manual "Land Autonomously" trigger have no other way to
+    know about each other) with a simple in-process set -- good enough for
+    a single server process, which this always runs as."""
     if task_id in _DH_LANDING_IN_FLIGHT:
         return {"ok": False, "stage": "in-flight", "error": "already landing this card"}
     _DH_LANDING_IN_FLIGHT.add(task_id)
     try:
-        return await _darkhelix_autoland_one_locked(task_id)
+        return await _darkhelix_autoland_one_locked(task_id, skip_review_check)
     finally:
         _DH_LANDING_IN_FLIGHT.discard(task_id)
 
 
-async def _darkhelix_autoland_one_locked(task_id: str) -> dict:
+async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool = False) -> dict:
     cfg = _dh_land_cfg()
     land = await _darkhelix_land(task_id)
     if not land.get("pr_url"):
@@ -5714,20 +5764,25 @@ async def _darkhelix_autoland_one_locked(task_id: str) -> dict:
     # Freshness: the review this whole path is gated on must still cover
     # what's actually about to merge -- the commit step above just ran, so
     # this is the earliest point the true final commit timestamp is known.
-    try:
-        review_ts = await _dh_reviewed(task_id)
-    except _DhOutage as exc:
-        outcome = await _kanban_block(task_id, f"opened {pr_url} but could not "
-                                       f"re-confirm review: {exc}", kind="needs_input")
-        return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
-                "reason": str(exc), "block_result": outcome}
-    if review_ts is None:
-        outcome = await _kanban_block(task_id, f"opened {pr_url} but its review_requested "
-                                       "event disappeared between the gate check and landing",
-                                       kind="needs_input")
-        return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
-                "reason": "no review event found on recheck", "block_result": outcome}
-    fresh, fresh_reason = await _dh_review_still_fresh(task_id, review_ts, DARKHELIX_REPO_PATH, branch)
+    # Skipped entirely when the caller already vouches for review currency
+    # (see the skip_review_check docstring above).
+    if skip_review_check:
+        review_ts, fresh, fresh_reason = None, True, ""
+    else:
+        try:
+            review_ts = await _dh_reviewed(task_id)
+        except _DhOutage as exc:
+            outcome = await _kanban_block(task_id, f"opened {pr_url} but could not "
+                                           f"re-confirm review: {exc}", kind="needs_input")
+            return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
+                    "reason": str(exc), "block_result": outcome}
+        if review_ts is None:
+            outcome = await _kanban_block(task_id, f"opened {pr_url} but its review_requested "
+                                           "event disappeared between the gate check and landing",
+                                           kind="needs_input")
+            return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
+                    "reason": "no review event found on recheck", "block_result": outcome}
+        fresh, fresh_reason = await _dh_review_still_fresh(task_id, review_ts, DARKHELIX_REPO_PATH, branch)
     if not fresh:
         outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
                                        f"{fresh_reason}", kind="needs_input")
@@ -5915,7 +5970,8 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
         review_ts = await _dh_reviewed(task_id)
     except _DhOutage as exc:
         return JSONResponse({"ok": False, "error": f"could not check review status: {exc}"}, status_code=502)
-    if review_ts is None and not bool(payload.get("skip_review_check")):
+    skip_review_check = bool(payload.get("skip_review_check"))
+    if review_ts is None and not skip_review_check:
         return JSONResponse({
             "ok": False,
             "error": ("this card has no review_requested event -- it has not been "
@@ -5926,7 +5982,11 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
 
     async def _run() -> None:
         try:
-            result = await _darkhelix_autoland_one(task_id)
+            # Thread the same flag into the function itself -- it now
+            # re-checks review currency internally too (freshness, not just
+            # presence), and without this the human's explicit skip request
+            # here would be silently overridden by that internal check.
+            result = await _darkhelix_autoland_one(task_id, skip_review_check=skip_review_check)
             if result.get("ok"):
                 _DH_LAND_STATUS["landed"] += 1
             _dh_land_record({"task_id": task_id,

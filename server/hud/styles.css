@@ -991,6 +991,29 @@ button.tm-review-btn:disabled{opacity:.5; cursor:default; box-shadow:none}
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .tm-review-status.saved{color:var(--teal)}
 .tm-review-status.err{color:var(--red)}
+.tm-review-chain-label{display:flex; align-items:center; gap:4px; flex-shrink:0;
+  font-size:10px; color:var(--txt-dim); cursor:pointer; user-select:none}
+.tm-review-chain-label input{margin:0}
+
+/* Review chain orchestration trigger (POST /api/kanban/process-fix-card
+   -> mechanical gates, then closure-review if those pass, then act:
+   accept/retry/escalate). Same row shape as .tm-review-trigger, one
+   dashed rule below it so the two read as a pair. */
+.tm-process-trigger{display:flex; align-items:center; gap:8px; padding:8px 10px;
+  border-bottom:1px dashed var(--line)}
+.tm-process-input{flex:1; min-width:0; background:var(--panel); color:var(--txt);
+  border:1px solid var(--line); border-radius:3px; padding:5px 7px;
+  font-family:'Rajdhani'; font-size:12px}
+.tm-process-input:focus{outline:1px solid var(--magenta); outline-offset:1px}
+button.tm-process-btn{border-color:var(--magenta); color:var(--magenta);
+  font-size:10px; padding:6px 10px; flex-shrink:0}
+button.tm-process-btn:hover{background:#3a0a33; box-shadow:0 0 10px #ff2fd044}
+button.tm-process-btn:disabled{opacity:.5; cursor:default; box-shadow:none}
+.tm-process-status{font-size:10px; color:var(--txt-dim); flex-shrink:0; max-width:320px;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tm-process-status.saved{color:var(--teal)}
+.tm-process-status.warn{color:var(--amber)}
+.tm-process-status.err{color:var(--red)}
 
 /* ---------------- submit work (darkhelix todo) ---------------- */
 /* ---- SUBMIT WORK ----

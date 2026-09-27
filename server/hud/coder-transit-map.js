@@ -297,14 +297,24 @@ function wireRoleBar(panel){
 // kanban card, never a higher status). One call = one review; no polling
 // loop needed, the request itself blocks until the review (and card
 // filing) completes or fails.
+//
+// The "chain" checkbox (2026-09-26) opts into review-file's chain:true --
+// when the review actually finds something, this ALSO files a second,
+// normally-dispatchable [Fix] card (--parent-linked, assignee=coder) for
+// the editor to pick up on its own. Off by default: this is the one
+// action in this whole panel that can cause real, unsupervised code
+// changes, so a human ticks it on purpose rather than it being the
+// default click.
 function wireReviewTrigger(panel){
   const btn = panel.querySelector(".tm-review-btn");
   const input = panel.querySelector(".tm-review-input");
+  const chainBox = panel.querySelector(".tm-review-chain");
   const statusEl = panel.querySelector(".tm-review-status");
   if (!btn || !input || !statusEl) return;
   btn.addEventListener("click", async () => {
     const target_file = input.value.trim();
     if (!target_file){ statusEl.textContent = "enter a file path first"; statusEl.className = "tm-review-status err"; return; }
+    const chain = !!(chainBox && chainBox.checked);
     btn.disabled = true;
     statusEl.textContent = "reviewing… (can take a minute or two)";
     statusEl.className = "tm-review-status";
@@ -312,15 +322,87 @@ function wireReviewTrigger(panel){
       const r = await fetch("/api/review-file", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({target_file}),
+        body: JSON.stringify({target_file, chain}),
       });
       const j = await r.json();
       if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
-      statusEl.textContent = `filed to triage: ${j.task.id}`;
-      statusEl.className = "tm-review-status saved";
+      if (j.no_issues_found){
+        statusEl.textContent = `filed to triage: ${j.task.id} (no issues found)`;
+        statusEl.className = "tm-review-status saved";
+      } else if (j.chained){
+        statusEl.textContent = `review ${j.task.id} -> fix card ${j.chained_task.id} filed (todo, assignee ${j.chained_task.assignee})`;
+        statusEl.className = "tm-review-status saved";
+      } else if (chain){
+        statusEl.textContent = `filed to triage: ${j.task.id} (${j.chain_skipped_reason || "not chained"})`;
+        statusEl.className = "tm-review-status saved";
+      } else {
+        statusEl.textContent = `filed to triage: ${j.task.id}`;
+        statusEl.className = "tm-review-status saved";
+      }
     }catch(err){
       statusEl.textContent = `error: ${err.message}`;
       statusEl.className = "tm-review-status err";
+    }finally{
+      btn.disabled = false;
+    }
+  });
+}
+
+// Manual trigger for the review chain's orchestration endpoint: given a
+// completed [Fix] card's id, runs the mechanical gates and (if they pass)
+// closure-review, then ACTS -- accept (leaves it for a human to merge),
+// retry (files a new linked attempt with specific objections), or
+// escalate (hermes kanban block --kind needs_input). Manual by design:
+// this is the one control in the panel that can file new work or change
+// a card's board state, so it stays a deliberate click, not a background
+// sweep, until there's been enough supervised use to trust it unattended.
+//
+// The "auto-land" checkbox (2026-09-27) is the override toggle: when an
+// accept verdict lands, this also carries it through PR submit, CI wait,
+// and merge, instead of stopping at "ready for a human". Off by default
+// per-click here regardless of the server.yaml review_chain.auto_land
+// default, for the same reason chain defaults off on the review trigger
+// above -- the one action that can merge to master unattended stays an
+// explicit, visible opt-in, not a box someone leaves checked and forgets.
+function wireProcessFixCardTrigger(panel){
+  const btn = panel.querySelector(".tm-process-btn");
+  const input = panel.querySelector(".tm-process-input");
+  const autoLandBox = panel.querySelector(".tm-process-autoland");
+  const statusEl = panel.querySelector(".tm-process-status");
+  if (!btn || !input || !statusEl) return;
+  btn.addEventListener("click", async () => {
+    const task_id = input.value.trim();
+    if (!task_id){ statusEl.textContent = "enter a fix card id first"; statusEl.className = "tm-process-status err"; return; }
+    const auto_land = !!(autoLandBox && autoLandBox.checked);
+    btn.disabled = true;
+    statusEl.textContent = auto_land
+      ? "checking gates, may run closure-review, then PR+CI+merge if accepted…"
+      : "checking gates, may run closure-review…";
+    statusEl.className = "tm-process-status";
+    try{
+      const r = await fetch("/api/kanban/process-fix-card", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({task_id, auto_land}),
+      });
+      const j = await r.json();
+      const byAction = {accept: "saved", retry: "warn", escalate: "err"};
+      if (j.action === "accept" && j.auto_land){
+        const land = j.auto_land;
+        statusEl.textContent = land.ok
+          ? `accept -> merged: ${land.pr_url || ""}`
+          : `accept -> land failed at ${land.stage}: ${land.reason || land.error || "unknown"}`;
+        statusEl.className = `tm-process-status ${land.ok ? "saved" : "err"}`;
+      } else if (!j.ok){
+        throw new Error(j.error || j.escalate_error || `HTTP ${r.status}`);
+      } else {
+        statusEl.textContent = `${j.action} (attempt ${j.attempt}): ${j.reason}`
+          + (j.retry_task ? ` -> ${j.retry_task.id}` : "");
+        statusEl.className = `tm-process-status ${byAction[j.action] || ""}`;
+      }
+    }catch(err){
+      statusEl.textContent = `error: ${err.message}`;
+      statusEl.className = "tm-process-status err";
     }finally{
       btn.disabled = false;
     }
@@ -355,8 +437,19 @@ async function renderTransitMap(panel){
         <summary class="flow-head-bar">REVIEWER LINE — ranked by catch rate</summary>
         <div class="tm-review-trigger">
           <input type="text" class="tm-review-input" placeholder="path inside DARKHELIX, e.g. darkhelix/ui_registry.py" />
+          <label class="tm-review-chain-label" title="Also file a linked, dispatchable [Fix] card if the review finds something -- runs unsupervised once filed">
+            <input type="checkbox" class="tm-review-chain" /> chain
+          </label>
           <button type="button" class="btn tm-review-btn">RUN REVIEW</button>
           <span class="tm-review-status"></span>
+        </div>
+        <div class="tm-process-trigger">
+          <input type="text" class="tm-process-input" placeholder="[Fix] card id, e.g. t_abcd1234" />
+          <label class="tm-review-chain-label" title="If accepted, also carry it through PR submit, CI wait, and merge -- otherwise accept just leaves it ready for a human">
+            <input type="checkbox" class="tm-process-autoland" /> auto-land
+          </label>
+          <button type="button" class="btn tm-process-btn">PROCESS FIX CARD</button>
+          <span class="tm-process-status"></span>
         </div>
         <div class="flow-grid mcard-grid">${reviewerCards || '<div class="kv"><span>no runs yet</span></div>'}</div>
       </details>
@@ -368,6 +461,7 @@ async function renderTransitMap(panel){
     `;
     wireRoleBar(panel);
     wireReviewTrigger(panel);
+    wireProcessFixCardTrigger(panel);
   }catch(err){
     panel.innerHTML = `<div class="kv"><span class="err">transit map unavailable: ${err.message}</span></div>`;
   }
