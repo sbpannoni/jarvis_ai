@@ -429,6 +429,7 @@ function renderKanban(panel, board, err){
    A paused board otherwise looks identical to an idle one, which is its own
    trap, so the state is shown as a banner rather than only on the button. */
 async function refreshKanbanPause(panel){
+  if(typeof plRefreshBadge === "function") plRefreshBadge(panel);
   const btn = panel.querySelector(".kb-pause");
   const banner = panel.querySelector(".kb-paused-banner");
   if(!btn || !banner) return;
@@ -485,12 +486,15 @@ function openKanbanBoard(){
         <span class="kb-head-sub">click a card for its run log · ⛓ = waiting on unfinished parents · n/m = children done · REVIEW/FIX = review chain</span>
         <span class="kb-head-spacer"></span>
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
+        <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">🧠 … pending learning</button>
         <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
         <span class="kb-source">loading…</span>
       </div>
       <div class="kb-paused-banner" hidden></div>
       <div class="kb-lanes"></div>`;
     panel.classList.add("kanban-pane");
+    const learnBtn = panel.querySelector(".kb-learning");
+    if(learnBtn) learnBtn.onclick = () => { if(typeof openPendingLearning === "function") openPendingLearning(); };
 
     // One delegated listener for the whole board — card clicks, action
     // buttons and lane collapse. Re-binding per card on every poll was both

@@ -6826,6 +6826,62 @@ async def _issue_note_card(title: str, task_id: str, how: str) -> None:
         pass
 
 
+# ------------------------------------------------------ PENDING LEARNING
+# Hermes profiles with write_approval=true never apply a kanban worker's memory
+# or skill write (nor its background self-review's); they stage it under
+# <profile>/pending/ for a human. Workers run unattended, so nobody was asked --
+# two lessons sat for a month (2026-08-29 .. 09-27). All reads and decisions go
+# through /root/.hermes/scripts/pending-learning on CT111, the same tool the
+# daily 05:00 Claude audit uses, so every decision lands in one log with who
+# made it and why.
+PENDING_LEARNING = "/root/.hermes/scripts/pending-learning"
+PENDING_LOG = "/root/.hermes/pending-learning.jsonl"
+AUDIT_REPORT = "/root/.hermes/learning-audit/latest.md"
+_PL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@app.get("/api/learning/pending")
+async def learning_pending() -> JSONResponse:
+    try:
+        rc, out = await _fleet_ssh("hermes", f"{PENDING_LEARNING} list --json")
+        rc2, log = await _fleet_ssh("hermes", f"tail -n 25 {PENDING_LOG} 2>/dev/null")
+        rc3, report = await _fleet_ssh("hermes", f"cat {AUDIT_REPORT} 2>/dev/null | head -c 20000")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if rc != 0:
+        return JSONResponse({"error": out[-400:]}, status_code=502)
+    decisions = []
+    for ln in (log or "").splitlines():
+        try:
+            decisions.append(json.loads(ln))
+        except Exception:
+            pass
+    return JSONResponse({"pending": json.loads(out), "decisions": list(reversed(decisions)),
+                         "audit_report": report or ""})
+
+
+@app.post("/api/learning/decide")
+async def learning_decide(request: Request) -> JSONResponse:
+    """Body: {profile, subsystem: memory|skills, id, decision: approve|reject, reason}."""
+    b = await request.json()
+    profile, sub, pid = b.get("profile", ""), b.get("subsystem", ""), b.get("id", "")
+    decision, reason = b.get("decision", ""), (b.get("reason") or "").strip()
+    if not (_PL_NAME_RE.match(profile) and _PL_NAME_RE.match(pid)) or sub not in ("memory", "skills") \
+            or decision not in ("approve", "reject") or not reason:
+        return JSONResponse({"ok": False, "error": "profile, subsystem, id, decision and a reason are required"},
+                            status_code=400)
+    cmd = (f"{PENDING_LEARNING} {decision} {shlex.quote(profile)} {sub} {shlex.quote(pid)} "
+           f"--by sam --reason {shlex.quote(reason)}")
+    try:
+        rc, out = await _fleet_ssh("hermes", cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    try:
+        return JSONResponse(json.loads(out.strip().splitlines()[-1]))
+    except Exception:
+        return JSONResponse({"ok": rc == 0, "output": out[-500:]})
+
+
 # --------------------------------------------------------- CODE SWEEP
 # Front end for coder-engine's pipeline/sweep/sweep.py on snarf: a chunked,
 # evidence-checked review of DARKHELIX whose findings live in a ledger
