@@ -6826,6 +6826,133 @@ async def _issue_note_card(title: str, task_id: str, how: str) -> None:
         pass
 
 
+# --------------------------------------------------------- CODE SWEEP
+# Front end for coder-engine's pipeline/sweep/sweep.py on snarf: a chunked,
+# evidence-checked review of DARKHELIX whose findings live in a ledger
+# (~/sweeps/ledger.sqlite) that persists across sweeps. The HUD only starts a
+# sweep, shows progress, and triages findings -- filing one as a GitHub issue
+# (the tracker since 2026-09-27) or marking it false positive / won't fix.
+# Nothing is filed automatically: a model's finding becomes work only when a
+# human clicks File issue.
+SWEEP_PY = "/home/sam/vllm/.venv/bin/python /ssdpool/coder-engine/pipeline/sweep/sweep.py"
+SWEEP_LOG = "/home/sam/sweeps/current.log"
+_SWEEP_DIR_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+_SWEEP_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+# A finding's file path -> the tracker area it most likely belongs to.
+_SWEEP_AREA = (("darkhelix-app/", "area:ui"), ("scripts/microbial_profiling/", "area:taxor"),
+               ("evaluation/", "area:evaluation"))
+
+
+async def _sweep_running() -> bool:
+    # [p]ipeline: the regex still matches the sweep, but no longer matches the
+    # ssh shell running this pgrep (whose own command line contains the text).
+    rc, out = await _fleet_ssh("snarf", "pgrep -f '[p]ipeline/sweep/sweep.py run' >/dev/null && echo yes || echo no")
+    return out.strip().endswith("yes")
+
+
+@app.get("/api/sweep")
+async def sweep_status() -> JSONResponse:
+    """Running state, log tail, ledger counts, recent runs, and the plan's groups."""
+    try:
+        running = await _sweep_running()
+        rc, tail = await _fleet_ssh("snarf", f"tail -n 12 {SWEEP_LOG} 2>/dev/null")
+        rc2, counts = await _fleet_ssh("snarf", f"{SWEEP_PY} ledger --json")
+        rc3, plan = await _fleet_ssh("snarf", f"{SWEEP_PY} plan")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    rows = json.loads(counts) if rc2 == 0 and counts.strip().startswith("[") else []
+    by_status: dict = {}
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    try:
+        plan_j = json.loads(plan)
+    except Exception:
+        plan_j = {}
+    return JSONResponse({"running": running, "log_tail": tail, "counts": by_status,
+                         "total": len(rows), "plan": plan_j})
+
+
+@app.get("/api/sweep/findings")
+async def sweep_findings(status: str = "open") -> JSONResponse:
+    if status not in ("open", "filed", "false_positive", "wontfix", "gone", "all"):
+        return JSONResponse({"error": "bad status"}, status_code=400)
+    arg = "" if status == "all" else f" --status {status}"
+    try:
+        rc, out = await _fleet_ssh("snarf", f"{SWEEP_PY} ledger --json{arg}")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if rc != 0:
+        return JSONResponse({"error": out[-500:]}, status_code=502)
+    rows = json.loads(out)
+    order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    rows.sort(key=lambda r: (order.get(r["severity"], 9), r["file"], r["line"] or 0))
+    return JSONResponse({"findings": rows})
+
+
+@app.post("/api/sweep/start")
+async def sweep_start(request: Request) -> JSONResponse:
+    """Body: {"only": ["darkhelix/collab", ...] | null, "max_chunks": int | null}.
+    Takes the GPU seat for as long as the sweep runs (hours for the whole repo)."""
+    body = await request.json()
+    only = body.get("only") or []
+    if any(not isinstance(d, str) or not _SWEEP_DIR_RE.match(d) or ".." in d for d in only):
+        return JSONResponse({"ok": False, "error": "bad directory in only"}, status_code=400)
+    max_chunks = body.get("max_chunks")
+    if max_chunks is not None and (not isinstance(max_chunks, int) or max_chunks < 1):
+        return JSONResponse({"ok": False, "error": "bad max_chunks"}, status_code=400)
+    if await _sweep_running():
+        return JSONResponse({"ok": False, "error": "a sweep is already running"}, status_code=409)
+    args = ""
+    if only:
+        args += " --only " + " ".join(shlex.quote(d) for d in only)
+    if max_chunks:
+        args += f" --max-chunks {int(max_chunks)}"
+    cmd = (f"mkdir -p /home/sam/sweeps && (setsid nohup {SWEEP_PY} run{args} "
+           f"> {SWEEP_LOG} 2>&1 < /dev/null &) ; sleep 1; echo started")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": rc == 0, "only": only, "max_chunks": max_chunks})
+
+
+@app.post("/api/sweep/finding")
+async def sweep_finding_action(request: Request) -> JSONResponse:
+    """Body: {"id": "<12 hex>", "action": "file_issue"|"false_positive"|"wontfix"|"open"}."""
+    body = await request.json()
+    fid, action = body.get("id") or "", body.get("action") or ""
+    if not _SWEEP_ID_RE.match(fid) or action not in ("file_issue", "false_positive", "wontfix", "open"):
+        return JSONResponse({"ok": False, "error": "bad id or action"}, status_code=400)
+    try:
+        if action != "file_issue":
+            rc, out = await _fleet_ssh("snarf", f"{SWEEP_PY} ledger-set {fid} {action}")
+            return JSONResponse(json.loads(out) if rc == 0 else {"ok": False, "error": out[-400:]})
+        rc, out = await _fleet_ssh("snarf", f"{SWEEP_PY} ledger --json --status open")
+        f = next((r for r in json.loads(out) if r["id"] == fid), None) if rc == 0 else None
+        if not f:
+            return JSONResponse({"ok": False, "error": "finding not open (already filed or triaged?)"}, status_code=404)
+        area = next((lab for pre, lab in _SWEEP_AREA if f["file"].startswith(pre)), "area:correctness")
+        title = f"[sweep] {f['summary']}"[:200]
+        body_md = (f"**{f['severity'].upper()} · {f['category']}** — `{f['file']}:{f['line']}`"
+                   + (f" (`{f['symbol']}`)" if f.get("symbol") else "") + "\n\n"
+                   f"```\n{f['quote']}\n```\n\n**Failure scenario:** {f['failure_scenario']}\n\n"
+                   f"_Found by the review sweep (finding `{f['id']}`, first seen at {f['first_seen_commit']}). "
+                   "The quote was verified to exist in the file; the claim itself was not -- "
+                   "confirm before fixing, and close as not planned if it is wrong._")
+        rc, out = await _fleet_ssh("snarf", f"gh issue create -R {DARKHELIX_ISSUE_REPO} "
+                                            f"--title {shlex.quote(title)} --body {shlex.quote(body_md)} "
+                                            f"--label {area} --label from-sweep")
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": out[-400:]}, status_code=502)
+        url = next((ln.strip() for ln in out.splitlines() if ln.strip().startswith("https://")), "")
+        num = int(url.rsplit("/", 1)[1]) if url else None
+        await _fleet_ssh("snarf", f"{SWEEP_PY} ledger-set {fid} filed" + (f" --issue {num}" if num else ""))
+        _ISSUE_ITEMS_CACHE["ts"] = 0.0
+        return JSONResponse({"ok": True, "issue": num, "url": url})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
 @app.get("/api/darkhelix-todo")
 async def darkhelix_todo() -> JSONResponse:
     """Real, current TODO.md items from DARKHELIX (snarf), for the SUBMIT
