@@ -1386,6 +1386,14 @@ button.btn.sw-submit:disabled{opacity:.4; cursor:not-allowed}
 .gpu-stats{font-size:10px; color:var(--txt-dim); text-align:center; line-height:1.35}
 .gpu-stats b{font-weight:600}
 .gpu-t-ok{color:var(--teal)} .gpu-t-warm{color:var(--amber)} .gpu-t-hot{color:var(--red)}
+.gpu-model{display:flex; align-items:center; gap:8px; padding:2px 2px 8px; margin-bottom:6px;
+  border-bottom:1px solid var(--line); min-height:30px}
+.gpu-model-ico{width:24px; height:24px; flex:0 0 auto}
+.gpu-model-txt{display:flex; flex-direction:column; min-width:0; line-height:1.2}
+.gpu-model-name{font-size:12px; color:var(--txt); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.gpu-model-name.dim{color:var(--txt-dim); font-weight:400}
+.gpu-model-sub{font-size:10px; color:var(--txt-dim)}
+.gpu-model-state.ok{color:var(--teal)} .gpu-model-state.warn{color:var(--amber)}
 .cpu-grid-wrap{margin-top:8px; border-top:1px solid var(--line); padding-top:7px}
 .cpu-grid-wrap:empty{display:none}
 .cpu-grid-head{display:flex; justify-content:space-between; font-size:9.5px; letter-spacing:1px;

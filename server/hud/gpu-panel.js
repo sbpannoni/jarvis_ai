@@ -137,6 +137,59 @@ function renderCpuGrid(rh) {
     <div class="cpu-grid">${cells}</div>`;
 }
 
+/* ---- which model holds the GPU seat --------------------------------------
+   A family glyph + name + backend at the top of the panel, from /api/brain
+   (model-seat status). The glyphs are simple ORIGINAL drawings that evoke each
+   family (DeepSeek's whale, Qwen's hexagon, ...) -- not copies of the vendors'
+   logos. Matched on the served model name, first match wins. */
+const GPU_FAMILY = [
+  [/deepseek/, "DeepSeek", "#4D6BFE",
+   '<path d="M2.5 13.2c0-3.9 3.9-6.7 8.8-6.7 3 0 5.3 1.1 6.4 3.1l3.1-2.1-.9 4.1 2.1 2.2-3.2.1c-1.1 3.2-4.3 5.2-8.3 5.2-4.9 0-8-2.4-8-5.9z" fill="currentColor"/><circle cx="7.6" cy="11.4" r="1" fill="var(--panel)"/><path d="M9 3.5c.6-.9 1.6-1.2 2.4-.7M11 2.2c.4-.8 1.3-1 2-.6" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linecap="round"/>'],
+  [/qwen|qwq/, "Qwen", "#7C6CF0",
+   '<path d="M12 2.3l8.4 4.85v9.7L12 21.7l-8.4-4.85v-9.7z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="3.6" fill="none" stroke="currentColor" stroke-width="2"/><path d="M14.4 14.6l3.4 3.4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>'],
+  [/gpt-oss|gptoss/, "GPT-OSS", "currentColor",
+   '<g fill="none" stroke="currentColor" stroke-width="1.7">' +
+     [0, 60, 120, 180, 240, 300].map(a => `<ellipse cx="12" cy="7.4" rx="3.2" ry="4.6" transform="rotate(${a} 12 12)"/>`).join("") + '</g>'],
+  [/devstral|codestral|mistral|magistral/, "Mistral", "#FA7A12",
+   '<rect x="3" y="4" width="4" height="4" fill="#FFD100"/><rect x="17" y="4" width="4" height="4" fill="#FFD100"/><rect x="3" y="8" width="18" height="4" fill="#FFA200"/><rect x="3" y="12" width="4" height="4" fill="#FF7000"/><rect x="10" y="12" width="4" height="4" fill="#FF7000"/><rect x="17" y="12" width="4" height="4" fill="#FF7000"/><rect x="1" y="16" width="8" height="4" fill="#F0461E"/><rect x="15" y="16" width="8" height="4" fill="#F0461E"/>'],
+  [/llama/, "Llama", "#1877F2",
+   '<path d="M3 15.5c0-4.2 2-8 4.6-8 2.2 0 3.3 2.6 4.4 4.9 1.1 2.3 2.2 4.9 4.4 4.9 2.6 0 4.6-3.8 4.6-8" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"/><path d="M3 8.5c0 4.2 2 8 4.6 8 2.2 0 3.3-2.6 4.4-4.9 1.1-2.3 2.2-4.9 4.4-4.9 2.6 0 4.6 3.8 4.6 8" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" opacity=".55"/>'],
+  [/gemma/, "Gemma", "#4F8DF7",
+   '<path d="M12 2c.9 5.4 4.6 9.1 10 10-5.4.9-9.1 4.6-10 10-.9-5.4-4.6-9.1-10-10 5.4-.9 9.1-4.6 10-10z" fill="currentColor"/>'],
+  [/kimi|moonshot/, "Kimi", "currentColor",
+   '<path d="M15.5 3.2A9 9 0 1 0 20.8 15.6 7.2 7.2 0 0 1 15.5 3.2z" fill="currentColor"/>'],
+];
+
+function gpuModelGlyph(model){
+  const m = (model || "").toLowerCase();
+  const hit = GPU_FAMILY.find(([re]) => re.test(m));
+  if(!hit) return {family: "", svg: '<circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="2" opacity=".5"/>', color: "var(--txt-dim)"};
+  return {family: hit[1], color: hit[2], svg: hit[3]};
+}
+
+async function refreshGpuModel(){
+  const host = document.getElementById("gpuModel");
+  if(!host) return;
+  try{
+    const r = await fetch("/api/brain", {credentials: "same-origin"});
+    const j = await r.json();
+    const be = {vllm: "vLLM", llamacpp: "llama.cpp"}[j.backend] || j.backend || "";
+    if(!j.model){
+      host.innerHTML = `<svg viewBox="0 0 24 24" class="gpu-model-ico" style="color:var(--txt-dim)"><circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 3"/></svg>
+        <div class="gpu-model-txt"><b class="gpu-model-name dim">${j.seat_empty ? "seat empty" : "seat unreachable"}</b>
+        <span class="gpu-model-sub">${j.seat_empty ? "loads on demand" : ""}</span></div>`;
+      host.title = "No model in snarf's GPU seat";
+      return;
+    }
+    const g = gpuModelGlyph(j.model);
+    const state = j.ready === false ? '<span class="gpu-model-state warn">loading</span>' : '<span class="gpu-model-state ok">ready</span>';
+    host.innerHTML = `<svg viewBox="0 0 24 24" class="gpu-model-ico" style="color:${g.color}" aria-label="${g.family}">${g.svg}</svg>
+      <div class="gpu-model-txt"><b class="gpu-model-name">${j.model}</b>
+      <span class="gpu-model-sub">${g.family ? g.family + " · " : ""}${be} · ${state}</span></div>`;
+    host.title = `GPU seat: ${j.model} (${be})`;
+  }catch{ /* keep the last render */ }
+}
+
 async function pollGpuPanel() {
   try {
     const r = await fetch("/api/rack_health", { credentials: "same-origin" });
@@ -147,4 +200,6 @@ async function pollGpuPanel() {
 addEventListener("DOMContentLoaded", () => {
   pollGpuPanel();
   setInterval(pollGpuPanel, 10000);   // matches the endpoint's own 10s cache
+  refreshGpuModel();
+  setInterval(refreshGpuModel, 20000); // /api/brain caches model-seat status for 20s
 });
