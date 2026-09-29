@@ -2188,6 +2188,86 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "assignments": assignments, "live_roles": sorted(MODEL_ROLE_LIVE)})
 
 
+MODEL_TUNING_PATH = "/ssdpool/coder-engine/pipeline/model_tuning.json"
+# Editable per-model reasoning tuning (thinking budget + effort) -- the
+# operating point the coder-engine reviewer/editor actually run at.
+# reviewer_prompt.py on snarf overlays this file onto its hardcoded
+# MODEL_PROTOCOL, so a change here takes effect on the next review/dispatch
+# with no redeploy -- the same live-file pattern as model_role_assignments.json.
+# Sampling and reasoning_control are managed in the file itself (a deeper
+# per-model characterization value); this endpoint exposes only the two knobs
+# the effort-arm sweep tunes.
+_TUNING_EFFORTS = {None, "low", "medium", "high", "max"}
+_TUNING_BUDGET_MIN, _TUNING_BUDGET_MAX = 1000, 200000
+
+
+@app.get("/api/model-tuning")
+async def model_tuning() -> JSONResponse:
+    """Current per-model tuning from snarf's model_tuning.json (minus the
+    _comment key). {model: {sampling, think_budget_tokens, reasoning_effort,
+    reasoning_control}}."""
+    try:
+        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_TUNING_PATH)}")
+        if rc != 0:
+            raise RuntimeError(f"cat exited {rc}: {out[-500:]}")
+        tuning = json.loads(out)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    if isinstance(tuning, dict):
+        tuning.pop("_comment", None)
+    return JSONResponse({"tuning": tuning})
+
+
+@app.post("/api/model-tuning")
+async def set_model_tuning(request: Request) -> JSONResponse:
+    """Update one model's thinking budget and/or reasoning effort in
+    model_tuning.json on snarf. Body: {"model": "<id>", "think_budget_tokens":
+    int, "reasoning_effort": null|"low"|"medium"|"high"|"max"}. Preserves that
+    model's sampling and reasoning_control; the model must already have an entry
+    (its sampling is a per-model characterization value, not set from here)."""
+    payload = await request.json()
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"ok": False, "error": "model is required"}, status_code=400)
+    budget = payload.get("think_budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or not (
+            _TUNING_BUDGET_MIN <= budget <= _TUNING_BUDGET_MAX):
+        return JSONResponse(
+            {"ok": False, "error": f"think_budget_tokens must be an int in "
+                                   f"[{_TUNING_BUDGET_MIN}, {_TUNING_BUDGET_MAX}]"},
+            status_code=400)
+    effort = payload.get("reasoning_effort")
+    if effort in ("", "default"):
+        effort = None
+    if effort not in _TUNING_EFFORTS:
+        return JSONResponse(
+            {"ok": False, "error": "reasoning_effort must be null or one of "
+                                   "low/medium/high/max"},
+            status_code=400)
+    try:
+        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_TUNING_PATH)}")
+        if rc != 0:
+            raise RuntimeError(f"cat exited {rc}: {out[-500:]}")
+        tuning = json.loads(out)
+        entry = tuning.get(model)
+        if not isinstance(entry, dict) or "sampling" not in entry:
+            raise RuntimeError(
+                f"no tuning profile for {model!r} -- its sampling must be seeded "
+                f"in model_tuning.json first (a per-model characterization step)")
+        entry["think_budget_tokens"] = budget
+        entry["reasoning_effort"] = effort
+        tuning[model] = entry
+        new_content = json.dumps(tuning, indent=2) + "\n"
+        write_cmd = f"printf %s {shlex.quote(new_content)} > {shlex.quote(MODEL_TUNING_PATH)}"
+        rc2, out2 = await _fleet_ssh("snarf", write_cmd)
+        if rc2 != 0:
+            raise RuntimeError(f"write exited {rc2}: {out2[-500:]}")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "model": model,
+                         "tuning": {k: v for k, v in tuning.items() if k != "_comment"}})
+
+
 CODER_ENGINE_VENV_PY = "/ssdpool/coder-engine/.venv/bin/python3"
 DISPATCH_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_review_task.py"
 CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"

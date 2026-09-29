@@ -330,10 +330,59 @@ function transitSeatWarning(panel, roster){
 // /api/model-role-assignments docstring). The LIVE/NOT WIRED tag comes from
 // the server's live_roles, so it says which changes take effect on the next
 // dispatch vs. are only recorded.
+// Editable per-model reasoning tuning shown inline on the editor/reviewer
+// rows (the two roles whose model reads model_tuning.json via reviewer_prompt).
+// Keyed by MODEL, not role: if two roles share a model, both rows edit the same
+// underlying entry. Only budget + effort are exposed here -- sampling is a
+// deeper per-model value managed in the file. A model with no tuning profile
+// yet renders disabled (its sampling must be seeded first).
+function transitTuningControl(model, t){
+  if (!model) return "";
+  const known = !!(t && typeof t.think_budget_tokens === "number");
+  const budget = known ? t.think_budget_tokens : "";
+  const effort = (t && t.reasoning_effort) ? t.reasoning_effort : "default";
+  const dis = known ? "" : " disabled";
+  const efOpts = ["default", "low", "medium", "high", "max"]
+    .map(e => `<option value="${e}"${e === effort ? " selected" : ""}>${e}</option>`).join("");
+  return `<span class="tm-tune" data-tune-model="${model}"${known ? "" : ' title="no tuning profile; seed sampling in model_tuning.json first"'}>
+    <label class="tm-tune-lbl">budget</label>
+    <input class="tm-tune-budget" type="number" min="1000" max="200000" step="1000" value="${budget}"${dis}>
+    <label class="tm-tune-lbl">effort</label>
+    <select class="tm-tune-effort"${dis}>${efOpts}</select>
+    <button class="tm-tune-save"${dis}>set</button>
+    <span class="tm-tune-status"></span>
+  </span>`;
+}
+
+async function saveModelTuning(model, budget, effort, statusEl){
+  statusEl.textContent = "saving…";
+  statusEl.className = "tm-tune-status";
+  try{
+    const r = await fetch("/api/model-tuning", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        model,
+        think_budget_tokens: budget,
+        reasoning_effort: (effort === "default") ? null : effort,
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    statusEl.textContent = "saved";
+    statusEl.className = "tm-tune-status saved";
+    setTimeout(() => { statusEl.textContent = ""; }, 2500);
+  }catch(err){
+    statusEl.textContent = `error: ${err.message}`;
+    statusEl.className = "tm-tune-status err";
+  }
+}
+
 function transitRoleBar(roleData){
   const roster = roleData.roster || [];
   const assignments = roleData.assignments || {};
   const live = new Set(roleData.live_roles || []);
+  const tuning = roleData.tuning || {};
   const roles = [["editor", "EDITOR"], ["reviewer", "REVIEWER"], ["orchestrator", "ORCHESTRATOR"]];
   return `<div class="tm-role-bar">${roles.map(([key, label]) => `
     <div class="tm-role-item">
@@ -341,6 +390,7 @@ function transitRoleBar(roleData){
       <select class="tm-role-select" data-role="${key}">${transitRoleOptions(roster, assignments[key])}</select>
       <span class="${live.has(key) ? "tm-role-live" : "tm-role-notlive"}">${live.has(key) ? "LIVE" : "NOT WIRED"}</span>
       <span class="tm-role-status" data-role-status="${key}"></span>
+      ${(key === "editor" || key === "reviewer") ? transitTuningControl(assignments[key], tuning[assignments[key]]) : ""}
     </div>`).join("")}
   </div>
   <div class="tm-seat-warning" hidden></div>`;
@@ -385,6 +435,22 @@ function wireRoleBar(panel, roster){
       transitRefreshSvg(panel, role, sel.value);
       const statusEl = panel.querySelector(`[data-role-status="${role}"]`);
       saveRoleAssignment(role, sel.value, statusEl);
+    });
+  });
+  panel.querySelectorAll(".tm-tune").forEach(box => {
+    const btn = box.querySelector(".tm-tune-save");
+    if (!btn) return;
+    btn.addEventListener("click", () => {
+      const model = box.dataset.tuneModel;
+      const budget = parseInt(box.querySelector(".tm-tune-budget").value, 10);
+      const effort = box.querySelector(".tm-tune-effort").value;
+      const statusEl = box.querySelector(".tm-tune-status");
+      if (!Number.isFinite(budget)){
+        statusEl.textContent = "budget?";
+        statusEl.className = "tm-tune-status err";
+        return;
+      }
+      saveModelTuning(model, budget, effort, statusEl);
     });
   });
 }
@@ -508,12 +574,14 @@ function wireProcessFixCardTrigger(panel){
 
 async function renderTransitMap(panel){
   try{
-    const [r, roleR] = await Promise.all([
+    const [r, roleR, tuneR] = await Promise.all([
       fetch("/api/coder-transit-map"),
       fetch("/api/model-role-assignments"),
+      fetch("/api/model-tuning"),
     ]);
     const j = await r.json();
     const roleData = roleR.ok ? await roleR.json() : {roster: [], assignments: {}, live_roles: []};
+    roleData.tuning = tuneR.ok ? ((await tuneR.json()).tuning || {}) : {};
     const editorGen = j.editor.generated_at ? new Date(j.editor.generated_at).toLocaleString() : "never";
     const reviewGen = j.reviewer.generated_at ? new Date(j.reviewer.generated_at).toLocaleString() : "never";
     const orchGen = j.orchestrator.generated_at ? new Date(j.orchestrator.generated_at).toLocaleString() : "never";
