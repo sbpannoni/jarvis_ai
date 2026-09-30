@@ -2274,6 +2274,36 @@ CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"
 DISPATCH_CLOSURE_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_closure_review_task.py"
 _FENCED_FINDINGS_RE = re.compile(r"```json:review-findings\n(.*?)\n```", re.DOTALL)
 
+CODEBASE_GRAPH_PY = "/ssdpool/coder-engine/pipeline/codebase_graph.py"
+CODEBASE_GRAPH_PACKAGE = "darkhelix"
+_codebase_graph_cache: dict = {}  # sha -> graph JSON
+
+
+@app.get("/api/codebase-graph")
+async def codebase_graph() -> JSONResponse:
+    """Import-dependency graph of the darkhelix package -- the review launcher's
+    selectable blast-radius map. Runs codebase_graph.py (grimp) on snarf and
+    returns {package, generated_from(sha), nodes:[{id,cluster,fan_in,fan_out}],
+    edges:[{source,target}]}. Cached per SHA once seen (grimp is fast; the cache
+    just avoids re-running when HEAD has not moved)."""
+    try:
+        rc, out = await _fleet_ssh(
+            "snarf",
+            f"{CODER_ENGINE_VENV_PY} {CODEBASE_GRAPH_PY} "
+            f"--package {shlex.quote(CODEBASE_GRAPH_PACKAGE)} "
+            f"--root {shlex.quote(DARKHELIX_REPO_PATH)}",
+        )
+        if rc != 0:
+            raise RuntimeError(f"exit {rc}: {out[-800:]}")
+        brace = out.find("{")
+        data = json.loads(out[brace:] if brace >= 0 else out)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    sha = data.get("generated_from") or "?"
+    _codebase_graph_cache[sha] = data
+    return JSONResponse(data)
+
+
 
 @app.post("/api/review-file")
 async def review_file(request: Request) -> JSONResponse:
