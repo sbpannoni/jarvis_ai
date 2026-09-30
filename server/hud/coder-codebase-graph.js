@@ -7,7 +7,14 @@
    highlights -> RUN a review (POST /api/review-file, sweep|deep).
    PENDING VIEW: nodes are coloured by their latest review outcome
    (GET /api/review-status): red border = findings, green = clean, dim = never
-   reviewed. "pending only" hides the clean ones.
+   reviewed. "pending only" hides the clean ones. Open DARKHELIX GitHub issues
+   (GET /api/darkhelix-todo, the tracker) are overlaid too: a node whose file an
+   open issue names gets an amber outline + a "flag N" count; selecting it lists
+   the issues (with links) in the toolbar. Issue->file mapping is deliberately
+   conservative -- a token match on the file's path, its basename.py, or (for
+   package nodes) its dotted module -- so it only lights up issues that actually
+   name a file, and never fires on prose that happens to contain a bare word
+   like "context" or "utils". "issues only" hides nodes with none.
 
    Layout is concentric on fan-in, so the highest-blast-radius modules sit at the
    centre and are drawn largest -- the geometry IS the blast radius. Core
@@ -28,6 +35,8 @@ function _cbgInjectStyle(){
     .cbg-canvas{flex:1;border:1px solid var(--line,#234);border-radius:8px;
       background:radial-gradient(circle at 50% 45%,rgba(40,60,90,.18),rgba(0,0,0,.30))}
     .cbg-status.saved{color:var(--green,#6e6)} .cbg-status.err{color:var(--red,#f77)}
+    .cbg-issues{font-size:11px;color:#f5a623} .cbg-issues a{color:#f5a623;text-decoration:none;margin-right:2px}
+    .cbg-issues a:hover{text-decoration:underline}
     .cbg-dot{display:inline-block;width:9px;height:9px;border-radius:50%;
       vertical-align:middle;margin:0 3px 0 8px}
   `;
@@ -38,6 +47,20 @@ function _cbgClusterColor(cluster){
   let h = 0;
   for (let i = 0; i < cluster.length; i++) h = (h * 31 + cluster.charCodeAt(i)) >>> 0;
   return `hsl(${h % 360},70%,58%)`;
+}
+
+function _cbgEsc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+// The strings that count as an issue "naming" this node's file: full repo path,
+// bare basename.py, and -- for package nodes (id has a dot, not a .py path) --
+// the dotted module. No bare stem, so "utils"/"context" in prose never match.
+function _cbgIssueTokens(n){
+  const toks = new Set([n.file, (n.file || "").split("/").pop()]);
+  if (n.id.includes(".") && !n.id.endsWith(".py")) toks.add(n.id);
+  return [...toks].filter(Boolean);
 }
 
 function _cbgReviewState(rec){
@@ -84,6 +107,15 @@ function _cbgSelect(panel, cy, node){
   const nb = node.closedNeighborhood();
   cy.elements().addClass("cbg-faded").removeClass("cbg-hl");
   nb.removeClass("cbg-faded").addClass("cbg-hl");
+  const issEl = panel.querySelector(".cbg-issues");
+  if (issEl){
+    const list = (panel._cbgIssuesByNode || {})[node.id()] || [];
+    issEl.innerHTML = list.length
+      ? "⚑ " + list.map(it =>
+          `<a href="${_cbgEsc(it.url)}" target="_blank" rel="noopener" title="${_cbgEsc(it.title)}"`
+          + `>#${_cbgEsc(it.issue)}</a>`).join(" ")
+      : "";
+  }
 }
 
 async function renderCodebaseMap(panel){
@@ -103,8 +135,10 @@ async function renderCodebaseMap(panel){
         <button type="button" class="btn cbg-run">RUN REVIEW</button>
         <label title="hide modules that reviewed clean"><input type="checkbox" class="cbg-pending"> pending only</label>
         <label title="hide standalone modules with no internal dependencies"><input type="checkbox" class="cbg-iso"> hide unconnected</label>
+        <label title="show only modules that an open GitHub issue names"><input type="checkbox" class="cbg-issuesonly"> issues only</label>
         <span class="cbg-status"></span>
-        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed · dashed = changed since review · size = blast radius</span>
+        <span class="cbg-issues"></span>
+        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed<span class="cbg-dot" style="box-shadow:0 0 0 2px #f5a623 inset;background:transparent"></span>open issue · dashed = changed since review · size = blast radius</span>
       </div>
       <div class="cbg-canvas"></div>
     </div>`;
@@ -113,27 +147,44 @@ async function renderCodebaseMap(panel){
   const canvas = panel.querySelector(".cbg-canvas");
   panel.querySelector(".cbg-run").addEventListener("click", () => _cbgRunReview(panel));
 
-  let data, status = {};
+  let data, status = {}, issues = [];
   try{
-    const [gr, sr] = await Promise.all([fetch("/api/codebase-graph"), fetch("/api/review-status")]);
+    const [gr, sr, ir] = await Promise.all([
+      fetch("/api/codebase-graph"),
+      fetch("/api/review-status"),
+      fetch("/api/darkhelix-todo").catch(() => null),   // overlay only -- never fatal
+    ]);
     data = await gr.json();
     if (data.error) throw new Error(data.error);
     status = sr.ok ? ((await sr.json()).status || {}) : {};
+    try{ if (ir && ir.ok) issues = (await ir.json()).items || []; }catch(e){ issues = []; }
   }catch(err){
     canvas.innerHTML = `<div class="kv"><span class="err">codebase graph unavailable: ${err.message}</span></div>`;
     return;
   }
+
+  // Pre-flatten each issue to a searchable haystack once (title + body).
+  const issueHay = issues.map(it => ({
+    issue: it.issue, url: it.url, title: it.title, blocked: it.blocked, wip: it.wip,
+    hay: `${it.title || ""} \n${it.text || ""}`,
+  }));
+  panel._cbgIssuesByNode = {};
 
   const maxFanIn = Math.max(1, ...data.nodes.map(n => n.fan_in));
   const elements = [];
   for (const n of data.nodes){
     const rec = n.file ? status[n.file] : null;
     const stale = !!(rec && rec.file_sha && n.last_commit && rec.file_sha !== n.last_commit);
+    const toks = _cbgIssueTokens(n);
+    const nIssues = toks.length ? issueHay.filter(it => toks.some(t => it.hay.includes(t))) : [];
+    if (nIssues.length) panel._cbgIssuesByNode[n.id] = nIssues;
+    const base = n.id.split(/[./]/).filter(Boolean).pop().replace(/\.py$/, "");
     elements.push({ data: {
-      id: n.id, label: n.id.split(/[./]/).filter(Boolean).pop().replace(/\.py$/, ""),
+      id: n.id, label: nIssues.length ? `${base}\n⚑${nIssues.length}` : base,
       file: n.file, fan_in: n.fan_in, fan_out: n.fan_out, cluster: n.cluster,
       color: _cbgClusterColor(n.cluster), review: _cbgReviewState(rec),
       findings_n: rec ? (rec.findings || 0) : 0, stale: stale,
+      issues_n: nIssues.length,
     }});
   }
   for (const e of data.edges){
@@ -149,6 +200,7 @@ async function renderCodebaseMap(panel){
         "background-color": "data(color)",
         "label": "data(label)", "font-size": 9, "color": "#dfe8f5",
         "text-valign": "center", "text-halign": "center",
+        "text-wrap": "wrap",
         "text-outline-width": 2, "text-outline-color": "#0a0f1a",
         "width": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
         "height": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
@@ -159,6 +211,10 @@ async function renderCodebaseMap(panel){
       { selector: 'node[review="clean-hi"]', style: { "border-color": "#7f7", "border-width": 4 } },
       { selector: 'node[review="unreviewed"]', style: { "border-color": "rgba(120,130,160,.5)" } },
       { selector: "node[?stale]", style: { "border-style": "dashed" } },
+      // Open-issue overlay: amber outline sits OUTSIDE the review border, so a
+      // node can show its review state and "has open issues" at once.
+      { selector: "node[issues_n > 0]", style: {
+        "outline-color": "#f5a623", "outline-width": 3, "outline-offset": 2 } },
       { selector: "edge", style: {
         "width": 1, "line-color": "rgba(150,180,220,.35)",
         "target-arrow-color": "rgba(150,180,220,.5)", "target-arrow-shape": "triangle",
@@ -179,7 +235,10 @@ async function renderCodebaseMap(panel){
   });
 
   cy.on("tap", "node", evt => _cbgSelect(panel, cy, evt.target));
-  cy.on("tap", evt => { if (evt.target === cy){ cy.elements().removeClass("cbg-faded cbg-hl"); } });
+  cy.on("tap", evt => { if (evt.target === cy){
+    cy.elements().removeClass("cbg-faded cbg-hl");
+    const issEl = panel.querySelector(".cbg-issues"); if (issEl) issEl.innerHTML = "";
+  } });
 
   const pendingBox = panel.querySelector(".cbg-pending");
   pendingBox.addEventListener("change", () => {
@@ -191,6 +250,12 @@ async function renderCodebaseMap(panel){
   isoBox.addEventListener("change", () => {
     const iso = cy.nodes().filter(n => n.degree(false) === 0);
     iso.style("display", isoBox.checked ? "none" : "element");
+  });
+
+  const issuesOnlyBox = panel.querySelector(".cbg-issuesonly");
+  issuesOnlyBox.addEventListener("change", () => {
+    const none = cy.nodes().filter(n => (n.data("issues_n") || 0) === 0);
+    none.style("display", issuesOnlyBox.checked ? "none" : "element");
   });
 }
 
