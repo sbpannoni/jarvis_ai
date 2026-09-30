@@ -2291,7 +2291,8 @@ async def codebase_graph() -> JSONResponse:
             "snarf",
             f"{CODER_ENGINE_VENV_PY} {CODEBASE_GRAPH_PY} "
             f"--package {shlex.quote(CODEBASE_GRAPH_PACKAGE)} "
-            f"--root {shlex.quote(DARKHELIX_REPO_PATH)}",
+            f"--root {shlex.quote(DARKHELIX_REPO_PATH)} "
+            f"--extra-tree scripts",
         )
         if rc != 0:
             raise RuntimeError(f"exit {rc}: {out[-800:]}")
@@ -2302,6 +2303,24 @@ async def codebase_graph() -> JSONResponse:
     sha = data.get("generated_from") or "?"
     _codebase_graph_cache[sha] = data
     return JSONResponse(data)
+
+
+REVIEW_STATUS_PATH_SNARF = "/ssdpool/agent-work/review_status.json"
+
+
+@app.get("/api/review-status")
+async def review_status() -> JSONResponse:
+    """Per-file latest review outcome for the CODEBASE MAP overlay:
+    {file: {status, findings, no_issues_found, high_confidence_clean, sha, ts}}.
+    Written by dispatch_review_task.py on every review; empty if none yet."""
+    data = {}
+    try:
+        rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(REVIEW_STATUS_PATH_SNARF)}")
+        if rc == 0 and out.strip():
+            data = json.loads(out)
+    except Exception:
+        data = {}
+    return JSONResponse({"status": data})
 
 
 
