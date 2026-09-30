@@ -36,8 +36,19 @@ function _cbgInjectStyle(){
       background:rgba(0,0,0,.25);font-size:12px}
     .cbg-target{color:var(--cyan,#5cf);font-weight:600;min-width:180px}
     .cbg-hint{color:var(--txt-dim,#89a);font-size:11px}
+    .cbg-body{display:flex;flex:1;gap:8px;min-height:0}
     .cbg-canvas{flex:1;border:1px solid var(--line,#234);border-radius:8px;
       background:radial-gradient(circle at 50% 45%,rgba(40,60,90,.18),rgba(0,0,0,.30))}
+    .cbg-steplist{width:196px;flex:none;overflow-y:auto;display:flex;flex-direction:column;gap:3px;
+      padding:6px;border:1px solid var(--line,#234);border-radius:8px;background:rgba(0,0,0,.25)}
+    .cbg-steplab{font-size:9px;letter-spacing:2px;color:var(--txt-dim,#89a);margin:2px 4px 4px}
+    .cbg-step{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;
+      font-size:12px;color:#cfe0f2;border:1px solid transparent;line-height:1.15}
+    .cbg-step:hover{background:rgba(90,200,255,.08);border-color:rgba(90,200,255,.25)}
+    .cbg-step.active{background:rgba(90,200,255,.14);border-color:var(--cyan,#5cf);color:#eaf6ff}
+    .cbg-step .cbg-swatch{width:10px;height:10px;border-radius:3px;flex:none}
+    .cbg-step .cbg-count{margin-left:auto;font-size:10px;color:var(--txt-dim,#89a)}
+    .cbg-step.cbg-all{color:#eaf6ff;font-weight:600}
     .cbg-status.saved{color:var(--green,#6e6)} .cbg-status.err{color:var(--red,#f77)}
     .cbg-issues{font-size:11px;color:#f5a623} .cbg-issues a{color:#f5a623;text-decoration:none;margin-right:2px}
     .cbg-issues a:hover{text-decoration:underline}
@@ -47,53 +58,71 @@ function _cbgInjectStyle(){
   document.head.appendChild(s);
 }
 
-// Swimlanes: after dagre has ranked modules by dependency depth (the y axis, the
-// top-to-bottom flow), reassign x so every cluster occupies its OWN disjoint
-// vertical lane. dagre keeps a lineage together but its cluster bounding boxes
-// still overlap because clusters span many depths; pinning each cluster to a lane
-// makes the compound parents render as clean, non-overlapping category bands while
-// the depth flow is preserved. Cross-lane edges are the inter-category deps.
-function _cbgSwimlanes(cy){
-  const reals = cy.nodes().filter(n => !n.data("isParent"));
-  if (reals.length === 0) return;
-  const avgY = arr => arr.reduce((s, n) => s + n.position("y"), 0) / arr.length;
-  const byCluster = {};
-  reals.forEach(n => { (byCluster[n.data("cluster")] = byCluster[n.data("cluster")] || []).push(n); });
-  // Order lanes left-to-right by average dependency depth (upstream/entry clusters
-  // first), tie-broken by size, so the eye still reads a pipeline progression.
-  const clusters = Object.keys(byCluster).sort((a, b) =>
-    (avgY(byCluster[a]) - avgY(byCluster[b])) || (byCluster[b].length - byCluster[a].length));
-  const NODE_DX = 48, ROW_H = 64, LANE_GAP = 84;
-  let x = 0;
-  for (const c of clusters){
-    const members = byCluster[c];
-    // Re-rank locally within the lane (from dagre's depth order) so every lane
-    // starts at the top -- compact side-by-side columns instead of a diagonal
-    // staircase, while intra-cluster dependency order is preserved.
-    const ys = [...new Set(members.map(n => Math.round(n.position("y"))))].sort((p, q) => p - q);
-    const buckets = {};   // local rank -> nodes
-    members.forEach(n => { const r = ys.indexOf(Math.round(n.position("y"))); (buckets[r] = buckets[r] || []).push(n); });
-    const maxPer = Math.max(...Object.values(buckets).map(b => b.length));
-    const laneW = Math.max(1, maxPer) * NODE_DX;
-    for (const r of Object.keys(buckets)){
-      const arr = buckets[r].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0));
-      arr.forEach((n, i) => {
-        const off = (i - (arr.length - 1) / 2) * NODE_DX;
-        n.position({ x: x + laneW / 2 + off, y: Number(r) * ROW_H });
-      });
-    }
-    x += laneW + LANE_GAP;
-  }
+// Standard view: the clean dagre subway. Modules ranked top-to-bottom by
+// dependency depth, right-angle connectors, the busiest hubs named as stations,
+// and the mega-hub edges faded (revealed on hover) so the flow reads.
+function _cbgOverviewLayout(cy){
+  const real = cy.nodes().filter(n => !n.data("isParent") && !n.data("isBand")).toArray();
+  const byIn = [...real].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0));
+  const byOut = [...real].sort((a, b) => (b.data("fan_out") || 0) - (a.data("fan_out") || 0));
+  cy.collection([...byIn.slice(0, 8), ...byOut.slice(0, 2)]).addClass("cbg-major");
+  cy.collection(byIn.slice(0, 3)).connectedEdges().addClass("cbg-hubedge");
+  const noParents = cy.elements().filter(e => !e.data("isParent"));
+  noParents.layout({ name: "dagre", rankDir: "TB", animate: false, fit: true, padding: 30,
+    nodeSep: 22, edgeSep: 12, rankSep: 80, ranker: "network-simplex" }).run();
 }
+
+// Focused view: pick one pipeline stage from the list and see just that stage and
+// what it touches -- the stage's modules laid out as their own clean flow, their
+// cross-stage neighbours kept as dimmed context, everything else hidden.
+function _cbgFocusLayout(panel, cy, focus){
+  const focusNodes = cy.nodes().filter(n => !n.data("isParent") && !n.data("isBand") && n.data("cluster") === focus);
+  if (focusNodes.length === 0) { _cbgOverviewLayout(cy); return; }
+  const visible = focusNodes.closedNeighborhood();
+  cy.elements().style("display", "none");
+  visible.style("display", "element");
+  visible.nodes().not(focusNodes).addClass("cbg-context");   // neighbours = dim context
+  focusNodes.addClass("cbg-major");                          // stage modules = named stations
+  const tEl = panel.querySelector(".cbg-target");
+  if (tEl) tEl.textContent = `${focus} — ${focusNodes.length} modules`;
+  visible.layout({ name: "dagre", rankDir: "TB", animate: false, fit: true, padding: 45,
+    nodeSep: 26, edgeSep: 14, rankSep: 95, ranker: "network-simplex" }).run();
+}
+
 
 // Broad category from a fine cluster id: the first two path/dotted segments
 // (darkhelix.collab -> darkhelix/collab, src/components/viz3d -> src/components).
-// This is the banding/coloring unit -- coarser than the raw cluster so the flow
-// reads as a handful of broad pipeline areas, not dozens of leaf directories.
+// This is the banding/coloring unit for the APP scope -- coarser than the raw
+// cluster so the flow reads as a handful of broad areas, not dozens of leaf dirs.
 function _cbgCategory(cluster){
   const parts = String(cluster).split(/[./]/).filter(Boolean);
   return parts.slice(0, 2).join("/") || String(cluster);
 }
+
+// Pipeline-stage classifier for the DARKHELIX python package. The modules are a
+// flat darkhelix.* namespace whose NAMES encode bioinformatics pipeline stages
+// (directory clustering can't see this), so we bucket by name keyword. Ordered:
+// first match wins, and the array order is also the top-to-bottom band order, so
+// the map reads as the pipeline sequence. Heuristic and DARKHELIX-specific.
+const _CBG_PY_STAGES = [
+  ["Orchestration & Entry", /(run_pipeline|\.cli$|\bcli\b|pipeline_gate|\bgate\b)/],
+  ["Ingest & QC", /(qc|host_removal|contaminant|cleanup|ont_error|error_rate|\bproc\b|run_manifest|list_manifest|manifest|validate_reference_data|build_strain_panels|build_agent_sketch|reference_data)/],
+  ["Assembly & Alignment", /(assembly|mag_alignment|\bmag\b|alignment|coord_liftover)/],
+  ["Taxonomy & Classification", /(taxonomy|viral_classification|collab_classification|geographic|microbial|profiling)/],
+  ["Genome Discovery & Consensus", /(collaborative_classifier|\.collab\b|\.collab\.|consensus|genome_discovery|functional_threat|reference_select|validation|depth_windows|gene_coverage|gene_threat_reads|taxid)/],
+  ["Assay & Primer Design", /(primer|synthetic_pcr)/],
+  ["Gene & Threat Detection", /(gene_prediction|gene_threat|amr_detection|vf_detection|vf_hmm|toxin|engineering_detection)/],
+  ["LLM & Reporting", /(llm|embed|faiss|cluster_embeddings|pathogen_index|db_provenance)/],
+  ["Infrastructure", /(context|utils|config|telemetry|logging|fsutil|tool_registry|ui_registry|commands)/],
+];
+function _cbgPyStage(id){
+  const s = String(id).toLowerCase();
+  if (s === "darkhelix") return "Orchestration & Entry";   // package __init__
+  for (const [name, re] of _CBG_PY_STAGES) if (re.test(s)) return name;
+  return "Infrastructure";   // anything unmatched
+}
+// Top-to-bottom band order for the pipeline scope (the classifier array order).
+const _CBG_PY_STAGE_ORDER = _CBG_PY_STAGES.map(s => s[0]);
 
 function _cbgClusterColor(cluster){
   let h = 0;
@@ -215,8 +244,9 @@ function _cbgSelect(panel, cy, node){
     ? `${node.data("id")}  (fan-in ${node.data("fan_in")}, fan-out ${node.data("fan_out")})`
     : `${node.data("id")}  (no source file)`;
   const nb = node.closedNeighborhood();
-  cy.elements().addClass("cbg-faded").removeClass("cbg-hl");
+  cy.elements().addClass("cbg-faded").removeClass("cbg-hl cbg-edgeshow");
   nb.removeClass("cbg-faded").addClass("cbg-hl");
+  nb.edges().addClass("cbg-edgeshow");   // un-fade this node's edges (incl. hub edges)
   const issEl = panel.querySelector(".cbg-issues");
   if (issEl){
     const list = (panel._cbgIssuesByNode || {})[node.id()] || [];
@@ -258,7 +288,10 @@ async function renderCodebaseMap(panel){
         <span class="cbg-issues"></span>
         <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed<span class="cbg-dot" style="box-shadow:0 0 0 2px #5cf inset;background:transparent"></span>reviewing<span class="cbg-dot" style="box-shadow:0 0 0 2px #f5a623 inset;background:transparent"></span>open issue · dashed = changed since review · size = blast radius</span>
       </div>
-      <div class="cbg-canvas"></div>
+      <div class="cbg-body">
+        <div class="cbg-steplist"></div>
+        <div class="cbg-canvas"></div>
+      </div>
     </div>`;
   const modeSel = panel.querySelector(".cbg-mode");
   if (modeSel) modeSel.value = prevMode;
@@ -308,13 +341,21 @@ async function renderCodebaseMap(panel){
   const maxFanIn = Math.max(1, ...data.nodes.map(n => n.fan_in));
   const elements = [];
   const clusters = new Set();
-  // Broad category per node, merging tiny categories (<3 members) up into their
-  // top-level segment so the banding stays to a handful of meaningful areas.
-  const rawCat = {};
-  for (const n of data.nodes) rawCat[n.id] = _cbgCategory(n.cluster);
-  const catCount = {};
-  for (const id in rawCat) catCount[rawCat[id]] = (catCount[rawCat[id]] || 0) + 1;
-  const catOf = id => (catCount[rawCat[id]] >= 3 ? rawCat[id] : (rawCat[id].split("/")[0] || rawCat[id]));
+  // Banding unit per node. APP scope: broad directory category, merging tiny ones
+  // (<3) up into their top segment. PIPELINE scope: bioinformatics pipeline stage
+  // classified from the module name (directory is a single flat package here).
+  const rawByCluster = {};
+  for (const n of data.nodes) rawByCluster[n.id] = n.cluster;
+  let catOf;
+  if (scope === "app"){
+    const rawCat = {};
+    for (const n of data.nodes) rawCat[n.id] = _cbgCategory(n.cluster);
+    const catCount = {};
+    for (const id in rawCat) catCount[rawCat[id]] = (catCount[rawCat[id]] || 0) + 1;
+    catOf = id => (catCount[rawCat[id]] >= 3 ? rawCat[id] : (rawCat[id].split("/")[0] || rawCat[id]));
+  } else {
+    catOf = id => _cbgPyStage(id);
+  }
   const clusterColorById = {};   // node id -> its category color, for tinting edges into "lines"
   for (const n of data.nodes) clusterColorById[n.id] = _cbgClusterColor(catOf(n.id));
   for (const n of data.nodes){
@@ -335,20 +376,21 @@ async function renderCodebaseMap(panel){
       color: _cbgClusterColor(cat), review: _cbgReviewState(rec),
       findings_n: rec ? (rec.findings || 0) : 0, stale: stale,
       issues_n: nIssues.length,
-      // Compound in BOTH views: the flow view lays categories out with dagre so
-      // lineages stay together under a labeled category band; the grouped view
-      // packs them tight with fcose. Membership is the same either way.
-      parent: `cluster:${cat}`,
+      // Grouped view uses real compound parents (fcose packs them). The flow view
+      // is flat (ELK partitions the categories into stage layers) and draws bands
+      // as background rectangles after layout instead.
+      parent: group ? `cluster:${cat}` : undefined,
     }});
   }
-  // Compound super-node per cluster. fan_in:0 keeps the fan-in size mapData off
-  // NaN; cytoscape auto-fits a parent to its children. Rendered as a tinted,
-  // labeled band behind the flow (or a box in the grouped view).
-  for (const c of clusters){
-    elements.push({ data: {
-      id: `cluster:${c}`, label: c, isParent: true, fan_in: 0,
-      color: _cbgClusterColor(c),
-    }});
+  // Compound super-node per cluster (grouped view only). fan_in:0 keeps the
+  // fan-in size mapData off NaN; cytoscape auto-fits a parent to its children.
+  if (group){
+    for (const c of clusters){
+      elements.push({ data: {
+        id: `cluster:${c}`, label: c, isParent: true, fan_in: 0,
+        color: _cbgClusterColor(c),
+      }});
+    }
   }
   for (const e of data.edges){
     elements.push({ data: {
@@ -376,6 +418,7 @@ async function renderCodebaseMap(panel){
         "width": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
         "height": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
         "border-width": 2, "border-color": "rgba(255,255,255,.25)",
+        "z-index": 10,
       }},
       { selector: 'node[review="findings"]', style: { "border-color": "#f66", "border-width": 4 } },
       { selector: 'node[review="clean"]', style: { "border-color": "#6e6", "border-width": 3 } },
@@ -395,13 +438,21 @@ async function renderCodebaseMap(panel){
         "target-arrow-color": "rgba(150,180,220,.5)", "target-arrow-shape": "triangle",
         "arrow-scale": 0.7, "curve-style": "bezier",
       } : {
-        "width": 2, "line-color": "data(lineColor)", "line-opacity": 0.5,
+        // Right-angle (round-taxi) routing: reads as clean transit connectors along
+        // the top-to-bottom dependency spine. Tinted by the category the edge leaves.
+        "width": 1.5, "line-color": "data(lineColor)", "line-opacity": 0.5,
         "target-arrow-color": "data(lineColor)", "target-arrow-shape": "triangle",
-        "arrow-scale": 0.55, "curve-style": "round-taxi",
-        "taxi-direction": "vertical", "taxi-turn": "40%", "taxi-turn-min-distance": 6,
-        "taxi-radius": 10,
+        "arrow-scale": 0.5, "curve-style": "round-taxi",
+        "taxi-direction": "vertical", "taxi-turn": "50%", "taxi-turn-min-distance": 5,
+        "taxi-radius": 8, "z-index": 6,
       }},
       { selector: ".cbg-faded", style: { "opacity": 0.12 } },
+      // A dimmed "context" node in the focused stage view (a neighbor of the stage).
+      { selector: "node.cbg-context", style: { "opacity": 0.4 } },
+      // Mega-hub edges: faded to declutter the convergence at context/utils/config;
+      // revealed (cbg-edgeshow) when the node is hovered/selected.
+      { selector: "edge.cbg-hubedge", style: { "line-opacity": 0.06, "width": 0.6, "z-index": 2 } },
+      { selector: "edge.cbg-edgeshow", style: { "line-opacity": 0.9, "width": 1.8, "z-index": 9 } },
       // Named stations: the busiest hubs (cbg-major) always show their label; any
       // node reveals its name on hover (cbg-hover). Label sits below the station
       // on a chip so it reads like a metro stop.
@@ -424,12 +475,16 @@ async function renderCodebaseMap(panel){
       { selector: "node[?isParent]", style: {
         "background-color": "data(color)", "background-opacity": 0.10,
         "shape": "round-rectangle", "border-width": 1, "border-color": "data(color)",
-        "border-opacity": 0.55,
-        "label": "data(label)", "text-valign": "top", "text-halign": "center",
-        "font-size": 15, "font-weight": "bold", "color": "data(color)",
-        "text-outline-width": 2, "text-outline-color": "#060a12",
-        "text-transform": "uppercase", "min-zoomed-font-size": 5,
-        "padding": "16px", "text-margin-y": -4, "events": "no",
+        "border-opacity": 0.5,
+        // Big header at the band's top-left so the stage/area name reads even at
+        // overview zoom (font is large so it survives the fit-to-screen scale).
+        "label": "data(label)", "text-valign": "top", "text-halign": "left",
+        "font-size": 30, "font-weight": "bold", "color": "data(color)",
+        "text-margin-x": 14, "text-margin-y": 8, "text-transform": "uppercase",
+        "text-background-color": "#060a12", "text-background-opacity": 0.66,
+        "text-background-padding": 5, "text-background-shape": "roundrectangle",
+        "text-outline-width": 0, "min-zoomed-font-size": 6,
+        "padding": "20px", "events": "no",
       }},
     ],
     // Layout is run manually below (per view) so the flow view can lay out only
@@ -439,6 +494,35 @@ async function renderCodebaseMap(panel){
 
   panel._cbgCy = cy;   // so _cbgRunReview / poll can touch the live graph
 
+  // Left step list: the pipeline stages (py) / areas (app). "Full pipeline" is the
+  // standard subway; picking a step reorganizes into a focused view of that step.
+  const stageCounts = {};
+  data.nodes.forEach(n => { const c = catOf(n.id); stageCounts[c] = (stageCounts[c] || 0) + 1; });
+  let stageList;
+  if (scope === "app"){
+    stageList = Object.keys(stageCounts).sort((a, b) => stageCounts[b] - stageCounts[a]);
+  } else {
+    stageList = _CBG_PY_STAGE_ORDER.filter(s => stageCounts[s]);
+    Object.keys(stageCounts).forEach(s => { if (!stageList.includes(s)) stageList.push(s); });
+  }
+  const focus = (panel._cbgFocus && stageCounts[panel._cbgFocus]) ? panel._cbgFocus : null;
+  const listEl = panel.querySelector(".cbg-steplist");
+  if (listEl){
+    listEl.innerHTML = `<div class="cbg-steplab">${scope === "app" ? "APP AREAS" : "PIPELINE STEPS"}</div>`;
+    const mkStep = (extraCls, swatch, label, count, active, onClick) => {
+      const el = document.createElement("div");
+      el.className = "cbg-step" + extraCls + (active ? " active" : "");
+      el.innerHTML = `<span class="cbg-swatch" style="background:${swatch}"></span><span>${_cbgEsc(label)}</span>`;
+      if (count != null){ const c = document.createElement("span"); c.className = "cbg-count"; c.textContent = count; el.appendChild(c); }
+      el.addEventListener("click", onClick);
+      listEl.appendChild(el);
+    };
+    mkStep(" cbg-all", "#5cf", "◆ Full pipeline", null, !focus,
+      () => { panel._cbgFocus = null; renderCodebaseMap(panel); });
+    stageList.forEach(s => mkStep("", _cbgClusterColor(s), s, stageCounts[s], focus === s,
+      () => { panel._cbgFocus = s; renderCodebaseMap(panel); }));
+  }
+
   if (group) {
     // fcose (registered in vendor-bootstrap.js) is compound-aware and keeps
     // cluster boxes compact. Built-in cose blew this same graph up to a
@@ -447,31 +531,26 @@ async function renderCodebaseMap(panel){
       quality: "default", nodeDimensionsIncludeLabels: true,
       idealEdgeLength: 60, nodeRepulsion: 4500, gravity: 0.25,
       gravityCompound: 1.0, nestingFactor: 0.1 }).run();
+  } else if (focus) {
+    _cbgFocusLayout(panel, cy, focus);   // one stage + what it touches
   } else {
-    // Flow view. Name the busiest hubs as "major stations" (always-on labels):
-    // top hubs by fan-in (most depended-on) plus top roots by fan-out (entry
-    // points like run_pipeline.py, whose significance is what they pull in).
-    const real = cy.nodes().filter(n => !n.data("isParent")).toArray();
-    const byIn = [...real].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0)).slice(0, 8);
-    const byOut = [...real].sort((a, b) => (b.data("fan_out") || 0) - (a.data("fan_out") || 0)).slice(0, 2);
-    cy.collection([...byIn, ...byOut]).addClass("cbg-major");
-    // Rank by dependency depth with dagre on the modules only (parents excluded,
-    // so ranking isn't perturbed by cluster boxes), then pin each cluster to its
-    // own vertical lane so the compound parents become clean category bands. dagre
-    // breaks import cycles automatically.
-    const noParents = cy.elements().filter(e => !e.data("isParent"));
-    const lay = noParents.layout({ name: "dagre", rankDir: "TB", animate: false, fit: false,
-      nodeSep: 18, edgeSep: 8, rankSep: 70, ranker: "network-simplex" });
-    lay.one("layoutstop", () => { _cbgSwimlanes(cy); cy.fit(undefined, 30); });
-    lay.run();
+    _cbgOverviewLayout(cy);              // the standard subway of the whole graph
   }
 
-  // Reveal any node's name on hover (major stations show theirs already).
-  cy.on("mouseover", "node", evt => { if (!evt.target.data("isParent")) evt.target.addClass("cbg-hover"); });
-  cy.on("mouseout", "node", evt => evt.target.removeClass("cbg-hover"));
+  // Reveal a node's name AND its (possibly faded hub) edges on hover.
+  cy.on("mouseover", "node", evt => {
+    const n = evt.target;
+    if (n.data("isParent") || n.data("isBand")) return;
+    n.addClass("cbg-hover");
+    n.connectedEdges().addClass("cbg-edgeshow");
+  });
+  cy.on("mouseout", "node", evt => {
+    evt.target.removeClass("cbg-hover");
+    evt.target.connectedEdges().removeClass("cbg-edgeshow");
+  });
   cy.on("tap", "node", evt => _cbgSelect(panel, cy, evt.target));
   cy.on("tap", evt => { if (evt.target === cy){
-    cy.elements().removeClass("cbg-faded cbg-hl");
+    cy.elements().removeClass("cbg-faded cbg-hl cbg-edgeshow");
     const issEl = panel.querySelector(".cbg-issues"); if (issEl) issEl.innerHTML = "";
   } });
 
