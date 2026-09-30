@@ -16,9 +16,13 @@
    name a file, and never fires on prose that happens to contain a bare word
    like "context" or "utils". "issues only" hides nodes with none.
 
-   Layout is concentric on fan-in, so the highest-blast-radius modules sit at the
-   centre and are drawn largest -- the geometry IS the blast radius. Core
-   cytoscape (vendored), no layout extension. Clustering/ELK is a later pass.
+   Layout is concentric on fan-in by default, so the highest-blast-radius modules
+   sit at the centre and are drawn largest -- the geometry IS the blast radius.
+   The "group by cluster" toggle switches to compound super-nodes (one box per
+   package/dir, from each node's `cluster`) laid out with core cytoscape's `cose`
+   -- an opt-in view that leaves the concentric default untouched. Core cytoscape
+   only (vendored), no layout extension; a nicer ELK/fcose "metro" layout and
+   collapsible clusters are the remaining aesthetic pass (needs visual iteration).
    Depends on: cytoscape (vendor/cytoscape.min.js), openWorkTabTurning (app.js). */
 
 function _cbgInjectStyle(){
@@ -148,6 +152,15 @@ async function _cbgRunReview(panel){
 }
 
 function _cbgSelect(panel, cy, node){
+  if (node.data("isParent")){   // a cluster box: highlight its members, nothing to review
+    panel._cbgSelected = null;
+    panel.querySelector(".cbg-target").textContent =
+      `${node.data("label")}  (cluster — ${node.children().length} modules)`;
+    cy.elements().addClass("cbg-faded").removeClass("cbg-hl");
+    node.descendants().add(node).removeClass("cbg-faded").addClass("cbg-hl");
+    const issEl0 = panel.querySelector(".cbg-issues"); if (issEl0) issEl0.innerHTML = "";
+    return;
+  }
   panel._cbgSelected = node.data("file") || null;
   const tEl = panel.querySelector(".cbg-target");
   tEl.textContent = node.data("file")
@@ -186,6 +199,7 @@ async function renderCodebaseMap(panel){
         <label title="hide modules that reviewed clean"><input type="checkbox" class="cbg-pending"> pending only</label>
         <label title="hide standalone modules with no internal dependencies"><input type="checkbox" class="cbg-iso"> hide unconnected</label>
         <label title="show only modules that an open GitHub issue names"><input type="checkbox" class="cbg-issuesonly"> issues only</label>
+        <label title="group modules into compound boxes by package/dir (cose layout)"><input type="checkbox" class="cbg-group"> group by cluster</label>
         <span class="cbg-status"></span>
         <span class="cbg-issues"></span>
         <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed<span class="cbg-dot" style="box-shadow:0 0 0 2px #5cf inset;background:transparent"></span>reviewing<span class="cbg-dot" style="box-shadow:0 0 0 2px #f5a623 inset;background:transparent"></span>open issue · dashed = changed since review · size = blast radius</span>
@@ -194,6 +208,9 @@ async function renderCodebaseMap(panel){
     </div>`;
   const modeSel = panel.querySelector(".cbg-mode");
   if (modeSel) modeSel.value = prevMode;
+  const group = !!panel._cbgGroup;   // grouped view persists across re-renders
+  const groupBox0 = panel.querySelector(".cbg-group");
+  if (groupBox0) groupBox0.checked = group;
   const canvas = panel.querySelector(".cbg-canvas");
   panel.querySelector(".cbg-run").addEventListener("click", () => _cbgRunReview(panel));
 
@@ -222,6 +239,7 @@ async function renderCodebaseMap(panel){
 
   const maxFanIn = Math.max(1, ...data.nodes.map(n => n.fan_in));
   const elements = [];
+  const clusters = new Set();
   for (const n of data.nodes){
     const rec = n.file ? status[n.file] : null;
     const stale = !!(rec && rec.file_sha && n.last_commit && rec.file_sha !== n.last_commit);
@@ -229,12 +247,22 @@ async function renderCodebaseMap(panel){
     const nIssues = toks.length ? issueHay.filter(it => toks.some(t => it.hay.includes(t))) : [];
     if (nIssues.length) panel._cbgIssuesByNode[n.id] = nIssues;
     const base = n.id.split(/[./]/).filter(Boolean).pop().replace(/\.py$/, "");
+    if (group) clusters.add(n.cluster);
     elements.push({ data: {
       id: n.id, label: nIssues.length ? `${base}\n⚑${nIssues.length}` : base,
       file: n.file, fan_in: n.fan_in, fan_out: n.fan_out, cluster: n.cluster,
       color: _cbgClusterColor(n.cluster), review: _cbgReviewState(rec),
       findings_n: rec ? (rec.findings || 0) : 0, stale: stale,
       issues_n: nIssues.length,
+      parent: group ? `cluster:${n.cluster}` : undefined,
+    }});
+  }
+  // Compound super-node per cluster (grouped view only). fan_in:0 keeps the
+  // fan-in size mapData off NaN; cytoscape auto-fits a parent to its children.
+  for (const c of clusters){
+    elements.push({ data: {
+      id: `cluster:${c}`, label: c, isParent: true, fan_in: 0,
+      color: _cbgClusterColor(c),
     }});
   }
   for (const e of data.edges){
@@ -276,8 +304,21 @@ async function renderCodebaseMap(panel){
       { selector: "edge.cbg-hl", style: {
         "line-color": "var(--cyan,#5cf)", "target-arrow-color": "var(--cyan,#5cf)",
         "width": 2, "opacity": 1 } },
+      // Cluster boxes (grouped view) -- last so it wins the base-node props for
+      // parents; the attribute-gated review/issue selectors never match them.
+      { selector: "node[?isParent]", style: {
+        "background-color": "data(color)", "background-opacity": 0.09,
+        "shape": "round-rectangle", "border-width": 1, "border-color": "data(color)",
+        "label": "data(label)", "text-valign": "top", "text-halign": "center",
+        "font-size": 11, "color": "#9fb3cc", "text-outline-width": 0,
+        "padding": "14px", "text-margin-y": -2,
+      }},
     ],
-    layout: {
+    layout: group ? {
+      name: "cose", animate: false, nodeDimensionsIncludeLabels: true,
+      idealEdgeLength: 55, nodeRepulsion: 9000, nestingFactor: 1.15,
+      gravity: 0.7, numIter: 1200, padding: 24,
+    } : {
       name: "concentric",
       concentric: n => n.data("fan_in"),
       levelWidth: () => Math.max(1, Math.round(maxFanIn / 6)),
@@ -300,14 +341,20 @@ async function renderCodebaseMap(panel){
 
   const isoBox = panel.querySelector(".cbg-iso");
   isoBox.addEventListener("change", () => {
-    const iso = cy.nodes().filter(n => n.degree(false) === 0);
+    const iso = cy.nodes().filter(n => !n.data("isParent") && n.degree(false) === 0);
     iso.style("display", isoBox.checked ? "none" : "element");
   });
 
   const issuesOnlyBox = panel.querySelector(".cbg-issuesonly");
   issuesOnlyBox.addEventListener("change", () => {
-    const none = cy.nodes().filter(n => (n.data("issues_n") || 0) === 0);
+    const none = cy.nodes().filter(n => !n.data("isParent") && (n.data("issues_n") || 0) === 0);
     none.style("display", issuesOnlyBox.checked ? "none" : "element");
+  });
+
+  const groupBox = panel.querySelector(".cbg-group");
+  groupBox.addEventListener("change", () => {
+    panel._cbgGroup = groupBox.checked;   // grouping changes the element set + layout
+    renderCodebaseMap(panel);             // so rebuild rather than restyle
   });
 }
 
