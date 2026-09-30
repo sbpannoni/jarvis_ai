@@ -472,6 +472,7 @@ function wireReviewTrigger(panel){
   const btn = panel.querySelector(".tm-review-btn");
   const input = panel.querySelector(".tm-review-input");
   const chainBox = panel.querySelector(".tm-review-chain");
+  const modeSel = panel.querySelector(".tm-review-mode");
   const statusEl = panel.querySelector(".tm-review-status");
   if (!btn || !input || !statusEl) return;
   btn.addEventListener("click", async () => {
@@ -485,7 +486,7 @@ function wireReviewTrigger(panel){
       const r = await fetch("/api/review-file", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({target_file, chain}),
+        body: JSON.stringify({target_file, chain, mode: modeSel ? modeSel.value : "sweep"}),
       });
       const j = await r.json();
       if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
@@ -609,6 +610,7 @@ async function renderTransitMap(panel){
           <label class="tm-review-chain-label" title="Also file a linked, dispatchable [Fix] card if the review finds something -- runs unsupervised once filed">
             <input type="checkbox" class="tm-review-chain" /> chain
           </label>
+          <select class="tm-review-mode" title="sweep = breadth only (fast); deep = a deep pass when the sweep comes back clean"><option value="sweep">sweep</option><option value="deep">deep (on clean)</option></select>
           <button type="button" class="btn tm-review-btn">RUN REVIEW</button>
           <span class="tm-review-status"></span>
         </div>

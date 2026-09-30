@@ -2322,6 +2322,9 @@ async def review_file(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "target_file is required"}, status_code=400)
     task_description = (payload.get("task_description") or "").strip()
     chain = bool(payload.get("chain"))
+    mode = (payload.get("mode") or "sweep").strip()
+    if mode not in ("sweep", "deep"):
+        mode = "sweep"
 
     try:
         rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
@@ -2337,7 +2340,8 @@ async def review_file(request: Request) -> JSONResponse:
         f"{CODER_ENGINE_VENV_PY} {DISPATCH_REVIEW_TASK_PY} "
         f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
         f"--target-file {shlex.quote(target_file)} "
-        f"--model {shlex.quote(model)}"
+        f"--model {shlex.quote(model)} "
+        f"--mode {shlex.quote(mode)}"
     )
     if task_description:
         cmd += f" --task-description {shlex.quote(task_description)}"
