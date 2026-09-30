@@ -643,6 +643,7 @@ function openCoderTransitMap(){
   openWorkTabTurning("coder-transit-map","main","TRANSIT MAP",(panel,tab)=>{
     panel.innerHTML = `<div class="kv"><span>loading…</span></div>`;
     panel.classList.add("flow-pane");
+    panel.classList.add("tm-pane");   // scrollable: the transit content is taller than the panel
     renderTransitMap(panel);
     const iv = setInterval(()=>renderTransitMap(panel), 30000);
     tab.onBeforeClose = () => clearInterval(iv);
