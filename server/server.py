@@ -2506,7 +2506,11 @@ async def review_file(request: Request) -> JSONResponse:
         _spawn_review_job(target_file, task_description, chain, mode)
         return JSONResponse({"ok": True, "status": "running", "target_file": target_file})
 
-    body, code = await _run_review(target_file, task_description, chain, mode)
+    tracker = await _sweep_tracker_open(target_file, mode)
+    try:
+        body, code = await _run_review(target_file, task_description, chain, mode)
+    finally:
+        await _sweep_tracker_close(tracker)
     return JSONResponse(body, status_code=code)
 
 
@@ -2516,8 +2520,65 @@ _REVIEW_JOBS: set = set()
 _REVIEW_JOBS_ACTIVE: set = set()
 
 
+async def _sweep_tracker_open(target_file: str, mode: str) -> str | None:
+    """Create a per-file review tracker card. Delegates to _kanban_tracker_create."""
+    title = f"[Sweep] IN PROGRESS · {target_file}"
+    body = (f"Live tracker: automated {mode} review of {target_file} is running on the "
+            f"coder-engine (looking-glass). This card auto-clears when the sweep ends; "
+            f"findings, if any, are filed separately as their own card.")
+    return await _kanban_tracker_create(title, body)
+
+
+async def _kanban_tracker_create(title: str, body: str) -> str | None:
+    """Create a stable, non-dispatchable kanban card for an in-progress sweep so it
+    is visible on the board. It has to go to `scheduled`: recompute_ready promotes
+    ANY childless card (blocked, todo, even a typed needs_input block) to `ready`
+    within ~10s -- where the dispatcher would spawn a junk worker on it -- but
+    `scheduled` ("waiting on time") has no drain and stays put. So: create (started
+    blocked to avoid a ready flash) then immediately `schedule`, well inside that
+    window. Closed (archived) when the sweep ends. Best-effort: a tracking failure
+    must never fail the sweep itself."""
+    try:
+        rc, out = await _kanban_ssh(
+            f"hermes kanban create {shlex.quote(title[:200])} --body {shlex.quote(body)} "
+            "--workspace scratch --initial-status blocked --created-by looking-glass --json")
+        if rc != 0:
+            return None
+        cid = json.loads(out.strip()).get("id")
+    except Exception as exc:
+        print(f"[sweep-tracker] create failed: {exc!r}", flush=True)
+        return None
+    if cid:
+        try:
+            await _kanban_ssh(
+                f"hermes kanban schedule {shlex.quote(cid)} "
+                f"{shlex.quote('live sweep tracker (looking-glass); auto-clears when done')}")
+        except Exception as exc:
+            print(f"[sweep-tracker] schedule failed for {cid}: {exc!r}", flush=True)
+    return cid
+
+
+async def _sweep_tracker_close(card_id: str | None) -> None:
+    """Complete + archive the tracker card so the board doesn't accumulate one card
+    per review. Best-effort. Leaving it in `running` would wedge the in-progress
+    slot, so this runs in a finally."""
+    if not card_id:
+        return
+    # Archive is the goal (remove from the active board); it must run even if the
+    # complete step is rejected for a blocked card, so they're independent.
+    try:
+        await _kanban_ssh(f"hermes kanban complete {shlex.quote(card_id)}")
+    except Exception:
+        pass
+    try:
+        await _kanban_ssh(f"hermes kanban archive {shlex.quote(card_id)}")
+    except Exception as exc:
+        print(f"[sweep-tracker] archive failed for {card_id}: {exc!r}", flush=True)
+
+
 def _spawn_review_job(target_file: str, task_description: str, chain: bool, mode: str) -> None:
     async def _job():
+        tracker = await _sweep_tracker_open(target_file, mode)
         try:
             body, _code = await _run_review(target_file, task_description, chain, mode)
             if not body.get("ok"):
@@ -2525,6 +2586,7 @@ def _spawn_review_job(target_file: str, task_description: str, chain: bool, mode
         except Exception as exc:  # never let a background job die silently
             print(f"[review-async] {target_file} crashed: {exc!r}", flush=True)
         finally:
+            await _sweep_tracker_close(tracker)
             _REVIEW_JOBS_ACTIVE.discard(target_file)
     _REVIEW_JOBS_ACTIVE.add(target_file)
     task = asyncio.get_running_loop().create_task(_job())
@@ -7184,6 +7246,9 @@ async def learning_decide(request: Request) -> JSONResponse:
 SWEEP_PY = "/home/sam/vllm/.venv/bin/python /ssdpool/coder-engine/pipeline/sweep/sweep.py"
 SWEEP_LOG = "/home/sam/sweeps/current.log"
 _SWEEP_DIR_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
+# Kanban tracker for the bulk sweep (a detached snarf process with no callback):
+# created on start, closed by the next /api/sweep poll that sees it stopped.
+_SWEEP_TRACKER_CARD: str | None = None
 _SWEEP_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 # A finding's file path -> the tracker area it most likely belongs to.
 _SWEEP_AREA = (("darkhelix-app/", "area:ui"), ("scripts/microbial_profiling/", "area:taxor"),
@@ -7215,6 +7280,12 @@ async def sweep_status() -> JSONResponse:
         plan_j = json.loads(plan)
     except Exception:
         plan_j = {}
+    # Close the bulk-sweep tracker card once the run is done (no callback from the
+    # detached snarf process, so the status poll is what notices it stopped).
+    global _SWEEP_TRACKER_CARD
+    if not running and _SWEEP_TRACKER_CARD:
+        await _sweep_tracker_close(_SWEEP_TRACKER_CARD)
+        _SWEEP_TRACKER_CARD = None
     return JSONResponse({"running": running, "log_tail": tail, "counts": by_status,
                          "total": len(rows), "plan": plan_j})
 
@@ -7260,6 +7331,16 @@ async def sweep_start(request: Request) -> JSONResponse:
         rc, out = await _fleet_ssh("snarf", cmd)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    # Put the running sweep on the kanban too (closed by a later /api/sweep poll).
+    global _SWEEP_TRACKER_CARD
+    if rc == 0:
+        scope = ", ".join(only) if only else "whole repo"
+        chunks = f", max {max_chunks} chunks" if max_chunks else ""
+        title = f"[Sweep] IN PROGRESS · {scope}"
+        body = (f"Live tracker: whole-codebase sweep ({scope}{chunks}) running on the "
+                f"coder-engine. Auto-clears when the sweep ends; progress + findings are "
+                f"in the CODE SWEEP panel.")
+        _SWEEP_TRACKER_CARD = await _kanban_tracker_create(title, body)
     return JSONResponse({"ok": rc == 0, "only": only, "max_chunks": max_chunks})
 
 
