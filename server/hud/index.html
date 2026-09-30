@@ -18,6 +18,7 @@
 <script src="vendor/xterm.js"></script>
 <script src="vendor/xterm-addon-fit.js"></script>
 <script src="vendor/3d-force-graph.min.js"></script>
+<script src="vendor/cytoscape.min.js"></script>
 <script type="module" src="vendor-bootstrap.js"></script>
 </head>
 <body>
@@ -107,6 +108,7 @@
       <div class="view-group">MODELS</div>
       <button class="btn viewBtn" data-action="coder-transit-map" style="border-color:var(--magenta); color:var(--magenta)" title="Subway-map view of every role the coder-engine pipeline needs a model for: editor, reviewer, orchestrator">☷ TRANSIT MAP</button>
       <button class="btn viewBtn" data-action="coder-models" style="border-color:var(--cyan); color:var(--cyan)" title="coder-engine Phase 3 eval roster: what each candidate model is for, and how it's performing">◇ CODER MODELS</button>
+      <button class="btn viewBtn" data-action="codebase-map" style="border-color:var(--green,#6e6); color:var(--green,#6e6)" title="Selectable dependency map of the codebase -- click a module to see its blast radius and launch a review">◈ CODEBASE MAP</button>
       <div class="view-group">HERMES</div>
       <button class="btn viewBtn" data-view="HERMES DASHBOARD" data-path="/">▸ HERMES DASHBOARD</button>
       <button class="btn viewBtn" data-view="CHAT" data-path="/chat">▸ DASHBOARD CHAT</button>
@@ -205,6 +207,7 @@
 <script src="ownership.js"></script>
 <script src="coder-models.js"></script>
 <script src="coder-transit-map.js"></script>
+<script src="coder-codebase-graph.js"></script>
 <script src="submit-work.js"></script>
 <script src="downloads.js"></script>
 <script src="sweep.js"></script>
