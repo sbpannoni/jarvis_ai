@@ -279,7 +279,7 @@ function transitOrchestratorCard(m){
   </div>`;
 }
 
-function transitRoleOptions(roster, selected){
+function transitRoleOptions(roster, selected, allowUnverified){
   // A model with tool_calling === false (from CODER_MODELS_ROSTER via
   // /api/model-role-assignments) can't emit structured tool calls, so it can't
   // fill any role -- render it disabled with a visible reason. The server
@@ -294,8 +294,12 @@ function transitRoleOptions(roster, selected){
       : noTools ? " — no tool calls (can't be assigned)"
       : m.in_seat_catalog === false ? " — not installed in model-seat" : "";
     const label = `${m.loaded ? "● " : ""}${m.label}${why}`;
+    // Coder-engine roles reject unverified models; the Hermes agent seats
+    // (allowUnverified) accept any seat-catalog model, disabling only ones known
+    // to lack tool calls.
+    const disabled = allowUnverified ? noTools : (noTools || m.unverified);
     return `<option value="${m.id}"${m.id === selected ? " selected" : ""}`
-      + `${noTools || m.unverified ? " disabled" : ""}>${label}</option>`;
+      + `${disabled ? " disabled" : ""}>${label}</option>`;
   };
   const groups = {};
   (roster || []).forEach(m => { (groups[m.backend || "other"] ||= []).push(m); });
@@ -383,16 +387,29 @@ function transitRoleBar(roleData){
   const assignments = roleData.assignments || {};
   const live = new Set(roleData.live_roles || []);
   const tuning = roleData.tuning || {};
-  const roles = [["editor", "EDITOR"], ["reviewer", "REVIEWER"], ["orchestrator", "ORCHESTRATOR"]];
-  return `<div class="tm-role-bar">${roles.map(([key, label]) => `
+  // Coder-engine roles vs Hermes agent seats -- two systems that share the one GPU
+  // seat. Both are shown/set here so the map is the single control surface.
+  const engineRoles = [["editor", "EDITOR"], ["reviewer", "REVIEWER"], ["orchestrator", "ORCHESTRATOR"]];
+  const agentSeats = [["kanban_worker", "KANBAN WORKER"], ["brain", "CHAT BRAIN (default)"]];
+  const roleItem = ([key, label], agent) => `
     <div class="tm-role-item">
       <span class="tm-role-label">${label}</span>
-      <select class="tm-role-select" data-role="${key}">${transitRoleOptions(roster, assignments[key])}</select>
-      <span class="${live.has(key) ? "tm-role-live" : "tm-role-notlive"}">${live.has(key) ? "LIVE" : "NOT WIRED"}</span>
+      <select class="tm-role-select" data-role="${key}"${agent ? ' data-agent="1"' : ""}>${transitRoleOptions(roster, assignments[key], agent)}</select>
+      <span class="${agent || live.has(key) ? "tm-role-live" : "tm-role-notlive"}">${agent || live.has(key) ? "LIVE" : "NOT WIRED"}</span>
       <span class="tm-role-status" data-role-status="${key}"></span>
       ${(key === "editor" || key === "reviewer") ? transitTuningControl(assignments[key], tuning[assignments[key]]) : ""}
-    </div>`).join("")}
-  </div>
+    </div>`;
+  const ad = !!roleData.auto_dispatch;
+  return `
+    <div class="tm-role-group"><div class="tm-role-grouplab">CODER ENGINE (snarf pipeline)</div>
+      <div class="tm-role-bar">${engineRoles.map(r => roleItem(r, false)).join("")}</div></div>
+    <div class="tm-role-group"><div class="tm-role-grouplab">HERMES AGENTS (CT111) · share the one GPU seat</div>
+      <div class="tm-role-bar">${agentSeats.map(r => roleItem(r, true)).join("")}
+        <label class="tm-autodispatch" title="ON: the gateway auto-decomposer works review findings on its own (grabs the GPU seat). OFF: a finding waits in triage for you to dispatch it.">
+          <input type="checkbox" class="tm-autodispatch-box"${ad ? " checked" : ""}> auto-dispatch findings
+          <span class="tm-autodispatch-status"></span>
+        </label>
+      </div></div>
   <div class="tm-seat-warning" hidden></div>`;
 }
 
@@ -437,6 +454,26 @@ function wireRoleBar(panel, roster){
       saveRoleAssignment(role, sel.value, statusEl);
     });
   });
+  const adBox = panel.querySelector(".tm-autodispatch-box");
+  if (adBox){
+    adBox.addEventListener("change", async () => {
+      const st = panel.querySelector(".tm-autodispatch-status");
+      if (st){ st.textContent = "saving…"; st.className = "tm-autodispatch-status"; }
+      try{
+        const r = await fetch("/api/kanban-auto-dispatch", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({enabled: adBox.checked}),
+        });
+        const j = await r.json();
+        if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+        if (st){ st.textContent = adBox.checked ? "on" : "off"; st.className = "tm-autodispatch-status saved";
+                 setTimeout(() => { st.textContent = ""; }, 2500); }
+      }catch(err){
+        adBox.checked = !adBox.checked;   // revert the visual toggle on failure
+        if (st){ st.textContent = `error: ${err.message}`; st.className = "tm-autodispatch-status err"; }
+      }
+    });
+  }
   panel.querySelectorAll(".tm-tune").forEach(box => {
     const btn = box.querySelector(".tm-tune-save");
     if (!btn) return;

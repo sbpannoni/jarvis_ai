@@ -987,6 +987,15 @@ body.view-map #work-area{display:none !important}
 /* Role-assignment dropdown bar: surfaces the model actually configured per
    role (distinct from the ranked-by-score leaderboard cards below) and
    lets it be changed live. See coder-transit-map.js's transitRoleBar(). */
+/* Seat groups: coder-engine roles vs Hermes agent seats (they share one GPU seat). */
+.tm-role-group{border-bottom:1px solid var(--line)}
+.tm-role-grouplab{font-family:'Orbitron'; font-size:8.5px; letter-spacing:2px; color:var(--txt-dim);
+  padding:5px 10px 0}
+.tm-role-group .tm-role-bar{border-bottom:none}
+.tm-autodispatch{display:flex; align-items:center; gap:5px; font-size:11px; color:var(--txt-dim);
+  margin-left:auto; cursor:pointer; white-space:nowrap}
+.tm-autodispatch-status{font-size:10px; color:var(--txt-dim)}
+.tm-autodispatch-status.saved{color:var(--teal)} .tm-autodispatch-status.err{color:var(--red)}
 .tm-role-bar{display:flex; flex-wrap:wrap; gap:16px; align-items:center;
   padding:9px 10px; border-bottom:1px solid var(--line); background:#050d16cc}
 .tm-role-item{display:flex; align-items:center; gap:6px}

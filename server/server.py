@@ -1949,6 +1949,17 @@ MODEL_ROLE_NAMES = ("editor", "reviewer", "orchestrator")
 # acts unsupervised. See Phase 3.5 / snazzy-chasing-willow.md.
 MODEL_ROLE_LIVE = {"editor", "orchestrator", "reviewer"}
 
+# Beyond the three coder-engine roles, two more model actors share the one GPU
+# seat and were previously invisible/unsettable from the map: the Hermes profile
+# that actually WORKS kanban cards (kanban_worker), and the gateway default that
+# the voice/chat brain and un-pinned agents inherit (brain). Both are driven via
+# `hermes config set` on CT111 -- the vendor's own safe writer, no YAML hand-edit.
+KANBAN_WORKER_PROFILE = "darkhelix"
+EXTRA_SEAT_SETTERS = {
+    "kanban_worker": f"hermes -p {KANBAN_WORKER_PROFILE} config set model.default {{m}}",
+    "brain": "hermes config set model.default {m}",
+}
+
 HERMES_CONFIG_PATH = "/root/.hermes/config.yaml"
 HERMES_VENV_PY = "/usr/local/lib/hermes-agent/venv/bin/python3"
 _HERMES_AUX_SECTIONS = ("triage_specifier", "kanban_decomposer")
@@ -2087,6 +2098,31 @@ async def model_role_assignments() -> JSONResponse:
     except Exception as exc:
         assignments["_orchestrator_error"] = str(exc)
 
+    # Extra seats + the auto-dispatch gate, so the map is the ONE place that shows
+    # every model actor and whether findings self-dispatch. Read via `hermes config
+    # get` on CT111 (last output line is the value).
+    def _last(s):
+        return (s or "").strip().splitlines()[-1].strip() if (s or "").strip() else ""
+    try:
+        rc_w, out_w = await _fleet_ssh("hermes", f"hermes -p {KANBAN_WORKER_PROFILE} config get model.default")
+        if rc_w == 0 and _last(out_w):
+            assignments["kanban_worker"] = _last(out_w)
+    except Exception as exc:
+        assignments["_kanban_worker_error"] = str(exc)
+    try:
+        rc_b, out_b = await _fleet_ssh("hermes", "hermes config get model.default")
+        if rc_b == 0 and _last(out_b):
+            assignments["brain"] = _last(out_b)
+    except Exception:
+        pass
+    auto_dispatch = None
+    try:
+        rc_a, out_a = await _fleet_ssh("hermes", "hermes config get kanban.auto_decompose")
+        if rc_a == 0:
+            auto_dispatch = _last(out_a).lower() in ("true", "1", "yes")
+    except Exception:
+        pass
+
     # model-seat's catalog is what can actually be put in the GPU seat, so it
     # supplies backend/loaded state. CODER_MODELS_ROSTER still supplies labels
     # and the verified tool_calling flag. A catalog model missing from the
@@ -2114,6 +2150,8 @@ async def model_role_assignments() -> JSONResponse:
         "assignments": assignments,
         "live_roles": sorted(MODEL_ROLE_LIVE),
         "seat_catalog_ok": seat is not None,
+        "auto_dispatch": auto_dispatch,
+        "extra_seats": sorted(EXTRA_SEAT_SETTERS),
         "roster": roster,
     })
 
@@ -2143,6 +2181,23 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
     payload = await request.json()
     role = (payload.get("role") or "").strip()
     model = (payload.get("model") or "").strip()
+
+    # Extra seats (kanban_worker, brain): set via `hermes config set` on CT111.
+    # Validate against what can actually be seated (roster or seat catalog) rather
+    # than the coder roster only, since these aren't coder-engine roles.
+    if role in EXTRA_SEAT_SETTERS:
+        seat = await _model_seat_catalog()
+        if model not in _CODER_ROSTER_BY_ID and not (seat and model in seat):
+            return JSONResponse({"ok": False, "error": f"unknown model id {model!r}"}, status_code=400)
+        cmd = EXTRA_SEAT_SETTERS[role].format(m=shlex.quote(model))
+        try:
+            rc, out = await _fleet_ssh("hermes", cmd)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": out[-500:]}, status_code=502)
+        return JSONResponse({"ok": True, "assignments": {role: model}, "live_roles": sorted(MODEL_ROLE_LIVE)})
+
     if role not in MODEL_ROLE_NAMES:
         return JSONResponse(
             {"ok": False, "error": f"role must be one of {MODEL_ROLE_NAMES}"}, status_code=400
@@ -2186,6 +2241,23 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
     return JSONResponse({"ok": True, "assignments": assignments, "live_roles": sorted(MODEL_ROLE_LIVE)})
+
+
+@app.post("/api/kanban-auto-dispatch")
+async def set_kanban_auto_dispatch(request: Request) -> JSONResponse:
+    """Toggle the gateway auto-decomposer (kanban.auto_decompose on CT111). When
+    off, a review finding filed to triage is NOT auto-worked -- it waits for a
+    human to dispatch it, so a finding can't silently grab the single GPU seat.
+    Read from root config.yaml every tick, so this takes effect without a restart."""
+    payload = await request.json()
+    enabled = bool(payload.get("enabled"))
+    try:
+        rc, out = await _fleet_ssh("hermes", f"hermes config set kanban.auto_decompose {str(enabled).lower()}")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": out[-500:]}, status_code=502)
+    return JSONResponse({"ok": True, "auto_dispatch": enabled})
 
 
 MODEL_TUNING_PATH = "/ssdpool/coder-engine/pipeline/model_tuning.json"
