@@ -2364,7 +2364,17 @@ async def review_file(request: Request) -> JSONResponse:
     always has -- reviewer still never merges anything itself, it can now
     just also hand off a well-specified todo instead of only a read-only
     note. See dispatch_review_task.py's own docstring for why reviewer
-    itself still never executes or merges."""
+    itself still never executes or merges.
+
+    Set "async": true to run the review as a background job: the call returns
+    immediately with {"ok": true, "status": "running", "target_file": ...} and
+    the review (plus its kanban filing) proceeds in the server background,
+    identical in every other respect to the blocking path. Progress lives in
+    review_status.json (dispatch_review_task.py writes a "running" marker at the
+    start of the graph run, the outcome at the end); the CODEBASE MAP polls
+    /api/review-status to show "reviewing…" and to notice completion. Default
+    false = the original blocking behavior, unchanged for every existing
+    caller."""
     payload = await request.json()
     target_file = (payload.get("target_file") or "").strip()
     if not target_file:
@@ -2375,15 +2385,59 @@ async def review_file(request: Request) -> JSONResponse:
     if mode not in ("sweep", "deep"):
         mode = "sweep"
 
+    if bool(payload.get("async")):
+        # Fire-and-poll: run the (long) review as a background job and return at
+        # once. The job runs the exact same _run_review below -- kanban card,
+        # chain and all -- so async changes only WHEN the client hears back, not
+        # WHAT happens. One review per file at a time.
+        if target_file in _REVIEW_JOBS_ACTIVE:
+            return JSONResponse({"ok": True, "status": "running", "target_file": target_file,
+                                 "already_running": True})
+        _spawn_review_job(target_file, task_description, chain, mode)
+        return JSONResponse({"ok": True, "status": "running", "target_file": target_file})
+
+    body, code = await _run_review(target_file, task_description, chain, mode)
+    return JSONResponse(body, status_code=code)
+
+
+# In-flight async review jobs: targets currently running, plus strong refs to
+# the tasks so the event loop does not garbage-collect them mid-run.
+_REVIEW_JOBS: set = set()
+_REVIEW_JOBS_ACTIVE: set = set()
+
+
+def _spawn_review_job(target_file: str, task_description: str, chain: bool, mode: str) -> None:
+    async def _job():
+        try:
+            body, _code = await _run_review(target_file, task_description, chain, mode)
+            if not body.get("ok"):
+                print(f"[review-async] {target_file} failed: {body.get('error')}", flush=True)
+        except Exception as exc:  # never let a background job die silently
+            print(f"[review-async] {target_file} crashed: {exc!r}", flush=True)
+        finally:
+            _REVIEW_JOBS_ACTIVE.discard(target_file)
+    _REVIEW_JOBS_ACTIVE.add(target_file)
+    task = asyncio.get_running_loop().create_task(_job())
+    _REVIEW_JOBS.add(task)
+    task.add_done_callback(_REVIEW_JOBS.discard)
+
+
+async def _run_review(target_file: str, task_description: str, chain: bool,
+                      mode: str) -> tuple[dict, int]:
+    """The whole blocking body of POST /api/review-file, lifted into a helper so
+    the endpoint can run it inline (sync) or as a background job (async:true)
+    without duplicating the kanban-filing / chain logic. Returns (body, http
+    status). Runs one reviewer-role review of target_file on snarf against the
+    reviewer's currently-assigned model and files the result as a --triage
+    kanban card (and, when chain and there are findings, a linked --parent fix
+    card)."""
     try:
         rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
         model = json.loads(out0).get("reviewer") if rc0 == 0 else None
     except Exception:
         model = None
     if not model:
-        return JSONResponse(
-            {"ok": False, "error": "could not resolve reviewer's assigned model"}, status_code=502
-        )
+        return {"ok": False, "error": "could not resolve reviewer's assigned model"}, 502
 
     cmd = (
         f"{CODER_ENGINE_VENV_PY} {DISPATCH_REVIEW_TASK_PY} "
@@ -2398,7 +2452,7 @@ async def review_file(request: Request) -> JSONResponse:
     try:
         rc, out = await _fleet_ssh("snarf", cmd)
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        return {"ok": False, "error": str(exc)}, 502
 
     brace = out.find("{")
     try:
@@ -2406,13 +2460,10 @@ async def review_file(request: Request) -> JSONResponse:
             raise ValueError("no JSON object in output")
         result = json.loads(out[brace:])
     except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"ok": False, "error": f"unparseable review output: {out[-1500:]}"}, status_code=502)
+        return {"ok": False, "error": f"unparseable review output: {out[-1500:]}"}, 502
 
     if result.get("status") != "done":
-        return JSONResponse(
-            {"ok": False, "error": result.get("error") or "review failed", "model": model},
-            status_code=502,
-        )
+        return {"ok": False, "error": result.get("error") or "review failed", "model": model}, 502
 
     review_text = result.get("review_text") or ""
     findings = result.get("findings") or []
@@ -2432,31 +2483,28 @@ async def review_file(request: Request) -> JSONResponse:
     try:
         rc2, out2 = await _kanban_ssh(kanban_cmd)
     except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc), "review_text": review_text}, status_code=502)
+        return {"ok": False, "error": str(exc), "review_text": review_text}, 502
     if rc2 != 0:
-        return JSONResponse({"ok": False, "error": out2[-2000:], "review_text": review_text}, status_code=502)
+        return {"ok": False, "error": out2[-2000:], "review_text": review_text}, 502
     try:
         task_data = json.loads(out2.strip())
     except json.JSONDecodeError:
-        return JSONResponse(
-            {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text},
-            status_code=502,
-        )
+        return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
 
     response = {
         "ok": True, "task": task_data, "model": model, "review_text": review_text,
         "findings": findings, "no_issues_found": no_issues_found, "chained": False,
     }
     if not chain:
-        return JSONResponse(response)
+        return response, 200
     if no_issues_found or not findings:
         response["chain_skipped_reason"] = "no actionable findings"
-        return JSONResponse(response)
+        return response, 200
 
     review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
     if not _TASK_ID_RE.match(review_task_id):
         response["chain_skipped_reason"] = f"review card id unparseable: {review_task_id!r}"
-        return JSONResponse(response)
+        return response, 200
 
     fix_lines = [
         f"Fix the {len(findings)} issue(s) below in `{target_file}`, found by an "
@@ -2497,19 +2545,19 @@ async def review_file(request: Request) -> JSONResponse:
         rc3, out3 = await _kanban_ssh(fix_cmd)
     except Exception as exc:
         response["chain_error"] = str(exc)
-        return JSONResponse(response)
+        return response, 200
     if rc3 != 0:
         response["chain_error"] = out3[-2000:]
-        return JSONResponse(response)
+        return response, 200
     try:
         fix_task_data = json.loads(out3.strip())
     except json.JSONDecodeError:
         response["chain_error"] = f"unparseable kanban output: {out3[-500:]}"
-        return JSONResponse(response)
+        return response, 200
 
     response["chained"] = True
     response["chained_task"] = fix_task_data
-    return JSONResponse(response)
+    return response, 200
 
 
 class _FixCardError(Exception):

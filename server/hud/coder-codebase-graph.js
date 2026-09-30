@@ -65,9 +65,58 @@ function _cbgIssueTokens(n){
 
 function _cbgReviewState(rec){
   if (!rec) return "unreviewed";
+  if (rec.status === "running") return "reviewing";
   if ((rec.findings || 0) > 0) return "findings";
   if (rec.no_issues_found) return rec.high_confidence_clean ? "clean-hi" : "clean";
   return "reviewed";
+}
+
+// Mark the node for `file` as under review in the LIVE graph (no re-render), so
+// the click gives instant feedback before the server/dispatcher confirm it.
+function _cbgMarkNodeReviewing(panel, file){
+  const cy = panel._cbgCy; if (!cy) return;
+  cy.nodes().filter(n => n.data("file") === file).data("review", "reviewing");
+}
+
+// Poll /api/review-status until this file leaves the "running" state (or we give
+// up), then refresh the map with the recorded outcome. Bound to the render that
+// started it (panel._cbgRenderId) so it stops if the panel is re-rendered/closed.
+async function _cbgPollReview(panel, file){
+  const myRender = panel._cbgRenderId;
+  const started = Date.now();
+  const MAX_MS = 75 * 60 * 1000;   // reviews run ~47 min; stop watching after 75
+  while (panel._cbgRenderId === myRender && panel.isConnected){
+    await new Promise(res => setTimeout(res, 12000));
+    if (panel._cbgRenderId !== myRender || !panel.isConnected) return;
+    let status = {};
+    try{
+      const sr = await fetch("/api/review-status");
+      status = sr.ok ? ((await sr.json()).status || {}) : {};
+    }catch(e){ continue; }   // transient; keep watching
+    const rec = status[file];
+    if (rec && rec.status !== "running"){
+      const statusEl = panel.querySelector(".cbg-status");
+      if (statusEl){
+        const st = _cbgReviewState(rec);
+        statusEl.textContent = st === "findings"
+          ? `${rec.findings} finding${rec.findings === 1 ? "" : "s"} on ${file} — see kanban`
+          : (st === "clean" || st === "clean-hi"
+              ? `clean${st === "clean-hi" ? " (high confidence)" : ""}: ${file}`
+              : `review done: ${file}`);
+        statusEl.className = "cbg-status saved";
+      }
+      renderCodebaseMap(panel);   // full refresh picks up the outcome + overlay
+      return;
+    }
+    if (Date.now() - started > MAX_MS){
+      const statusEl = panel.querySelector(".cbg-status");
+      if (statusEl){
+        statusEl.textContent = `still running? gave up watching ${file} — check the kanban board`;
+        statusEl.className = "cbg-status err";
+      }
+      return;
+    }
+  }
 }
 
 async function _cbgRunReview(panel){
@@ -75,23 +124,23 @@ async function _cbgRunReview(panel){
   const statusEl = panel.querySelector(".cbg-status");
   const modeSel = panel.querySelector(".cbg-mode");
   if (!target){ statusEl.textContent = "select a module first"; statusEl.className = "cbg-status err"; return; }
-  statusEl.textContent = `reviewing ${target} … (may take several minutes)`;
+  statusEl.textContent = `dispatching review of ${target} …`;
   statusEl.className = "cbg-status";
   try{
+    // async:true -> the review runs in the server background and we poll; the
+    // call returns at once instead of blocking the whole ~47-min run.
     const r = await fetch("/api/review-file", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({target_file: target, mode: modeSel ? modeSel.value : "sweep"}),
+      body: JSON.stringify({target_file: target, mode: modeSel ? modeSel.value : "sweep", async: true}),
     });
     const j = await r.json();
     if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
-    if (j.no_issues_found){
-      statusEl.textContent = `clean${j.high_confidence_clean ? " (high confidence)" : ""}: ${target}`;
-    } else {
-      const n = (j.findings || []).length;
-      statusEl.textContent = `${n} finding${n === 1 ? "" : "s"} on ${target}${j.task ? ` -> card ${j.task.id}` : ""}`;
-    }
-    statusEl.className = "cbg-status saved";
-    renderCodebaseMap(panel);   // refresh the overlay with the new outcome
+    statusEl.textContent = j.already_running
+      ? `already reviewing ${target} … (runs in background)`
+      : `reviewing ${target} … (runs in background; can take many minutes)`;
+    statusEl.className = "cbg-status";
+    _cbgMarkNodeReviewing(panel, target);
+    _cbgPollReview(panel, target);
   }catch(err){
     statusEl.textContent = `error: ${err.message}`;
     statusEl.className = "cbg-status err";
@@ -120,6 +169,7 @@ function _cbgSelect(panel, cy, node){
 
 async function renderCodebaseMap(panel){
   _cbgInjectStyle();
+  panel._cbgRenderId = (panel._cbgRenderId || 0) + 1;   // invalidates in-flight polls
   if (typeof cytoscape === "undefined"){
     panel.innerHTML = `<div class="kv"><span class="err">cytoscape not loaded (vendor/cytoscape.min.js)</span></div>`;
     return;
@@ -138,7 +188,7 @@ async function renderCodebaseMap(panel){
         <label title="show only modules that an open GitHub issue names"><input type="checkbox" class="cbg-issuesonly"> issues only</label>
         <span class="cbg-status"></span>
         <span class="cbg-issues"></span>
-        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed<span class="cbg-dot" style="box-shadow:0 0 0 2px #f5a623 inset;background:transparent"></span>open issue · dashed = changed since review · size = blast radius</span>
+        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed<span class="cbg-dot" style="box-shadow:0 0 0 2px #5cf inset;background:transparent"></span>reviewing<span class="cbg-dot" style="box-shadow:0 0 0 2px #f5a623 inset;background:transparent"></span>open issue · dashed = changed since review · size = blast radius</span>
       </div>
       <div class="cbg-canvas"></div>
     </div>`;
@@ -210,6 +260,7 @@ async function renderCodebaseMap(panel){
       { selector: 'node[review="clean"]', style: { "border-color": "#6e6", "border-width": 3 } },
       { selector: 'node[review="clean-hi"]', style: { "border-color": "#7f7", "border-width": 4 } },
       { selector: 'node[review="unreviewed"]', style: { "border-color": "rgba(120,130,160,.5)" } },
+      { selector: 'node[review="reviewing"]', style: { "border-color": "#5cf", "border-width": 5 } },
       { selector: "node[?stale]", style: { "border-style": "dashed" } },
       // Open-issue overlay: amber outline sits OUTSIDE the review border, so a
       // node can show its review state and "has open issues" at once.
@@ -234,6 +285,7 @@ async function renderCodebaseMap(panel){
     },
   });
 
+  panel._cbgCy = cy;   // so _cbgRunReview / poll can touch the live graph
   cy.on("tap", "node", evt => _cbgSelect(panel, cy, evt.target));
   cy.on("tap", evt => { if (evt.target === cy){
     cy.elements().removeClass("cbg-faded cbg-hl");
