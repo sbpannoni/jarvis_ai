@@ -102,6 +102,7 @@ async function renderCodebaseMap(panel){
         </select>
         <button type="button" class="btn cbg-run">RUN REVIEW</button>
         <label title="hide modules that reviewed clean"><input type="checkbox" class="cbg-pending"> pending only</label>
+        <label title="hide standalone modules with no internal dependencies"><input type="checkbox" class="cbg-iso"> hide unconnected</label>
         <span class="cbg-status"></span>
         <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed · size = blast radius</span>
       </div>
@@ -181,8 +182,13 @@ async function renderCodebaseMap(panel){
   const pendingBox = panel.querySelector(".cbg-pending");
   pendingBox.addEventListener("change", () => {
     const clean = cy.nodes('[review="clean"], [review="clean-hi"], [review="reviewed"]');
-    if (pendingBox.checked){ clean.style("display", "none"); }
-    else { clean.style("display", "element"); }
+    clean.style("display", pendingBox.checked ? "none" : "element");
+  });
+
+  const isoBox = panel.querySelector(".cbg-iso");
+  isoBox.addEventListener("change", () => {
+    const iso = cy.nodes().filter(n => n.degree(false) === 0);
+    iso.style("display", isoBox.checked ? "none" : "element");
   });
 }
 
