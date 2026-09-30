@@ -202,7 +202,10 @@ function _cbgSelect(panel, cy, node){
 
 async function renderCodebaseMap(panel){
   _cbgInjectStyle();
-  panel._cbgRenderId = (panel._cbgRenderId || 0) + 1;   // invalidates in-flight polls
+  // Bump the render id: invalidates in-flight polls AND lets a superseded render
+  // (e.g. the scope was switched before the first fetch returned) bail after its
+  // awaits instead of racing to build a second graph on the live canvas.
+  const myRenderId = panel._cbgRenderId = (panel._cbgRenderId || 0) + 1;
   if (typeof cytoscape === "undefined"){
     panel.innerHTML = `<div class="kv"><span class="err">cytoscape not loaded (vendor/cytoscape.min.js)</span></div>`;
     return;
@@ -211,6 +214,9 @@ async function renderCodebaseMap(panel){
   panel.innerHTML = `
     <div class="cbg-wrap">
       <div class="cbg-toolbar">
+        <select class="cbg-scope" title="which subsystem to map: the Python pipeline or the Electron/TS app">
+          <option value="pipeline">pipeline · py</option><option value="app">app · ts</option>
+        </select>
         <span class="cbg-target">click a module…</span>
         <select class="cbg-mode" title="sweep = breadth only (fast); deep = deep pass when the sweep is clean">
           <option value="sweep">sweep</option><option value="deep">deep (on clean)</option>
@@ -228,6 +234,18 @@ async function renderCodebaseMap(panel){
     </div>`;
   const modeSel = panel.querySelector(".cbg-mode");
   if (modeSel) modeSel.value = prevMode;
+  let storedScope = null;
+  try { storedScope = localStorage.getItem("cbg-scope"); } catch (e) { /* private mode */ }
+  const scope = panel._cbgScope || storedScope || "pipeline";   // persists across re-renders and reopens
+  const scopeSel = panel.querySelector(".cbg-scope");
+  if (scopeSel){
+    scopeSel.value = scope;
+    scopeSel.addEventListener("change", () => {
+      panel._cbgScope = scopeSel.value;
+      try { localStorage.setItem("cbg-scope", scopeSel.value); } catch (e) { /* private mode */ }
+      renderCodebaseMap(panel);
+    });
+  }
   const group = !!panel._cbgGroup;   // grouped view persists across re-renders
   const groupBox0 = panel.querySelector(".cbg-group");
   if (groupBox0) groupBox0.checked = group;
@@ -237,7 +255,7 @@ async function renderCodebaseMap(panel){
   let data, status = {}, issues = [];
   try{
     const [gr, sr, ir] = await Promise.all([
-      fetch("/api/codebase-graph"),
+      fetch(scope === "app" ? "/api/codebase-graph-ts" : "/api/codebase-graph"),
       fetch("/api/review-status"),
       fetch("/api/darkhelix-todo").catch(() => null),   // overlay only -- never fatal
     ]);
@@ -246,9 +264,11 @@ async function renderCodebaseMap(panel){
     status = sr.ok ? ((await sr.json()).status || {}) : {};
     try{ if (ir && ir.ok) issues = (await ir.json()).items || []; }catch(e){ issues = []; }
   }catch(err){
+    if (panel._cbgRenderId !== myRenderId) return;   // superseded; don't clobber the newer render
     canvas.innerHTML = `<div class="kv"><span class="err">codebase graph unavailable: ${err.message}</span></div>`;
     return;
   }
+  if (panel._cbgRenderId !== myRenderId) return;   // a newer render started while we awaited; stop
 
   // Pre-flatten each issue to a searchable haystack once (title + body).
   const issueHay = issues.map(it => ({
@@ -268,10 +288,10 @@ async function renderCodebaseMap(panel){
     const toks = _cbgIssueTokens(n);
     const nIssues = toks.length ? issueHay.filter(it => toks.some(t => it.hay.includes(t))) : [];
     if (nIssues.length) panel._cbgIssuesByNode[n.id] = nIssues;
-    // Strip the .py extension BEFORE taking the last path/dotted segment -- for a
-    // loose file id like "run_pipeline.py" or "scripts/llm/embed.py", splitting
-    // first would pop "py" as the name.
-    const base = n.id.replace(/\.py$/, "").split(/[./]/).filter(Boolean).pop();
+    // Strip the source extension BEFORE taking the last path/dotted segment -- for
+    // a loose/TS file id like "run_pipeline.py" or "src/views/report/types.ts",
+    // splitting first would pop "py"/"ts" as the name.
+    const base = n.id.replace(/\.(py|tsx?|jsx?)$/, "").split(/[./]/).filter(Boolean).pop();
     if (group) clusters.add(n.cluster);
     elements.push({ data: {
       id: n.id, label: nIssues.length ? `${base}\n⚑${nIssues.length}` : base,

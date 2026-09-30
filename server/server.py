@@ -2278,6 +2278,13 @@ CODEBASE_GRAPH_PY = "/ssdpool/coder-engine/pipeline/codebase_graph.py"
 CODEBASE_GRAPH_PACKAGE = "darkhelix"
 _codebase_graph_cache: dict = {}  # sha -> graph JSON
 
+# TS/JS side: the Electron desktop app (darkhelix-app) is a separate subsystem
+# grimp can't see. codebase_graph_ts.py emits the identical schema via
+# dependency-cruiser, so the same map renders it under a scope toggle.
+CODEBASE_GRAPH_TS_PY = "/ssdpool/coder-engine/pipeline/codebase_graph_ts.py"
+CODEBASE_GRAPH_TS_APP = "darkhelix-app"
+_codebase_graph_ts_cache: dict = {}  # sha -> graph JSON
+
 
 @app.get("/api/codebase-graph")
 async def codebase_graph() -> JSONResponse:
@@ -2306,6 +2313,33 @@ async def codebase_graph() -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=502)
     sha = data.get("generated_from") or "?"
     _codebase_graph_cache[sha] = data
+    return JSONResponse(data)
+
+
+@app.get("/api/codebase-graph-ts")
+async def codebase_graph_ts() -> JSONResponse:
+    """Import-dependency graph of the darkhelix-app Electron/TS app, in the same
+    schema as /api/codebase-graph so the CODEBASE MAP's "APP" scope renders it
+    with the identical flow/cluster view. Runs codebase_graph_ts.py (which shells
+    out to dependency-cruiser) on snarf, recursing from the renderer and main-
+    process entry points. Cached per SHA (the npx run is the slow part)."""
+    try:
+        rc, out = await _fleet_ssh(
+            "snarf",
+            f"{CODER_ENGINE_VENV_PY} {CODEBASE_GRAPH_TS_PY} "
+            f"--repo-root {shlex.quote(DARKHELIX_REPO_PATH)} "
+            f"--app {shlex.quote(CODEBASE_GRAPH_TS_APP)} "
+            f"--entry src/main.tsx --entry electron/main.ts "
+            f"--include src --include electron",
+        )
+        if rc != 0:
+            raise RuntimeError(f"exit {rc}: {out[-800:]}")
+        brace = out.find("{")
+        data = json.loads(out[brace:] if brace >= 0 else out)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    sha = data.get("generated_from") or "?"
+    _codebase_graph_ts_cache[sha] = data
     return JSONResponse(data)
 
 
