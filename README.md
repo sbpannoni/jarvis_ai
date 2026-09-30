@@ -138,6 +138,31 @@ launchd/         macOS auto-start templates with hard-won TCC + FD-limit notes
 docs/            SETUP, ARCHITECTURE (protocols/endpoints), TROUBLESHOOTING
 ```
 
+## Developing the HUD
+
+The HUD is WebGL/canvas-heavy (network map, moon terrain, bloom, the cytoscape
+CODEBASE MAP) — none of that can be verified by reading source. **Edit on the
+box that serves the HUD**, then look at the result with the headless-Chromium
+dev tool, which sets the auth cookie, `--click`s into a view, and dumps the
+browser console so page errors surface instead of being invisible:
+
+```bash
+# whole HUD:
+server/scripts/screenshot-hud.py /tmp/hud.png
+# CODEBASE MAP, default (concentric) view:
+server/scripts/screenshot-hud.py /tmp/map.png --click '[data-action="codebase-map"]' --wait 6
+# CODEBASE MAP, grouped (fcose cluster) view:
+server/scripts/screenshot-hud.py /tmp/map.png \
+  --click '[data-action="codebase-map"]' --click '.cbg-group' --wait 6
+# probe live state a screenshot can't show (e.g. cytoscape zoom/bbox):
+server/scripts/screenshot-hud.py /tmp/x.png --click '[data-action="codebase-map"]' \
+  --eval 'document.title'
+```
+
+Then read the PNG. Loop is: edit panel → `systemctl restart looking-glass` →
+re-shoot. `--eval` runs in page context and is interleaved with `--click` in the
+order given, so a probe reads state at that point in the sequence.
+
 ## Security model
 
 - The Hermes API key never reaches the browser: the HUD talks through a

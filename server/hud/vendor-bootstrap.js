@@ -25,3 +25,18 @@ window.THREE_POSTFX = {EffectComposer, RenderPass, UnrealBloomPass};
 // activate before three.js existed, silently fall back to no-terrain
 // rendering, and look like an empty black background.
 window.dispatchEvent(new Event("three3d-ready"));
+
+// Register the fcose layout extension (compound-aware force layout) for the
+// CODEBASE MAP's grouped/cluster view. Built-in cose blows compound graphs up
+// to a ~100k-px canvas (fit zoom ~0.01 -> blank), while fcose keeps clusters
+// compact and legible. cose-base + cytoscape-fcose are UMD classic scripts
+// loaded before this module, so their globals are already on window.
+if (window.cytoscape && window.cytoscapeFcose) {
+  window.cytoscape.use(window.cytoscapeFcose);
+}
+// dagre: layered (hierarchical) layout used for the CODEBASE MAP's directional
+// "flow" view, which ranks modules by dependency depth so the graph reads as a
+// left-to-right subway line instead of a radial hairball.
+if (window.cytoscape && window.cytoscapeDagre) {
+  window.cytoscape.use(window.cytoscapeDagre);
+}

@@ -19,6 +19,13 @@
 <script src="vendor/xterm-addon-fit.js"></script>
 <script src="vendor/3d-force-graph.min.js"></script>
 <script src="vendor/cytoscape.min.js"></script>
+<!-- fcose layout stack, load order matters: layout-base <- cose-base <- fcose -->
+<script src="vendor/layout-base.min.js"></script>
+<script src="vendor/cose-base.min.js"></script>
+<script src="vendor/cytoscape-fcose.min.js"></script>
+<!-- dagre layered layout for the CODEBASE MAP's directional flow (subway) view -->
+<script src="vendor/dagre.min.js"></script>
+<script src="vendor/cytoscape-dagre.min.js"></script>
 <script type="module" src="vendor-bootstrap.js"></script>
 </head>
 <body>

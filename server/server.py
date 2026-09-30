@@ -2292,7 +2292,11 @@ async def codebase_graph() -> JSONResponse:
             f"{CODER_ENGINE_VENV_PY} {CODEBASE_GRAPH_PY} "
             f"--package {shlex.quote(CODEBASE_GRAPH_PACKAGE)} "
             f"--root {shlex.quote(DARKHELIX_REPO_PATH)} "
-            f"--extra-tree scripts",
+            f"--extra-tree scripts "
+            # run_pipeline.py is the repo-root entry point (outside the package and
+            # scripts/); including it puts the true head of the flow on the map and
+            # connects modules only it reaches (e.g. darkhelix.ui_registry).
+            f"--extra-file run_pipeline.py",
         )
         if rc != 0:
             raise RuntimeError(f"exit {rc}: {out[-800:]}")

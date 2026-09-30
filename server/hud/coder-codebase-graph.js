@@ -47,6 +47,26 @@ function _cbgInjectStyle(){
   document.head.appendChild(s);
 }
 
+// Park standalone modules (no static import edges -- almost all scripts/ entry
+// points) in a tidy vertical rail just left of the flow, with a rotated header,
+// so they stay visible without stretching or cluttering the dependency flow.
+function _cbgRailIsolated(cy, iso, flow){
+  if (!iso || iso.length === 0) return;
+  const bb = flow.length ? flow.boundingBox() : { x1: 0, y1: 0, h: 600 };
+  const gapY = 30, colW = 46;
+  const rows = Math.max(1, Math.floor((bb.h || 600) / gapY));
+  const railRight = bb.x1 - 90;   // sit just left of the flow's left edge
+  iso.forEach((n, i) => {
+    const col = Math.floor(i / rows), row = i % rows;
+    n.addClass("cbg-rail");
+    n.position({ x: railRight - col * colW, y: bb.y1 + row * gapY });
+  });
+  const cols = Math.ceil(iso.length / rows);
+  cy.add({ group: "nodes", classes: "cbg-railhead",
+    data: { id: "cbg:railhead", label: "SCRIPTS · ENTRY POINTS", isParent: false, fan_in: 0 },
+    position: { x: railRight - (cols - 1) * colW / 2, y: bb.y1 - 46 } });
+}
+
 function _cbgClusterColor(cluster){
   let h = 0;
   for (let i = 0; i < cluster.length; i++) h = (h * 31 + cluster.charCodeAt(i)) >>> 0;
@@ -240,13 +260,18 @@ async function renderCodebaseMap(panel){
   const maxFanIn = Math.max(1, ...data.nodes.map(n => n.fan_in));
   const elements = [];
   const clusters = new Set();
+  const clusterColorById = {};   // node id -> its cluster color, for tinting edges into "lines"
+  for (const n of data.nodes) clusterColorById[n.id] = _cbgClusterColor(n.cluster);
   for (const n of data.nodes){
     const rec = n.file ? status[n.file] : null;
     const stale = !!(rec && rec.file_sha && n.last_commit && rec.file_sha !== n.last_commit);
     const toks = _cbgIssueTokens(n);
     const nIssues = toks.length ? issueHay.filter(it => toks.some(t => it.hay.includes(t))) : [];
     if (nIssues.length) panel._cbgIssuesByNode[n.id] = nIssues;
-    const base = n.id.split(/[./]/).filter(Boolean).pop().replace(/\.py$/, "");
+    // Strip the .py extension BEFORE taking the last path/dotted segment -- for a
+    // loose file id like "run_pipeline.py" or "scripts/llm/embed.py", splitting
+    // first would pop "py" as the name.
+    const base = n.id.replace(/\.py$/, "").split(/[./]/).filter(Boolean).pop();
     if (group) clusters.add(n.cluster);
     elements.push({ data: {
       id: n.id, label: nIssues.length ? `${base}\n⚑${nIssues.length}` : base,
@@ -266,7 +291,12 @@ async function renderCodebaseMap(panel){
     }});
   }
   for (const e of data.edges){
-    elements.push({ data: { id: `${e.source}__${e.target}`, source: e.source, target: e.target } });
+    elements.push({ data: {
+      id: `${e.source}__${e.target}`, source: e.source, target: e.target,
+      // Tint each edge by the cluster it leaves, so the flow view reads as a set
+      // of colored subway lines rather than one grey web.
+      lineColor: clusterColorById[e.source] || "rgba(140,190,235,.55)",
+    } });
   }
 
   const cy = cytoscape({
@@ -279,6 +309,9 @@ async function renderCodebaseMap(panel){
         "label": "data(label)", "font-size": 9, "color": "#dfe8f5",
         "text-valign": "center", "text-halign": "center",
         "text-wrap": "wrap",
+        // Labels are hidden by default; only "major stations" (busiest hubs) and
+        // the hovered node reveal their name, so the overview stays legible.
+        "text-opacity": 0,
         "text-outline-width": 2, "text-outline-color": "#0a0f1a",
         "width": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
         "height": `mapData(fan_in, 0, ${maxFanIn}, 20, 74)`,
@@ -294,15 +327,44 @@ async function renderCodebaseMap(panel){
       // node can show its review state and "has open issues" at once.
       { selector: "node[issues_n > 0]", style: {
         "outline-color": "#f5a623", "outline-width": 3, "outline-offset": 2 } },
-      { selector: "edge", style: {
+      // Flow (subway) view uses right-angled "round-taxi" routing so edges read
+      // as transit lines along the left-to-right dependency spine; the grouped
+      // view keeps soft bezier curves inside its cluster boxes.
+      { selector: "edge", style: group ? {
         "width": 1, "line-color": "rgba(150,180,220,.35)",
         "target-arrow-color": "rgba(150,180,220,.5)", "target-arrow-shape": "triangle",
         "arrow-scale": 0.7, "curve-style": "bezier",
+      } : {
+        "width": 2, "line-color": "data(lineColor)", "line-opacity": 0.5,
+        "target-arrow-color": "data(lineColor)", "target-arrow-shape": "triangle",
+        "arrow-scale": 0.55, "curve-style": "round-taxi",
+        "taxi-direction": "vertical", "taxi-turn": "40%", "taxi-turn-min-distance": 6,
+        "taxi-radius": 10,
       }},
       { selector: ".cbg-faded", style: { "opacity": 0.12 } },
-      { selector: "node.cbg-hl", style: { "border-color": "var(--cyan,#5cf)" } },
+      // Named stations: the busiest hubs (cbg-major) always show their label; any
+      // node reveals its name on hover (cbg-hover). Label sits below the station
+      // on a chip so it reads like a metro stop.
+      { selector: "node.cbg-major, node.cbg-hover", style: {
+        "text-opacity": 1, "font-size": 12, "text-valign": "bottom", "text-margin-y": 4,
+        "text-background-color": "#0a0f1a", "text-background-opacity": 0.72,
+        "text-background-padding": 3, "text-background-shape": "roundrectangle",
+        "text-outline-width": 0, "color": "#eaf2ff", "z-index": 30,
+      }},
+      // The corralled "scripts / entry-points" rail: standalone modules nothing
+      // imports (grimp sees no static edge), parked out of the flow.
+      { selector: "node.cbg-rail", style: { "background-opacity": 0.75 } },
+      { selector: "node.cbg-railhead", style: {
+        "shape": "round-rectangle", "background-opacity": 0, "border-width": 0,
+        "text-opacity": 1, "label": "data(label)", "font-size": 12,
+        "text-valign": "center", "text-halign": "center", "color": "#7f93ad",
+        "text-outline-width": 0, "text-rotation": "-90deg", "events": "no",
+      }},
+      // cytoscape's stylesheet parser can't resolve CSS var(); use literal hex
+      // like the rest of this sheet, or the highlight silently keeps its base color.
+      { selector: "node.cbg-hl", style: { "border-color": "#5cf" } },
       { selector: "edge.cbg-hl", style: {
-        "line-color": "var(--cyan,#5cf)", "target-arrow-color": "var(--cyan,#5cf)",
+        "line-color": "#5cf", "target-arrow-color": "#5cf",
         "width": 2, "opacity": 1 } },
       // Cluster boxes (grouped view) -- last so it wins the base-node props for
       // parents; the attribute-gated review/issue selectors never match them.
@@ -314,19 +376,46 @@ async function renderCodebaseMap(panel){
         "padding": "14px", "text-margin-y": -2,
       }},
     ],
-    layout: group ? {
-      name: "cose", animate: false, nodeDimensionsIncludeLabels: true,
-      idealEdgeLength: 55, nodeRepulsion: 9000, nestingFactor: 1.15,
-      gravity: 0.7, numIter: 1200, padding: 24,
-    } : {
-      name: "concentric",
-      concentric: n => n.data("fan_in"),
-      levelWidth: () => Math.max(1, Math.round(maxFanIn / 6)),
-      minNodeSpacing: 26, spacingFactor: 1.1, animate: false,
-    },
+    // Layout is run manually below (per view) so the flow view can lay out only
+    // the connected graph and then corral standalone scripts into a side rail.
+    layout: { name: "preset" },
   });
 
   panel._cbgCy = cy;   // so _cbgRunReview / poll can touch the live graph
+
+  if (group) {
+    // fcose (registered in vendor-bootstrap.js) is compound-aware and keeps
+    // cluster boxes compact. Built-in cose blew this same graph up to a
+    // ~100k-px canvas (fit zoom ~0.01 -> sub-pixel nodes, blank canvas).
+    cy.layout({ name: "fcose", animate: false, fit: true, padding: 30,
+      quality: "default", nodeDimensionsIncludeLabels: true,
+      idealEdgeLength: 60, nodeRepulsion: 4500, gravity: 0.25,
+      gravityCompound: 1.0, nestingFactor: 0.1 }).run();
+  } else {
+    // Flow view. Standalone modules (grimp finds no static import either way --
+    // almost all are scripts/ entry points) carry no flow, so lay out only the
+    // connected graph with dagre, then park the rest in a labeled side rail.
+    const iso = cy.nodes().filter(n => !n.data("isParent") && n.degree(false) === 0);
+    const flow = cy.elements().not(iso);
+    // Name the busiest hubs as "major stations" (always-on labels): the top hubs
+    // by fan-in (most depended-on) plus the top roots by fan-out (entry points
+    // like run_pipeline.py, whose significance is what they pull in, not fan-in).
+    const real = cy.nodes().filter(n => !n.data("isParent")).toArray();
+    const byIn = [...real].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0)).slice(0, 8);
+    const byOut = [...real].sort((a, b) => (b.data("fan_out") || 0) - (a.data("fan_out") || 0)).slice(0, 2);
+    cy.collection([...byIn, ...byOut]).addClass("cbg-major");
+    // dagre layered layout: rank modules by dependency depth so the graph reads
+    // as a top-to-bottom flow (entry points up top, the core modules they pull
+    // in below) instead of a radial hairball. dagre breaks cycles automatically.
+    const lay = flow.layout({ name: "dagre", rankDir: "TB", animate: false, fit: false,
+      nodeSep: 26, edgeSep: 10, rankSep: 80, ranker: "network-simplex" });
+    lay.one("layoutstop", () => { _cbgRailIsolated(cy, iso, flow); cy.fit(undefined, 30); });
+    lay.run();
+  }
+
+  // Reveal any node's name on hover (major stations show theirs already).
+  cy.on("mouseover", "node", evt => { if (!evt.target.data("isParent")) evt.target.addClass("cbg-hover"); });
+  cy.on("mouseout", "node", evt => evt.target.removeClass("cbg-hover"));
   cy.on("tap", "node", evt => _cbgSelect(panel, cy, evt.target));
   cy.on("tap", evt => { if (evt.target === cy){
     cy.elements().removeClass("cbg-faded cbg-hl");
