@@ -104,7 +104,7 @@ async function renderCodebaseMap(panel){
         <label title="hide modules that reviewed clean"><input type="checkbox" class="cbg-pending"> pending only</label>
         <label title="hide standalone modules with no internal dependencies"><input type="checkbox" class="cbg-iso"> hide unconnected</label>
         <span class="cbg-status"></span>
-        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed · size = blast radius</span>
+        <span class="cbg-hint"><span class="cbg-dot" style="background:#f66"></span>findings<span class="cbg-dot" style="background:#6e6"></span>clean<span class="cbg-dot" style="background:#556"></span>unreviewed · dashed = changed since review · size = blast radius</span>
       </div>
       <div class="cbg-canvas"></div>
     </div>`;
@@ -128,11 +128,12 @@ async function renderCodebaseMap(panel){
   const elements = [];
   for (const n of data.nodes){
     const rec = n.file ? status[n.file] : null;
+    const stale = !!(rec && rec.file_sha && n.last_commit && rec.file_sha !== n.last_commit);
     elements.push({ data: {
       id: n.id, label: n.id.split(/[./]/).filter(Boolean).pop().replace(/\.py$/, ""),
       file: n.file, fan_in: n.fan_in, fan_out: n.fan_out, cluster: n.cluster,
       color: _cbgClusterColor(n.cluster), review: _cbgReviewState(rec),
-      findings_n: rec ? (rec.findings || 0) : 0,
+      findings_n: rec ? (rec.findings || 0) : 0, stale: stale,
     }});
   }
   for (const e of data.edges){
@@ -157,6 +158,7 @@ async function renderCodebaseMap(panel){
       { selector: 'node[review="clean"]', style: { "border-color": "#6e6", "border-width": 3 } },
       { selector: 'node[review="clean-hi"]', style: { "border-color": "#7f7", "border-width": 4 } },
       { selector: 'node[review="unreviewed"]', style: { "border-color": "rgba(120,130,160,.5)" } },
+      { selector: "node[?stale]", style: { "border-style": "dashed" } },
       { selector: "edge", style: {
         "width": 1, "line-color": "rgba(150,180,220,.35)",
         "target-arrow-color": "rgba(150,180,220,.5)", "target-arrow-shape": "triangle",
