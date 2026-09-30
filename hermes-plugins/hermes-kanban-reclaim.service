@@ -1,0 +1,7 @@
+[Unit]
+Description=Reclaim orphaned Hermes kanban claims (running cards whose worker died)
+After=hermes-dashboard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/hermes-agent/venv/bin/python3 /root/.hermes/scripts/reclaim_orphaned_claims.py
