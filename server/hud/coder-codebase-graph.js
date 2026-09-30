@@ -47,24 +47,52 @@ function _cbgInjectStyle(){
   document.head.appendChild(s);
 }
 
-// Park standalone modules (no static import edges -- almost all scripts/ entry
-// points) in a tidy vertical rail just left of the flow, with a rotated header,
-// so they stay visible without stretching or cluttering the dependency flow.
-function _cbgRailIsolated(cy, iso, flow){
-  if (!iso || iso.length === 0) return;
-  const bb = flow.length ? flow.boundingBox() : { x1: 0, y1: 0, h: 600 };
-  const gapY = 30, colW = 46;
-  const rows = Math.max(1, Math.floor((bb.h || 600) / gapY));
-  const railRight = bb.x1 - 90;   // sit just left of the flow's left edge
-  iso.forEach((n, i) => {
-    const col = Math.floor(i / rows), row = i % rows;
-    n.addClass("cbg-rail");
-    n.position({ x: railRight - col * colW, y: bb.y1 + row * gapY });
-  });
-  const cols = Math.ceil(iso.length / rows);
-  cy.add({ group: "nodes", classes: "cbg-railhead",
-    data: { id: "cbg:railhead", label: "SCRIPTS · ENTRY POINTS", isParent: false, fan_in: 0 },
-    position: { x: railRight - (cols - 1) * colW / 2, y: bb.y1 - 46 } });
+// Swimlanes: after dagre has ranked modules by dependency depth (the y axis, the
+// top-to-bottom flow), reassign x so every cluster occupies its OWN disjoint
+// vertical lane. dagre keeps a lineage together but its cluster bounding boxes
+// still overlap because clusters span many depths; pinning each cluster to a lane
+// makes the compound parents render as clean, non-overlapping category bands while
+// the depth flow is preserved. Cross-lane edges are the inter-category deps.
+function _cbgSwimlanes(cy){
+  const reals = cy.nodes().filter(n => !n.data("isParent"));
+  if (reals.length === 0) return;
+  const avgY = arr => arr.reduce((s, n) => s + n.position("y"), 0) / arr.length;
+  const byCluster = {};
+  reals.forEach(n => { (byCluster[n.data("cluster")] = byCluster[n.data("cluster")] || []).push(n); });
+  // Order lanes left-to-right by average dependency depth (upstream/entry clusters
+  // first), tie-broken by size, so the eye still reads a pipeline progression.
+  const clusters = Object.keys(byCluster).sort((a, b) =>
+    (avgY(byCluster[a]) - avgY(byCluster[b])) || (byCluster[b].length - byCluster[a].length));
+  const NODE_DX = 48, ROW_H = 64, LANE_GAP = 84;
+  let x = 0;
+  for (const c of clusters){
+    const members = byCluster[c];
+    // Re-rank locally within the lane (from dagre's depth order) so every lane
+    // starts at the top -- compact side-by-side columns instead of a diagonal
+    // staircase, while intra-cluster dependency order is preserved.
+    const ys = [...new Set(members.map(n => Math.round(n.position("y"))))].sort((p, q) => p - q);
+    const buckets = {};   // local rank -> nodes
+    members.forEach(n => { const r = ys.indexOf(Math.round(n.position("y"))); (buckets[r] = buckets[r] || []).push(n); });
+    const maxPer = Math.max(...Object.values(buckets).map(b => b.length));
+    const laneW = Math.max(1, maxPer) * NODE_DX;
+    for (const r of Object.keys(buckets)){
+      const arr = buckets[r].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0));
+      arr.forEach((n, i) => {
+        const off = (i - (arr.length - 1) / 2) * NODE_DX;
+        n.position({ x: x + laneW / 2 + off, y: Number(r) * ROW_H });
+      });
+    }
+    x += laneW + LANE_GAP;
+  }
+}
+
+// Broad category from a fine cluster id: the first two path/dotted segments
+// (darkhelix.collab -> darkhelix/collab, src/components/viz3d -> src/components).
+// This is the banding/coloring unit -- coarser than the raw cluster so the flow
+// reads as a handful of broad pipeline areas, not dozens of leaf directories.
+function _cbgCategory(cluster){
+  const parts = String(cluster).split(/[./]/).filter(Boolean);
+  return parts.slice(0, 2).join("/") || String(cluster);
 }
 
 function _cbgClusterColor(cluster){
@@ -280,8 +308,15 @@ async function renderCodebaseMap(panel){
   const maxFanIn = Math.max(1, ...data.nodes.map(n => n.fan_in));
   const elements = [];
   const clusters = new Set();
-  const clusterColorById = {};   // node id -> its cluster color, for tinting edges into "lines"
-  for (const n of data.nodes) clusterColorById[n.id] = _cbgClusterColor(n.cluster);
+  // Broad category per node, merging tiny categories (<3 members) up into their
+  // top-level segment so the banding stays to a handful of meaningful areas.
+  const rawCat = {};
+  for (const n of data.nodes) rawCat[n.id] = _cbgCategory(n.cluster);
+  const catCount = {};
+  for (const id in rawCat) catCount[rawCat[id]] = (catCount[rawCat[id]] || 0) + 1;
+  const catOf = id => (catCount[rawCat[id]] >= 3 ? rawCat[id] : (rawCat[id].split("/")[0] || rawCat[id]));
+  const clusterColorById = {};   // node id -> its category color, for tinting edges into "lines"
+  for (const n of data.nodes) clusterColorById[n.id] = _cbgClusterColor(catOf(n.id));
   for (const n of data.nodes){
     const rec = n.file ? status[n.file] : null;
     const stale = !!(rec && rec.file_sha && n.last_commit && rec.file_sha !== n.last_commit);
@@ -292,18 +327,23 @@ async function renderCodebaseMap(panel){
     // a loose/TS file id like "run_pipeline.py" or "src/views/report/types.ts",
     // splitting first would pop "py"/"ts" as the name.
     const base = n.id.replace(/\.(py|tsx?|jsx?)$/, "").split(/[./]/).filter(Boolean).pop();
-    if (group) clusters.add(n.cluster);
+    const cat = catOf(n.id);
+    clusters.add(cat);
     elements.push({ data: {
       id: n.id, label: nIssues.length ? `${base}\n⚑${nIssues.length}` : base,
-      file: n.file, fan_in: n.fan_in, fan_out: n.fan_out, cluster: n.cluster,
-      color: _cbgClusterColor(n.cluster), review: _cbgReviewState(rec),
+      file: n.file, fan_in: n.fan_in, fan_out: n.fan_out, cluster: cat,
+      color: _cbgClusterColor(cat), review: _cbgReviewState(rec),
       findings_n: rec ? (rec.findings || 0) : 0, stale: stale,
       issues_n: nIssues.length,
-      parent: group ? `cluster:${n.cluster}` : undefined,
+      // Compound in BOTH views: the flow view lays categories out with dagre so
+      // lineages stay together under a labeled category band; the grouped view
+      // packs them tight with fcose. Membership is the same either way.
+      parent: `cluster:${cat}`,
     }});
   }
-  // Compound super-node per cluster (grouped view only). fan_in:0 keeps the
-  // fan-in size mapData off NaN; cytoscape auto-fits a parent to its children.
+  // Compound super-node per cluster. fan_in:0 keeps the fan-in size mapData off
+  // NaN; cytoscape auto-fits a parent to its children. Rendered as a tinted,
+  // labeled band behind the flow (or a box in the grouped view).
   for (const c of clusters){
     elements.push({ data: {
       id: `cluster:${c}`, label: c, isParent: true, fan_in: 0,
@@ -371,29 +411,25 @@ async function renderCodebaseMap(panel){
         "text-background-padding": 3, "text-background-shape": "roundrectangle",
         "text-outline-width": 0, "color": "#eaf2ff", "z-index": 30,
       }},
-      // The corralled "scripts / entry-points" rail: standalone modules nothing
-      // imports (grimp sees no static edge), parked out of the flow.
-      { selector: "node.cbg-rail", style: { "background-opacity": 0.75 } },
-      { selector: "node.cbg-railhead", style: {
-        "shape": "round-rectangle", "background-opacity": 0, "border-width": 0,
-        "text-opacity": 1, "label": "data(label)", "font-size": 12,
-        "text-valign": "center", "text-halign": "center", "color": "#7f93ad",
-        "text-outline-width": 0, "text-rotation": "-90deg", "events": "no",
-      }},
       // cytoscape's stylesheet parser can't resolve CSS var(); use literal hex
       // like the rest of this sheet, or the highlight silently keeps its base color.
       { selector: "node.cbg-hl", style: { "border-color": "#5cf" } },
       { selector: "edge.cbg-hl", style: {
         "line-color": "#5cf", "target-arrow-color": "#5cf",
         "width": 2, "opacity": 1 } },
-      // Cluster boxes (grouped view) -- last so it wins the base-node props for
-      // parents; the attribute-gated review/issue selectors never match them.
+      // Category bands (behind the flow) / cluster boxes (grouped view) -- last so
+      // it wins the base-node props for parents; the attribute-gated review/issue
+      // selectors never match them. Tinted fill + a bold header in the category
+      // color so each broad area reads at a glance.
       { selector: "node[?isParent]", style: {
-        "background-color": "data(color)", "background-opacity": 0.09,
+        "background-color": "data(color)", "background-opacity": 0.10,
         "shape": "round-rectangle", "border-width": 1, "border-color": "data(color)",
+        "border-opacity": 0.55,
         "label": "data(label)", "text-valign": "top", "text-halign": "center",
-        "font-size": 11, "color": "#9fb3cc", "text-outline-width": 0,
-        "padding": "14px", "text-margin-y": -2,
+        "font-size": 15, "font-weight": "bold", "color": "data(color)",
+        "text-outline-width": 2, "text-outline-color": "#060a12",
+        "text-transform": "uppercase", "min-zoomed-font-size": 5,
+        "padding": "16px", "text-margin-y": -4, "events": "no",
       }},
     ],
     // Layout is run manually below (per view) so the flow view can lay out only
@@ -412,24 +448,21 @@ async function renderCodebaseMap(panel){
       idealEdgeLength: 60, nodeRepulsion: 4500, gravity: 0.25,
       gravityCompound: 1.0, nestingFactor: 0.1 }).run();
   } else {
-    // Flow view. Standalone modules (grimp finds no static import either way --
-    // almost all are scripts/ entry points) carry no flow, so lay out only the
-    // connected graph with dagre, then park the rest in a labeled side rail.
-    const iso = cy.nodes().filter(n => !n.data("isParent") && n.degree(false) === 0);
-    const flow = cy.elements().not(iso);
-    // Name the busiest hubs as "major stations" (always-on labels): the top hubs
-    // by fan-in (most depended-on) plus the top roots by fan-out (entry points
-    // like run_pipeline.py, whose significance is what they pull in, not fan-in).
+    // Flow view. Name the busiest hubs as "major stations" (always-on labels):
+    // top hubs by fan-in (most depended-on) plus top roots by fan-out (entry
+    // points like run_pipeline.py, whose significance is what they pull in).
     const real = cy.nodes().filter(n => !n.data("isParent")).toArray();
     const byIn = [...real].sort((a, b) => (b.data("fan_in") || 0) - (a.data("fan_in") || 0)).slice(0, 8);
     const byOut = [...real].sort((a, b) => (b.data("fan_out") || 0) - (a.data("fan_out") || 0)).slice(0, 2);
     cy.collection([...byIn, ...byOut]).addClass("cbg-major");
-    // dagre layered layout: rank modules by dependency depth so the graph reads
-    // as a top-to-bottom flow (entry points up top, the core modules they pull
-    // in below) instead of a radial hairball. dagre breaks cycles automatically.
-    const lay = flow.layout({ name: "dagre", rankDir: "TB", animate: false, fit: false,
-      nodeSep: 26, edgeSep: 10, rankSep: 80, ranker: "network-simplex" });
-    lay.one("layoutstop", () => { _cbgRailIsolated(cy, iso, flow); cy.fit(undefined, 30); });
+    // Rank by dependency depth with dagre on the modules only (parents excluded,
+    // so ranking isn't perturbed by cluster boxes), then pin each cluster to its
+    // own vertical lane so the compound parents become clean category bands. dagre
+    // breaks import cycles automatically.
+    const noParents = cy.elements().filter(e => !e.data("isParent"));
+    const lay = noParents.layout({ name: "dagre", rankDir: "TB", animate: false, fit: false,
+      nodeSep: 18, edgeSep: 8, rankSep: 70, ranker: "network-simplex" });
+    lay.one("layoutstop", () => { _cbgSwimlanes(cy); cy.fit(undefined, 30); });
     lay.run();
   }
 
