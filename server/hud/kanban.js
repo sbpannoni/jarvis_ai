@@ -301,6 +301,18 @@ function kbVerifyControl(t){
      title="Static pre-merge trust check: does this integration add tests for its new code, and did it avoid weakening existing tests? Run it before Merge — CI runs the tests during Merge.">✓ Verify</button>`;
 }
 
+/* Agentic (semantic) review for an [Integrate] card: hand it to Hermes's review
+   lane, which judges coherence, test quality and regressions -- the check CI and
+   the static Verify can't. Offered after the branch exists, before Merge. */
+function kbReviewControl(t){
+  if(!(t.title || "").startsWith("[Integrate]")) return "";
+  if((kbDiffstats[t.id] || 0) <= 0) return "";
+  const pr = kbPrs[t.id];
+  if(pr && (pr.state === "MERGED" || pr.state === "OPEN")) return "";
+  return `<button class="btn kb-card-btn kb-review" data-action="request-review" data-id="${kanbanEsc(t.id)}"
+     title="Agentic review: send this integration to Hermes's review lane, where a review agent judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. The semantic check Verify (static) and CI (mechanical) can't make.">⇄ Review</button>`;
+}
+
 /* Is this done card the merge target for its family -- i.e. the integrating
    card whose branch subsumes the siblings? Highest commit count wins, then a
    card that already has a PR, then id. Used to put the family's single Merge on
@@ -375,7 +387,7 @@ function kbCardInner(t, opts){
             : "")
         // Landing state (merged/merging/landing/Merge) -- shared with family heads.
         // Suppressed on a family member: the family merges as one via its head.
-        + (noMerge ? "" : kbVerifyControl(t) + kbMergeControl(t))
+        + (noMerge ? "" : kbVerifyControl(t) + kbReviewControl(t) + kbMergeControl(t))
         // Left reference files in pool-staging -> Promote them into the shared
         // pool (the data counterpart to Merge; code lands via git, data via this).
         + ((kbStaged[t.id] > 0)
@@ -522,7 +534,7 @@ function kbRenderDoneGrouped(listEl, tasks){
         <span class="kb-fam-toggle">${open ? "▾" : "▸"}</span>
         <span class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</span>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
-        ${kbVerifyControl(lead)}${kbMergeControl(lead)}${integrateBtn}
+        ${kbVerifyControl(lead)}${kbReviewControl(lead)}${kbMergeControl(lead)}${integrateBtn}
       </div>
       <div class="kb-family-members"${open ? "" : " hidden"}>${ordered.map(t => card(t, {noMerge: true})).join("")}</div>
     </div>`);
@@ -694,6 +706,28 @@ async function kbLandCard(panel, btn){
     btn.textContent = "landing → PR + CI…";
     btn.title = "PR opened; waiting on CI, squash-merges if green (up to ~30m). Watch the card: it moves to blocked with a reason if CI fails, and the branch/badge clear when it merges.";
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
+}
+
+/* Agentic (semantic) review of the finished integration: a reviewer model judges
+   the whole diff against the card's spec -- coherence, whether the new tests are
+   meaningful, and regressions. It's a multi-minute model run, so it runs in the
+   BACKGROUND and the verdict (approve/request_changes/escalate + rationale) is
+   posted as a card comment. A report, not an action: nothing is merged or moved;
+   you read the comment, then Verify/Merge. */
+async function kbRequestReview(panel, btn){
+  if(!confirm("Run an agentic review of this integration?\n\nA reviewer model judges spec adherence, whether the new tests are meaningful, and regressions. It runs in the background (several minutes) and posts the verdict as a comment on this card. Nothing is merged or moved.")) return;
+  btn.disabled = true;
+  btn.textContent = "reviewing…";
+  try{
+    const r = await fetch("/api/darkhelix/request-review", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "review failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "⟳ reviewing…";
+    btn.title = `Review running (${j.model || "reviewer"}); the verdict will post as a comment on this card in a few minutes.`;
+  }catch(err){ btn.disabled = false; btn.textContent = "review failed — retry"; btn.title = err.message; }
 }
 
 /* Run the static pre-merge trust check and report the verdict in place. A
@@ -896,6 +930,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
         if(btn.dataset.action === "verify"){ kbVerify(panel, btn); return; }
+        if(btn.dataset.action === "request-review"){ kbRequestReview(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;

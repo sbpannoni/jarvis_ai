@@ -3997,6 +3997,85 @@ async def darkhelix_verify_integration(request: Request) -> JSONResponse:
                          "reason": "; ".join(reasons) or "tests present, no tamper"})
 
 
+
+
+INTEGRATION_REVIEW_PY = "/ssdpool/coder-engine/pipeline/dispatch_integration_review_task.py"
+_REVIEW_TASKS: set = set()
+
+
+@app.post("/api/darkhelix/request-review")
+async def darkhelix_request_review(request: Request) -> JSONResponse:
+    """The semantic gate: an agentic review of a DONE card's whole diff against
+    its spec -- coherence, whether the new behaviour has meaningful tests, and
+    regressions. The judgment CI (does it pass) and the static Verify (do tests
+    exist / was any tampered) cannot make.
+
+    Post-hoc by design (Hermes's `review` lane only accepts running/ready cards;
+    this gate runs on the finished branch before Merge). Dispatches
+    dispatch_integration_review_task.py on snarf against `hermes/<id>` with the
+    card's body as the spec -- a real reviewer-model call, read-only. Reports the
+    verdict and posts it as a card comment; it does not merge or move the card."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    try:
+        rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
+        model = json.loads(out0).get("reviewer") if rc0 == 0 else None
+    except Exception:
+        model = None
+    if not model:
+        return JSONResponse({"ok": False, "error": "could not resolve reviewer's assigned model"},
+                            status_code=502)
+    try:
+        detail = await _kanban_task_detail(task_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"board unreadable: {exc}"}, status_code=502)
+    task = detail.get("task") or {}
+    spec = _DISPATCH_TARGET_RE.sub("", task.get("body") or "").strip() or (task.get("title") or task_id)
+    cmd = (
+        f"{CODER_ENGINE_VENV_PY} {INTEGRATION_REVIEW_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--branch-name {shlex.quote('hermes/' + task_id)} "
+        f"--base-ref origin/master --model {shlex.quote(model)} "
+        f"--spec {shlex.quote(spec[:8000])}"
+    )
+    # The reviewer model is a multi-minute llama.cpp generation (plus a possible
+    # seat swap), well past any HTTP window -- and a blocking call would orphan
+    # the run on client disconnect. So fire it in the background (same shape as
+    # land-auto) and land the verdict as a card comment; the button only reports
+    # that review STARTED.
+    async def _run() -> None:
+        try:
+            rc, out = await _fleet_ssh("snarf", cmd)
+            result = _extract_json(out)
+            if result and result.get("status") == "done":
+                regr = result.get("regressions") or []
+                comment = (
+                    f"Integration review ({model}) → {result.get('verdict')}\n\n"
+                    f"Spec adherence: {result.get('spec_adherence', '')}\n"
+                    f"Tests meaningful: {result.get('tests_meaningful')}\n"
+                    + (("Regressions:\n" + "\n".join(f"- {r}" for r in regr) + "\n") if regr else "")
+                    + f"\n{result.get('rationale', '')}"
+                )
+            else:
+                comment = ("Integration review could not produce a verdict: "
+                           + ((result or {}).get("error") or out[-800:]))
+            await _kanban_ssh(f"hermes kanban comment {shlex.quote(task_id)} {shlex.quote(comment[:4000])}")
+        except Exception as exc:
+            try:
+                await _kanban_ssh(f"hermes kanban comment {shlex.quote(task_id)} "
+                                  f"{shlex.quote('Integration review failed to run: ' + str(exc)[:500])}")
+            except Exception:
+                pass
+        finally:
+            _REVIEW_TASKS.discard(asyncio.current_task())
+
+    t = asyncio.get_running_loop().create_task(_run())
+    _REVIEW_TASKS.add(t)
+    return JSONResponse({"ok": True, "started": True, "task_id": task_id, "model": model})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher
