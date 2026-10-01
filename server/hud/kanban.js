@@ -314,23 +314,27 @@ function kbVerifyControl(t){
    lane, which judges coherence, test quality and regressions -- the check CI and
    the static Verify can't. Offered after the branch exists, before Merge. */
 function kbReviewControl(t){
-  if(!(t.title || "").startsWith("[Integrate]")) return "";
-  if((kbDiffstats[t.id] || 0) <= 0) return "";
-  const pr = kbPrs[t.id];
-  if(pr && (pr.state === "MERGED" || pr.state === "OPEN")) return "";
-  // Live state: running -> verdict. A running review shows (so it isn't silent);
-  // a non-approve verdict surfaces a one-click "Fix issues" to close the loop.
-  if(kbReviewing.indexOf(t.id) !== -1)
+  if(t.status !== "done") return "";
+  const id = t.id;
+  // Review STATE shows for any reviewed card -- including a merged one, so a card
+  // that merged with review errors stays visible and actionable (not buried).
+  if(kbReviewing.indexOf(id) !== -1)
     return `<span class="kb-chip kb-merging" title="Agentic review running — the verdict posts as a card comment and appears here in a minute.">⟳ reviewing…</span>`;
-  const v = kbReviews[t.id];
+  const v = kbReviews[id];
   if(v === "approve")
-    return `<span class="kb-chip kb-merged" title="Agentic review: approved — see the card comment for detail. Safe to Merge.">review ✓</span>`;
+    return `<span class="kb-chip kb-merged" title="Agentic review: approved — see the card comment for detail.">review ✓</span>`;
   if(v === "request_changes" || v === "escalate")
-    return `<span class="kb-chip kb-nodiff" title="Agentic review: ${v} — read the card comment. Use 'Fix issues' to dispatch an editor to address it.">review ⚠ ${v === "escalate" ? "escalate" : "changes"}</span>`
-      + `<button class="btn kb-card-btn kb-fix" data-action="fix-review" data-id="${kanbanEsc(t.id)}"
-           title="Dispatch an editor to address the review's requested changes, continuing from this branch (files a [Fix] card and runs it). Re-review and re-Verify the result before Merge.">↻ Fix issues</button>`;
-  return `<button class="btn kb-card-btn kb-review" data-action="request-review" data-id="${kanbanEsc(t.id)}"
-     title="Agentic review: a reviewer model judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. Runs in the background (a few min); the verdict posts as a comment and shows here. The semantic check Verify (static) and CI (mechanical) can't make.">⇄ Review</button>`;
+    return `<span class="kb-chip kb-nodiff" title="Agentic review: ${v} — read the card comment. 'Fix issues' dispatches an editor to address it (from master if this already merged).">review ⚠ ${v === "escalate" ? "escalate" : "changes"}</span>`
+      + `<button class="btn kb-card-btn kb-fix" data-action="fix-review" data-id="${kanbanEsc(id)}"
+           title="Dispatch an editor to address the review's requested changes. If this card already merged, the fix branches from master and corrects the errors there; otherwise it continues this branch. Files a [Fix] card and runs it.">↻ Fix issues</button>`;
+  // Not reviewed yet: offer Review on a code-bearing [Integrate] card that hasn't
+  // merged -- the pre-merge semantic gate.
+  const pr = kbPrs[id];
+  const settled = pr && (pr.state === "MERGED" || pr.state === "OPEN");
+  if(!settled && (kbDiffstats[id] || 0) > 0 && (t.title || "").startsWith("[Integrate]"))
+    return `<button class="btn kb-card-btn kb-review" data-action="request-review" data-id="${kanbanEsc(id)}"
+       title="Agentic review: a reviewer model judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. Runs in the background (a few min); the verdict posts as a comment and shows here.">⇄ Review</button>`;
+  return "";
 }
 
 /* Is this done card the merge target for its family -- i.e. the integrating

@@ -3907,7 +3907,18 @@ async def _archive_merged_tick() -> None:
         h = p.get("headRefName") or ""
         if h.startswith("hermes/"):
             merged[h[len("hermes/"):]] = p.get("number")
-    for tid in sorted(done_ids & set(merged)):
+    # Do NOT archive a merged card whose review flagged problems -- it merged with
+    # known errors and must stay in `done`, actionable (Fix issues), not buried.
+    flagged: set = set()
+    try:
+        _, rout = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(_LINKS_QUERY)}")
+        for line in (rout or "").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "R" and parts[2] in ("request_changes", "escalate"):
+                flagged.add(parts[1])
+    except Exception:
+        pass
+    for tid in sorted((done_ids & set(merged)) - flagged):
         try:
             await _kanban_ssh(f"hermes kanban archive {shlex.quote(tid)} "
                               f"{shlex.quote(f'auto-archived: PR #{merged[tid]} merged')}")
@@ -4187,25 +4198,50 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
         if base.startswith(p):
             base = base[len(p):].strip()
     fix_title = (f"[Fix] {base} — review changes" if base else f"[Fix] {task_id} — review changes")[:200]
-    body = (
-        "Address the integration review's requested changes below, then COMMIT to "
-        "this card's branch. Your worktree is provisioned from the reviewed card's "
-        "branch (its parent) -- continue from that work, do not start over.\n\n"
-        "- Make the changes the review asks for.\n"
-        "- Keep/extend tests for the new behaviour; do not weaken existing tests.\n"
-        "- Run `pytest tests/` and make it pass before completing.\n\n"
-        "If the feedback cannot be addressed safely, BLOCK this card "
-        "(`--kind needs_input`) with why -- do not complete it unaddressed.\n\n"
-        f"Reviewed card: {task_id} ({title})\n\n--- review feedback ---\n{feedback}"
-    )
+    # If the reviewed card already MERGED, its fix must branch from current master
+    # (which has the merged work) and correct the errors there -- NOT continue the
+    # old pre-squash branch. Only continue the branch when it hasn't merged yet.
+    try:
+        _, mout = await _fleet_ssh(
+            "snarf",
+            f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+            f"gh pr list --state merged --head {shlex.quote('hermes/' + task_id)} --json number 2>/dev/null")
+        source_merged = bool(json.loads(mout.strip() or "[]"))
+    except Exception:
+        source_merged = False
+    if source_merged:
+        body = (
+            "The change below was MERGED, but review found errors in it. Fix them on "
+            "master and COMMIT. Your worktree is fresh from master (which already has "
+            "the merged change) -- correct the errors there, do not re-apply the "
+            "original change.\n\n"
+            "- Make the corrections the review asks for.\n"
+            "- Add/extend tests for the fixed behaviour; do not weaken existing tests.\n"
+            "- Run `pytest tests/` and make it pass before completing.\n\n"
+            "If it cannot be fixed safely, BLOCK (`--kind needs_input`) with why.\n\n"
+            f"Original (merged) card: {task_id} ({title})\n\n--- review feedback ---\n{feedback}"
+        )
+    else:
+        body = (
+            "Address the review's requested changes below, then COMMIT to this card's "
+            "branch. Your worktree is provisioned from the reviewed card's branch (its "
+            "parent) -- continue from that work, do not start over.\n\n"
+            "- Make the changes the review asks for.\n"
+            "- Keep/extend tests for the new behaviour; do not weaken existing tests.\n"
+            "- Run `pytest tests/` and make it pass before completing.\n\n"
+            "If the feedback cannot be addressed safely, BLOCK this card "
+            "(`--kind needs_input`) with why -- do not complete it unaddressed.\n\n"
+            f"Reviewed card: {task_id} ({title})\n\n--- review feedback ---\n{feedback}"
+        )
     assignee = ((payload.get("assignee") or "").strip() or (task.get("assignee") or "").strip()
                 or _darkhelix_assignee())
     create = (
         "hermes kanban create "
         f"{shlex.quote(fix_title)} "
         f"--body {shlex.quote(body)} "
-        f"--workspace scratch --parent {shlex.quote(task_id)} "
-        "--created-by looking-glass --json"
+        "--workspace scratch "
+        + ("" if source_merged else f"--parent {shlex.quote(task_id)} ")
+        + "--created-by looking-glass --json"
     )
     try:
         rc, out = await _kanban_ssh(create)
@@ -4441,6 +4477,31 @@ async def kanban_archive(request: Request) -> JSONResponse:
     if rc != 0:
         return JSONResponse({"ok": False, "error": out[-1000:]}, status_code=502)
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/kanban/unarchive")
+async def kanban_unarchive(request: Request) -> JSONResponse:
+    """Bring an archived card back to `done` -- for a card that was archived but
+    shouldn't have been (e.g. auto-archived on merge even though its review
+    flagged errors). Uses the plugin API's complete_task path (parents already
+    satisfied for a finished card), so it reappears as actionable done work."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    # The plugin HTTP API routes status=done through complete_task, which refuses
+    # an archived card. Call the plugin's own direct status mover (what drag-drop
+    # uses) instead -- it writes the status + a feed event cleanly.
+    py = ("import sys; sys.path.insert(0,'/usr/local/lib/hermes-agent'); "
+          "from plugins.kanban.dashboard import plugin_api as pa; conn=pa._conn(); "
+          f"print('OK' if pa._set_status_direct(conn, {task_id!r}, 'done') else 'FAIL')")
+    try:
+        rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(py)}")
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    if rc != 0 or "OK" not in (out or ""):
+        return JSONResponse({"ok": False, "error": (out or "")[-600:] or "unarchive failed"}, status_code=502)
+    return JSONResponse({"ok": True, "status": "done"})
 
 
 # ------------------------------------------------ SUBMIT WORK (DARKHELIX) --
