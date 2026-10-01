@@ -701,6 +701,12 @@ footer{
 }
 .kb-merge-all:hover{border-color:var(--green, #4ade80); background:color-mix(in srgb, var(--green, #4ade80) 12%, transparent)}
 .kb-merge-all:disabled{opacity:.5; cursor:default}
+.kb-arch-toggle{
+  background:none; border:1px solid var(--line); border-radius:6px; color:var(--txt-dim);
+  font-family:'Rajdhani'; font-size:11px; letter-spacing:0; padding:3px 9px; cursor:pointer;
+}
+.kb-arch-toggle:hover{border-color:var(--cyan); color:var(--cyan)}
+.kb-arch-toggle.on{border-color:var(--cyan); color:var(--cyan); background:color-mix(in srgb, var(--cyan) 12%, transparent)}
 .kb-card-btn.kb-fix{color:var(--amber); border-color:#7a5a1a}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
 .kb-card-btn.kb-review{color:var(--magenta); border-color:var(--magenta)}

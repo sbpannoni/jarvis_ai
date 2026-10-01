@@ -92,6 +92,7 @@ let kbEdges = [];
 let kbReviews = {};
 let kbReviewing = [];
 const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
+const KB_ARCHIVED_KEY = "lg-kb-show-archived";  // show the archived lane
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
 const KB_ASSIGNEE_KEY  = "lg-kb-assignee";
@@ -944,8 +945,9 @@ async function refreshKanbanPanel(panel){
     // Board and diff stats in parallel. Diff stats are server-cached for a
     // tick, so polling them every refresh is cheap; a failure just leaves the
     // "no diff" badges off, never breaks the board.
+    const showArch = kbPrefLoad(KB_ARCHIVED_KEY, false);
     const [r, dr, lr] = await Promise.all([
-      fetch("/api/kanban"),
+      fetch("/api/kanban" + (showArch ? "?archived=1" : "")),
       fetch("/api/kanban/diffstats").catch(() => null),
       fetch("/api/kanban/links").catch(() => null),
     ]);
@@ -968,6 +970,7 @@ function openKanbanBoard(){
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
         <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">🧠 … pending learning</button>
         <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">⤴ merge all</button>
+        <button class="kb-arch-toggle" type="button" title="Show the archived lane — merged cards (auto-archived on merge) and dismissed ones live here.">⊟ archived</button>
         <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
         <span class="kb-source">loading…</span>
       </div>
@@ -1055,6 +1058,21 @@ function openKanbanBoard(){
 
     const mergeAllBtn = panel.querySelector(".kb-merge-all");
     if(mergeAllBtn) mergeAllBtn.onclick = () => kbMergeAll(panel, mergeAllBtn);
+
+    const archBtn = panel.querySelector(".kb-arch-toggle");
+    if(archBtn){
+      const sync = () => {
+        const on = kbPrefLoad(KB_ARCHIVED_KEY, false);
+        archBtn.classList.toggle("on", on);
+        archBtn.textContent = on ? "⊟ hide archived" : "⊟ archived";
+      };
+      sync();
+      archBtn.onclick = () => {
+        kbPrefSave(KB_ARCHIVED_KEY, !kbPrefLoad(KB_ARCHIVED_KEY, false));
+        sync();
+        refreshKanbanPanel(panel);
+      };
+    }
 
     const sel = panel.querySelector(".kb-assignee");
     sel.value = kbPrefLoad(KB_ASSIGNEE_KEY, "") || "";

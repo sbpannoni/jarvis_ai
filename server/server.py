@@ -3442,15 +3442,20 @@ def _kanban_task_slim(task: dict) -> dict:
 
 
 @app.get("/api/kanban")
-async def kanban_board() -> JSONResponse:
+async def kanban_board(archived: int = 0) -> JSONResponse:
     """The board.
 
     `tasks` keeps its original contract -- a flat list, newest first -- so
     every existing caller is unaffected. `columns` is additive: the plugin
     API already groups cards into the board's own ordered statuses, which is
-    what a lane view needs and what the CLI path cannot produce."""
+    what a lane view needs and what the CLI path cannot produce.
+
+    `archived=1` includes the archived lane (the board's archived toggle), where
+    merged/dismissed cards live; it is left out by default so the board shows
+    only live work."""
+    board_path = "/api/plugins/kanban/board" + ("?include_archived=true" if archived else "")
     try:
-        board = await _kanban_api_get("/api/plugins/kanban/board")
+        board = await _kanban_api_get(board_path)
         columns = [{"name": c.get("name"),
                     "tasks": [_kanban_task_slim(t) for t in c.get("tasks") or []]}
                    for c in board.get("columns") or []]
@@ -3872,6 +3877,59 @@ async def kanban_links() -> JSONResponse:
             reviews[parts[1]] = parts[2]
     _LINKS_CACHE.update(ts=now, edges=edges, reviews=reviews)
     return JSONResponse({"edges": edges, "reviews": reviews, "reviewing": reviewing})
+
+
+# ---------------------------------------------------- auto-archive merged
+# A merged card is finished; leaving it in `done` turns that lane into a
+# graveyard. This sweep moves any done card whose PR is MERGED into `archived`
+# (viewable via the board's archived toggle), so `done` shows only actionable
+# finished work. On by default; set kanban.auto_archive_merged: false to stop it.
+_ARCHIVE_MERGED_STATUS: dict = {"enabled": False, "last_tick": None, "archived": 0, "last_error": None}
+
+
+def _auto_archive_on() -> bool:
+    return bool(_kanban_cfg().get("auto_archive_merged", True))
+
+
+async def _archive_merged_tick() -> None:
+    board = await _kanban_api_get("/api/plugins/kanban/board")
+    done_ids = {t.get("id") for col in (board.get("columns") or [])
+                if col.get("name") == "done"
+                for t in (col.get("tasks") or []) if t.get("id")}
+    if not done_ids:
+        return
+    rc, pout = await _fleet_ssh(
+        "snarf",
+        f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+        "gh pr list --state merged --limit 300 --json number,headRefName 2>/dev/null")
+    merged: dict = {}
+    for p in json.loads(pout.strip() or "[]"):
+        h = p.get("headRefName") or ""
+        if h.startswith("hermes/"):
+            merged[h[len("hermes/"):]] = p.get("number")
+    for tid in sorted(done_ids & set(merged)):
+        try:
+            await _kanban_ssh(f"hermes kanban archive {shlex.quote(tid)} "
+                              f"{shlex.quote(f'auto-archived: PR #{merged[tid]} merged')}")
+            _ARCHIVE_MERGED_STATUS["archived"] += 1
+        except Exception:
+            pass
+
+
+async def _archive_merged_forever() -> None:
+    """Off unless kanban.auto_archive_merged (default on). Polls done cards for a
+    merged PR and archives them -- the board's declutter for landed work."""
+    if not _auto_archive_on():
+        return
+    _ARCHIVE_MERGED_STATUS["enabled"] = True
+    while True:
+        try:
+            await _archive_merged_tick()
+            _ARCHIVE_MERGED_STATUS["last_error"] = None
+        except Exception as exc:
+            _ARCHIVE_MERGED_STATUS["last_error"] = str(exc)[:300]
+        _ARCHIVE_MERGED_STATUS["last_tick"] = time.time()
+        await asyncio.sleep(int(_kanban_cfg().get("auto_archive_poll_seconds") or 120))
 
 
 def _integrate_card_body(ids: list[str]) -> str:
@@ -9343,6 +9401,7 @@ async def start_activity_feed() -> None:
     asyncio.get_running_loop().create_task(_poll_network_topology_forever())
     asyncio.get_running_loop().create_task(_verify_completions_forever())
     asyncio.get_running_loop().create_task(_land_darkhelix_forever())
+    asyncio.get_running_loop().create_task(_archive_merged_forever())
     asyncio.get_running_loop().create_task(_poll_pool_manifest_forever())
     asyncio.get_running_loop().create_task(_poll_enforce_blocks_forever())
 
