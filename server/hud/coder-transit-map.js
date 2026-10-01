@@ -102,6 +102,8 @@ function transitLineText(models, assignedId, roster, fmt, isMeasured, noun){
 function buildTransitSvg(data, roleData){
   const assignments = (roleData && roleData.assignments) || {};
   const roster = (roleData && roleData.roster) || [];
+  const autoDispatch = !!(roleData && roleData.auto_dispatch);
+  const workerModel = assignments.kanban_worker || "—";
 
   const ed = transitLineText(data.editor.models, assignments.editor, roster,
     m => `${transitFmtPct(m.pass_rate)} · ${transitFmtTime(m.avg_elapsed_s)}`,
@@ -172,6 +174,7 @@ function buildTransitSvg(data, roleData){
     <circle cx="280" cy="300" r="12" fill="var(--panel)" stroke="var(--txt)" stroke-width="3"/>
     <circle cx="280" cy="300" r="4" fill="var(--teal)"/>
     ${transitStationLabel(280, 300, "CLAIM + DISPATCH", "below")}
+    <text x="240" y="346" text-anchor="start" class="tm-metric-chip" fill="var(--txt-dim)">kanban worker: ${workerModel}</text>
 
     ${transitStationCircle(560, 150, "var(--cyan)", "good")}
     ${transitStationLabel(560, 150, "WORKTREE + BRANCH", "above")}
@@ -211,6 +214,14 @@ function buildTransitSvg(data, roleData){
 
     <circle cx="980" cy="300" r="8" fill="var(--bg)" stroke="var(--magenta)" stroke-width="3" stroke-dasharray="2 4"/>
     ${transitStationLabel(980, 300, "KANBAN: TRIAGE CARD", "below")}
+
+    <!-- Auto-dispatch gate: whether a triage finding is auto-worked by a kanban
+         worker (ON) or waits for a human to dispatch it (OFF). Reflects
+         kanban.auto_decompose; toggled from the HERMES AGENTS seat bar. -->
+    <path d="M 980 338 L 980 372" fill="none" stroke="${autoDispatch ? 'var(--teal)' : 'var(--txt-dim)'}" stroke-width="3"${autoDispatch ? '' : ' stroke-dasharray="3 5"'}/>
+    <rect x="965" y="372" width="30" height="18" rx="4" fill="var(--bg)" stroke="${autoDispatch ? 'var(--teal)' : 'var(--red)'}" stroke-width="2"/>
+    <text x="980" y="385" text-anchor="middle" class="tm-metric-chip" fill="${autoDispatch ? 'var(--teal)' : 'var(--red)'}">${autoDispatch ? '▸' : '■'}</text>
+    <text x="1004" y="385" text-anchor="start" class="tm-metric-chip" fill="${autoDispatch ? 'var(--teal)' : 'var(--txt-dim)'}">auto-dispatch ${autoDispatch ? 'ON → worker' : 'OFF · waits for you'}</text>
 
     <circle cx="1200" cy="300" r="12" fill="var(--panel)" stroke="var(--txt)" stroke-width="3"/>
     <circle cx="1200" cy="300" r="4" fill="var(--teal)"/>
