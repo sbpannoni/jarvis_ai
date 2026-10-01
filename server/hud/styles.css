@@ -658,17 +658,34 @@ footer{
    merging = in flight. */
 .kb-chip.kb-merged{color:var(--green, #4ade80); border-color:#2f6b43}
 .kb-chip.kb-merging{color:var(--amber); border-color:#7a5a1a}
-/* Decomposition family: one collapsible card standing in for a whole tree. */
-.kb-family{border:1px solid var(--line); border-radius:8px; margin-bottom:6px; background:rgba(255,255,255,.02)}
-.kb-family-head{display:flex; align-items:center; gap:6px; padding:5px 7px; cursor:pointer}
-.kb-family-head:hover{background:rgba(255,255,255,.03)}
-.kb-fam-toggle{color:var(--txt-dim); width:10px; flex:0 0 auto}
-.kb-fam-title{flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px}
-.kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto}
-.kb-family-members{padding:0 6px 6px 16px; display:flex; flex-direction:column; gap:6px}
-.kb-family-members[hidden]{display:none}
+/* A decomposition family reads as ONE container: an accent spine on the left, a
+   tinted body, the header as its own card, and members clearly nested under a
+   connecting rule and dimmed a step so the hierarchy is obvious at a glance. */
+.kb-family{
+  border:1px solid var(--line); border-left:2px solid var(--cyan-dim);
+  border-radius:8px; margin-bottom:6px; overflow:hidden;
+  background:color-mix(in srgb, var(--panel) 45%, transparent);
+}
+.kb-family-head{display:flex; align-items:center; gap:8px; padding:7px 9px; cursor:pointer}
+.kb-family-head:hover{background:color-mix(in srgb, var(--cyan) 7%, transparent)}
+.kb-fam-toggle{color:var(--cyan-dim); width:12px; flex:0 0 auto; font-size:11px; text-align:center}
 .kb-fam-main{flex:1 1 auto; min-width:0}
-.kb-fam-sub{color:var(--txt-dim); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.kb-fam-title{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:600; color:var(--txt)}
+.kb-fam-sub{color:var(--txt-dim); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:1px}
+.kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto}
+.kb-family-members{
+  padding:7px 8px 8px 14px; margin-left:5px;
+  display:flex; flex-direction:column; gap:5px;
+  border-top:1px solid var(--line); border-left:1px solid var(--line);
+}
+.kb-family-members[hidden]{display:none}
+/* Members are children, not peers: a notch dimmer, smaller title, and without
+   the full-strength lane bar the top-level cards carry. */
+.kb-family-members .kb-card{
+  background:color-mix(in srgb, var(--panel) 62%, transparent);
+  border-left-color:color-mix(in srgb, var(--lane) 45%, transparent);
+}
+.kb-family-members .kb-title{font-size:12px}
 .kb-merge-all{color:var(--green, #4ade80)}
 .kb-card-btn.kb-fix{color:var(--amber); border-color:#7a5a1a}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
