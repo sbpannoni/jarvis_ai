@@ -2672,6 +2672,15 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         f"verified finding. Read it and decide; nothing has been changed.\n\n"
         f"{review_text}"
     )
+    # Embed the structured findings so that when this card is approved (or
+    # Code-the-fix is used on it), the [Fix] card built from this body carries
+    # the block the review-chain gates (check-fix-card/closure-review/Process)
+    # require. Same fenced shape _fetch_fix_card parses; target_file is enough,
+    # the fix card id is not known here and _fetch_fix_card doesn't need it.
+    if findings:
+        body += ("\n\n```json:review-findings\n"
+                 + json.dumps({"target_file": target_file, "findings": findings}, indent=2)
+                 + "\n```")
     kanban_cmd = (
         "hermes kanban create "
         f"{shlex.quote(title[:200])} "
@@ -3423,7 +3432,13 @@ _KANBAN_TASK_FIELDS = (
 
 
 def _kanban_task_slim(task: dict) -> dict:
-    return {k: task.get(k) for k in _KANBAN_TASK_FIELDS if k in task}
+    slim = {k: task.get(k) for k in _KANBAN_TASK_FIELDS if k in task}
+    # Whether this card carries a structured review-findings block, i.e. whether
+    # the review-chain gates (Process) can actually run on it. Computed from the
+    # body the board payload already includes (the HUD otherwise discards it), so
+    # the frontend can hide Process on a fix card it would only ever 400 on.
+    slim["has_findings"] = bool(_FENCED_FINDINGS_RE.search(task.get("body") or ""))
+    return slim
 
 
 @app.get("/api/kanban")
@@ -3525,6 +3540,255 @@ async def kanban_reclaim(request: Request) -> JSONResponse:
     if rc != 0:
         return JSONResponse({"ok": False, "error": out[-1000:]}, status_code=502)
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------- triage review gate
+# A card sits in `triage` until a human reads it, because `auto_decompose` is
+# deliberately OFF on CT111: the sweep/review chain files a finding here and we
+# do NOT want the decomposer to fan it out and start fixing before anyone has
+# looked. The cost of that choice was that nothing in the HUD could then move an
+# approved card forward -- the only drains for `triage` are the decomposer's own
+# `decompose`/`specify`, which REWRITE an atomic card's title and body (observed
+# turning "[Review] darkhelix/fsutil.py" into a generic spec and dropping the
+# findings). This is the UI half of the gate: read the card, click Approve, and
+# it goes to `ready` in place with its title and findings untouched.
+
+async def _patch_task(task_id: str, **fields) -> None:
+    """One PATCH to the kanban plugin API -- the non-lossy transport (status,
+    assignee, summary) /api/kanban/{id}/edit already uses."""
+    await asyncio.to_thread(
+        _kanban_api_call, "PATCH",
+        f"/api/plugins/kanban/tasks/{quote(task_id)}", json=fields)
+
+
+def _fix_body_from_source(source_id: str, source_title: str, source_body: str) -> str:
+    """Build a [Fix] card body that tells a worker to APPLY and COMMIT the fix
+    for the problem a review/sweep card identified -- the exact opposite of the
+    review card's propose-only brief, which is why "done with no diff" kept
+    happening. The source's prose (its ```json:review-findings block included,
+    if it carries one, so check-fix-card/closure-review can still verify the
+    diff) becomes the spec."""
+    problem = _DISPATCH_TARGET_RE.sub("", source_body or "").strip()
+    # Drop the review card's "a proposal ... nothing has been changed" preamble;
+    # this card's whole point is that something WILL be changed.
+    problem = re.sub(r"^Automated review by .*?nothing has been changed\.\s*",
+                     "", problem, flags=re.DOTALL)
+    return (
+        "Apply the fix for the problem identified below, then COMMIT it to this "
+        "card's branch. A non-empty diff is the expected outcome.\n\n"
+        "If, after investigating, the problem does not reproduce or a fix is not "
+        "safe to apply, BLOCK this card (`--kind needs_input`) with your "
+        "reasoning. Do NOT complete the card with no change -- re-confirming a "
+        "problem is not a fix.\n\n"
+        f"Identified by {source_id} ({source_title}).\n\n"
+        "--- problem ---\n"
+        f"{problem}"
+    )
+
+
+async def _file_fix_card(source_id: str, source_task: dict, assignee: str,
+                         link_parent: bool = False) -> dict:
+    """File (but do NOT promote) a dispatchable [Fix] card from a review/sweep
+    source. Returns {fix_id, assignee}.
+
+    `link_parent` makes the fix card a `--parent` child of the source. Use it
+    ONLY when the source is already terminal (done): then the dependency is
+    satisfied immediately, the source card re-renders to show it spawned a fix
+    (so its "Code the fix" button disappears instead of freezing), and the trail
+    is a real link. Do NOT use it for a `triage` source being approved: there,
+    the source must be archived to retire it, and you can't archive a parent
+    with an open child -- a deadlock -- so that path keeps the fix card standalone
+    with the source id only in the body."""
+    title = (source_task.get("title") or "").strip()
+    base = title
+    for p in ("[Review]", "[Fix]"):
+        if base.startswith(p):
+            base = base[len(p):].strip()
+    fix_title = (f"[Fix] {base}" if base else f"[Fix] {source_id}")[:200]
+    body = _fix_body_from_source(source_id, title or source_id,
+                                 source_task.get("body") or "")
+    create = (
+        "hermes kanban create "
+        f"{shlex.quote(fix_title)} "
+        f"--body {shlex.quote(body)} "
+        "--workspace scratch "
+        + (f"--parent {shlex.quote(source_id)} " if link_parent else "")
+        + "--created-by looking-glass --json"
+    )
+    rc, out = await _kanban_ssh(create)
+    if rc != 0:
+        raise RuntimeError(out[-1000:])
+    data = json.loads(out.strip())
+    fix_id = str(data.get("id") or data.get("task_id") or "")
+    if not _TASK_ID_RE.match(fix_id):
+        raise RuntimeError(f"fix card id unparseable: {fix_id!r}")
+    return {"fix_id": fix_id, "assignee": assignee}
+
+
+async def _archive_card(task_id: str, reason: str) -> None:
+    """Archive via the CLI, which (unlike the plugin API's archived PATCH) moves
+    a never-run `triage` card out cleanly. Best-effort: a card that can't be
+    archived (e.g. a parent with open children) is left in place, not fatal."""
+    try:
+        await _kanban_ssh(f"hermes kanban archive {shlex.quote(task_id)} {shlex.quote(reason)}")
+    except Exception:
+        pass
+
+
+@app.post("/api/kanban/approve")
+async def kanban_approve(request: Request) -> JSONResponse:
+    """The triage review gate.
+
+    For a **[Review]** card, Approve means GET THE FIX CODED, not re-reviewed:
+    a review card only proposes ("nothing has been changed"), so sending it
+    straight to a worker just produces another proposal and a card that lands
+    in `done` with an empty diff -- the surprise this endpoint exists to end.
+    Instead it dispatches a **[Fix]** card: promoting a chain-filed [Fix] child
+    if one already exists, else filing one from the review's findings. The
+    review card is marked `done` first, which both records the human approval
+    and satisfies the fix card's parent dependency so it can go `ready`.
+
+    For any **other** triage card (a SUBMIT WORK card already carries real
+    instructions), Approve just dispatches it in place -- a direct status PATCH,
+    no title/body rewrite, unlike `decompose`/`specify`. A `ready` card with no
+    assignee never dispatches, so an unassigned card is given one (caller ->
+    current -> `_darkhelix_assignee`, the review chain's own default)."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    try:
+        detail = await _kanban_task_detail(task_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"board unreadable: {exc}"},
+                            status_code=502)
+    task = detail.get("task") or {}
+    status = (task.get("status") or "").strip()
+    if status != "triage":
+        return JSONResponse(
+            {"ok": False,
+             "error": f"approve only applies to a triage card; this one is '{status or 'unknown'}'"},
+            status_code=409)
+    title = (task.get("title") or "").strip()
+    assignee = ((payload.get("assignee") or "").strip()
+                or (task.get("assignee") or "").strip()
+                or _darkhelix_assignee())
+    try:
+        if title.startswith("[Review]"):
+            children = [c for c in (detail.get("child_results") or [])
+                        if (c.get("title") or "").startswith("[Fix]")]
+            if children:
+                # The review chain already filed [Fix] child(ren) (they sit in
+                # `todo` behind this review as their parent). Force them past
+                # that dependency to `ready` and assign them; then retire the
+                # review card. `promote --force` ignores the open parent, which
+                # a plain status PATCH cannot.
+                for c in children:
+                    try:
+                        await _kanban_ssh(f"hermes kanban promote {shlex.quote(c['id'])} --force")
+                    except Exception:
+                        pass
+                    await _patch_task(c["id"], assignee=assignee)
+                await _archive_card(task_id, "approved from the Looking Glass board; fix dispatched")
+                return JSONResponse({"ok": True, "mode": "promoted_existing_fix",
+                                     "fix_ids": [c["id"] for c in children],
+                                     "assignee": assignee})
+            # No fix card yet: file one, dispatch it, and retire the review card.
+            # The review card's job -- being read -- is done; archiving it keeps
+            # it from sitting in triage looking unresolved (it can't be marked
+            # `done`: a card that never ran can't complete).
+            res = await _file_fix_card(task_id, task, assignee)
+            await _patch_task(res["fix_id"], status="ready", assignee=assignee)
+            await _archive_card(task_id, f"approved from the Looking Glass board; fix dispatched as {res['fix_id']}")
+            return JSONResponse({"ok": True, "mode": "filed_fix",
+                                 "fix_id": res["fix_id"], "assignee": assignee})
+        await _patch_task(task_id, status="ready", assignee=assignee)
+        return JSONResponse({"ok": True, "mode": "promoted",
+                             "assignee": assignee, "status": "ready"})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
+@app.post("/api/kanban/code-fix")
+async def kanban_code_fix(request: Request) -> JSONResponse:
+    """Apply a fix for a card that already reached `done` without writing any
+    code -- the manual counterpart to Approve, for the review/no-diff card you
+    only decided to act on after it finished. Files a dispatchable [Fix] card
+    from the done card's content (same builder as Approve) and leaves the done
+    card in place as the record. The done card satisfies the fix card's parent
+    dependency, so it goes `ready` immediately."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    try:
+        detail = await _kanban_task_detail(task_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"board unreadable: {exc}"},
+                            status_code=502)
+    task = detail.get("task") or {}
+    assignee = ((payload.get("assignee") or "").strip()
+                or (task.get("assignee") or "").strip()
+                or _darkhelix_assignee())
+    try:
+        # Link to the (terminal) source: it re-renders to show the fix was
+        # filed, so the "Code the fix" button clears instead of freezing, and a
+        # second click can't file a duplicate.
+        res = await _file_fix_card(task_id, task, assignee, link_parent=True)
+        await _patch_task(res["fix_id"], status="ready", assignee=assignee)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "fix_id": res["fix_id"], "assignee": assignee})
+
+
+_DIFFSTAT_CACHE: dict = {"ts": 0.0, "data": {}}
+_DIFFSTAT_TTL = 30.0
+
+
+@app.get("/api/kanban/diffstats")
+async def kanban_diffstats() -> JSONResponse:
+    """Commits-ahead per done card, so the board can flag one that COMPLETED
+    WITHOUT WRITING CODE (`0`). A review card legitimately does this; a card
+    meant to fix something that didn't is the surprise this surfaces. One SSH
+    call loops `git rev-list --count origin/master..hermes/<id>` over the done
+    cards' branches on snarf, cached for a tick. `null` = no such branch
+    (older/merged/never dispatched), which the UI leaves unbadged."""
+    now = time.time()
+    if now - _DIFFSTAT_CACHE["ts"] < _DIFFSTAT_TTL:
+        return JSONResponse({"diffstats": _DIFFSTAT_CACHE["data"], "cached": True})
+    try:
+        board = await _kanban_api_get("/api/plugins/kanban/board")
+    except Exception as exc:
+        return JSONResponse({"diffstats": {}, "error": str(exc)}, status_code=502)
+    done_ids = [t.get("id") for col in (board.get("columns") or [])
+                if col.get("name") == "done"
+                for t in (col.get("tasks") or []) if t.get("id")]
+    if not done_ids:
+        _DIFFSTAT_CACHE.update(ts=now, data={})
+        return JSONResponse({"diffstats": {}})
+    ids = " ".join(shlex.quote(i) for i in done_ids[:200])
+    script = (
+        f'cd {shlex.quote(DARKHELIX_REPO_PATH)} 2>/dev/null || exit 0; '
+        f'for b in {ids}; do '
+        f'if git rev-parse --verify -q "refs/heads/hermes/$b" >/dev/null 2>&1; then '
+        f'echo "$b $(git rev-list --count origin/master..hermes/$b 2>/dev/null || echo -1)"; '
+        f'else echo "$b -1"; fi; done'
+    )
+    try:
+        rc, out = await _fleet_ssh("snarf", script)
+    except Exception as exc:
+        return JSONResponse({"diffstats": {}, "error": str(exc)}, status_code=502)
+    data: dict = {}
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and _TASK_ID_RE.match(parts[0]):
+            try:
+                n = int(parts[1])
+            except ValueError:
+                continue
+            data[parts[0]] = None if n < 0 else n
+    _DIFFSTAT_CACHE.update(ts=now, data=data)
+    return JSONResponse({"diffstats": data})
 
 
 # ------------------------------------------------------- pipeline pause

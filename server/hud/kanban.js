@@ -58,7 +58,21 @@ const KB_CARD_ACTIONS = {
   unblock: {endpoint:"/api/kanban/unblock", verb:"Unblock"},
   archive: {endpoint:"/api/kanban/archive", verb:"Archive"},
   reclaim: {endpoint:"/api/kanban/reclaim", verb:"Reclaim"},
+  // The triage review gate (auto_decompose is off, so a sweep/review card waits
+  // in triage until a human acts). Approve sends it to ready in place -- no
+  // title/body rewrite, unlike the decomposer. Dismiss is just an archive with
+  // its own label so the button reads "Dismissing…" not "Archiveing…".
+  approve: {endpoint:"/api/kanban/approve", verb:"Approve"},
+  dismiss: {endpoint:"/api/kanban/archive", verb:"Dismiss"},
+  // Done card that identified a problem but wrote no code -> file a [Fix] card
+  // that dispatches a worker to actually apply + commit the fix.
+  codefix: {endpoint:"/api/kanban/code-fix", verb:"Code fix"},
 };
+
+/* commits-ahead per done card (from /api/kanban/diffstats): 0 = finished but
+   changed nothing, >0 = wrote code, null/absent = no branch or not yet known.
+   Refreshed alongside the board; the server caches the git calls for a tick. */
+let kbDiffstats = {};
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
 const KB_ASSIGNEE_KEY  = "lg-kb-assignee";
@@ -195,7 +209,10 @@ function kbCardSignature(t){
   return [t.status, t.title, t.assignee, t.comment_count, t.completed_at,
           t.started_at, t.block_kind, t.last_failure_error,
           lc.parents, lc.children, pr.done, pr.total,
-          t.status === "running" ? kbSeat.label : ""].join("|");
+          t.status === "running" ? kbSeat.label : "",
+          // Re-render a done card when its commit count arrives/changes, so the
+          // "no diff" badge and Code-fix button appear without a full rebuild.
+          t.status === "done" ? kbDiffstats[t.id] : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -241,6 +258,15 @@ function kbCardInner(t){
     ? `<div class="kb-seat" title="Model in snarf's GPU seat right now -- runs don't record their model, so this is only shown while the card is running">● ${kanbanEsc(kbSeat.label)}</div>`
     : "";
   const comments = t.comment_count ? `<span class="kb-chip">${t.comment_count}c</span>` : "";
+  // Did this card actually write code? commits ahead on its hermes/<id> branch.
+  // Only meaningful for done cards; null = no branch, undefined = not yet known.
+  const commits = t.status === "done" ? kbDiffstats[t.id] : undefined;
+  const noWork = commits === 0;
+  const diffBadge = (t.status === "done" && commits !== undefined && commits !== null)
+    ? (noWork
+        ? `<span class="kb-chip kb-nodiff" title="Completed without committing any code — its branch is 0 commits ahead of master. A review card does this by design; a card meant to fix something did NOT do the work.">∅ no diff</span>`
+        : `<span class="kb-chip kb-diff ok" title="${commits} commit${commits===1?"":"s"} on this card's branch, ahead of master">+${commits}</span>`)
+    : "";
   // The lane header already says what the status is, so the card doesn't
   // repeat it — that word was most of the old card's height.
   const note = (t.status === "blocked" && t.last_failure_error)
@@ -256,16 +282,36 @@ function kbCardInner(t){
   // `ready` -- which is DISPATCHABLE, so the gateway starts a fresh run on its
   // next pass and spends another model run. The tooltip says so, because
   // "reclaim" on its own sounds free.
-  const action = t.status === "blocked"
+  // triage is the human review gate: nothing drains it automatically here
+  // (auto_decompose is off on purpose), so a sweep/review finding waits for a
+  // person to read it and either Approve (→ ready, worked by the dispatcher) or
+  // Dismiss (archive a false positive). Approve preserves the card's title and
+  // findings; the decomposer's path would rewrite them.
+  const action = t.status === "triage"
+    ? `<button class="btn kb-card-btn" data-action="approve" data-id="${kanbanEsc(t.id)}"
+         title="You've reviewed this finding — send it to ready so the dispatcher works it. Moves triage→ready in place; unlike the auto-decomposer it does NOT rewrite the title or findings. Assigns the review-chain default if the card is unassigned.">Approve</button>
+       <button class="btn kb-card-btn" data-action="dismiss" data-id="${kanbanEsc(t.id)}"
+         title="Dismiss this finding without working it — archives the card. Use for a false positive or a won't-fix.">Dismiss</button>`
+    : t.status === "blocked"
     ? `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>`
     : t.status === "done"
       // Findings first: on a finished card the question is almost always
       // "what did it produce", and the answer used to be reachable only by
       // reading the run log to the end -- a transcript, not a result.
-      ? (chain && chain.kind === "fix"
+      // Process only on a fix card that actually carries a findings block --
+      // the gates 400 without one, so offering it on a prose-derived fix card
+      // was just a button that always failed. Those get Code-the-fix / Findings
+      // + merge instead.
+      ? ((chain && chain.kind === "fix" && t.has_findings)
           ? `<button class="btn kb-card-btn" data-action="process-fix" data-id="${kanbanEsc(t.id)}"
                title="Run the review chain on this finished fix: mechanical gates, then closure review, then ACT -- accept (left for a human to merge), retry (files a new linked attempt), or escalate. Never auto-lands from here; use the transit map's auto-land box for that.">Process</button>`
           : "")
+        // Did no work (0 commits) and hasn't already spawned a fix -> offer to
+        // code the fix: files a dispatchable [Fix] card from this card's content.
+        + ((noWork && !((t.link_counts || {}).children))
+            ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
+                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
+            : "")
         + `<button class="btn kb-card-btn" data-action="output" data-id="${kanbanEsc(t.id)}"
            title="What this card produced: its completion summary, the structured facts it recorded, the swarm blackboard if it was part of one, and any file it named — checked against disk">Findings</button>
          <button class="btn kb-card-btn" data-action="archive" data-id="${kanbanEsc(t.id)}">Archive</button>`
@@ -276,7 +322,7 @@ function kbCardInner(t){
   return `<div class="kb-title">${kbChainChip(chain)}${kanbanEsc(chain ? chain.rest : t.title)}</div>
     ${note}${seat}
     <div class="kb-meta"><span class="kb-who">${kanbanEsc(t.assignee) || "—"}</span>
-      <span class="kb-meta-r">${kbDepChips(t)}${comments}<span class="kb-age">${kanbanAge(t)}</span></span></div>
+      <span class="kb-meta-r">${diffBadge}${kbDepChips(t)}${comments}<span class="kb-age">${kanbanAge(t)}</span></span></div>
     ${action}`;
 }
 
@@ -472,8 +518,17 @@ async function kbProcessFix(panel, btn){
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
-    const r = await fetch("/api/kanban");
+    // Board and diff stats in parallel. Diff stats are server-cached for a
+    // tick, so polling them every refresh is cheap; a failure just leaves the
+    // "no diff" badges off, never breaks the board.
+    const [r, dr] = await Promise.all([
+      fetch("/api/kanban"),
+      fetch("/api/kanban/diffstats").catch(() => null),
+    ]);
     const j = await r.json();
+    if(dr && dr.ok){
+      try{ kbDiffstats = (await dr.json()).diffstats || {}; }catch{ /* keep last */ }
+    }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
   }catch(err){ renderKanban(panel, {}, err.message); }
