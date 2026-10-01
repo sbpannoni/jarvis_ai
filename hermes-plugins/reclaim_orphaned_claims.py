@@ -28,27 +28,36 @@ def main() -> int:
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
-            "SELECT id, claim_expires, last_heartbeat_at FROM tasks WHERE status='running'"
+            "SELECT id, title, created_by, claim_expires, last_heartbeat_at "
+            "FROM tasks WHERE status='running'"
         ).fetchall()
     finally:
         con.close()
 
-    reclaimed = 0
+    acted = 0
     for r in rows:
         exp = r["claim_expires"] or 0
         hb = r["last_heartbeat_at"] or 0
         claim_expired = exp and exp < (now - GRACE_S)
         hb_stale = (not hb) or hb < (now - HB_STALE_S)
-        if claim_expired and hb_stale:
-            res = subprocess.run(["hermes", "kanban", "reclaim", r["id"]],
-                                 capture_output=True, text=True)
-            ok = res.returncode == 0
-            print(f"{'reclaimed' if ok else 'reclaim FAILED for'} {r['id']} "
-                  f"(claim expired {int(now - exp)}s ago): "
-                  f"{(res.stdout or res.stderr).strip()[:200]}", flush=True)
-            reclaimed += int(ok)
-    if reclaimed:
-        print(f"reclaimed {reclaimed} orphaned card(s)", flush=True)
+        if not (claim_expired and hb_stale):
+            continue
+        # Looking-glass sweep trackers are not real work -- an orphaned one is
+        # archived (cleaned up), never reclaimed, so it can't be dispatched into a
+        # junk worker. Everything else is a genuine orphaned claim: reclaim it back
+        # to ready for the dispatcher to retry.
+        is_tracker = (r["created_by"] == "looking-glass"
+                      and (r["title"] or "").startswith("[Sweep]"))
+        verb = "archive" if is_tracker else "reclaim"
+        res = subprocess.run(["hermes", "kanban", verb, r["id"]],
+                             capture_output=True, text=True)
+        ok = res.returncode == 0
+        print(f"{verb} {'ok' if ok else 'FAILED'} {r['id']} "
+              f"(claim expired {int(now - exp)}s ago): "
+              f"{(res.stdout or res.stderr).strip()[:200]}", flush=True)
+        acted += int(ok)
+    if acted:
+        print(f"acted on {acted} orphaned card(s)", flush=True)
     return 0
 
 

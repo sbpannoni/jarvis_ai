@@ -2531,19 +2531,21 @@ async def _sweep_tracker_open(target_file: str, mode: str) -> str | None:
     return await _kanban_tracker_create(title, body)
 
 
-async def _kanban_tracker_create(title: str, body: str) -> str | None:
-    """Create a stable, non-dispatchable kanban card for an in-progress sweep so it
-    is visible on the board. It has to go to `scheduled`: recompute_ready promotes
-    ANY childless card (blocked, todo, even a typed needs_input block) to `ready`
-    within ~10s -- where the dispatcher would spawn a junk worker on it -- but
-    `scheduled` ("waiting on time") has no drain and stays put. So: create (started
-    blocked to avoid a ready flash) then immediately `schedule`, well inside that
-    window. Closed (archived) when the sweep ends. Best-effort: a tracking failure
-    must never fail the sweep itself."""
+async def _kanban_tracker_create(title: str, body: str, ttl: int = 1800) -> str | None:
+    """Create a kanban card for an in-progress sweep, held in `running` -- the right
+    column: a sweep is running, not waiting. A claimless running/blocked/todo card
+    is promoted to `ready` within ~10s and dispatched into a junk worker, so the
+    card is created (lands `ready`) then immediately `claim`ed with a TTL, which
+    atomically moves it to `running` with a lock the dispatcher and recompute both
+    respect. The claim counts toward max_in_progress=1 -- correct, the sweep owns
+    the GPU seat. Closed (complete+archive) when the sweep ends; if the sweep
+    outlives the TTL or the HUD dies, the reclaim timer archives the orphan (it is a
+    looking-glass [Sweep] card) rather than redispatching it. Best-effort: a
+    tracking failure must never fail the sweep itself."""
     try:
         rc, out = await _kanban_ssh(
             f"hermes kanban create {shlex.quote(title[:200])} --body {shlex.quote(body)} "
-            "--workspace scratch --initial-status blocked --created-by looking-glass --json")
+            "--workspace scratch --initial-status running --created-by looking-glass --json")
         if rc != 0:
             return None
         cid = json.loads(out.strip()).get("id")
@@ -2552,11 +2554,9 @@ async def _kanban_tracker_create(title: str, body: str) -> str | None:
         return None
     if cid:
         try:
-            await _kanban_ssh(
-                f"hermes kanban schedule {shlex.quote(cid)} "
-                f"{shlex.quote('live sweep tracker (looking-glass); auto-clears when done')}")
+            await _kanban_ssh(f"hermes kanban claim {shlex.quote(cid)} --ttl {int(ttl)}")
         except Exception as exc:
-            print(f"[sweep-tracker] schedule failed for {cid}: {exc!r}", flush=True)
+            print(f"[sweep-tracker] claim failed for {cid}: {exc!r}", flush=True)
     return cid
 
 
@@ -7360,7 +7360,7 @@ async def sweep_start(request: Request) -> JSONResponse:
         body = (f"Live tracker: whole-codebase sweep ({scope}{chunks}) running on the "
                 f"coder-engine. Auto-clears when the sweep ends; progress + findings are "
                 f"in the CODE SWEEP panel.")
-        _SWEEP_TRACKER_CARD = await _kanban_tracker_create(title, body)
+        _SWEEP_TRACKER_CARD = await _kanban_tracker_create(title, body, ttl=21600)  # whole-repo sweep runs for hours
     return JSONResponse({"ok": rc == 0, "only": only, "max_chunks": max_chunks})
 
 
