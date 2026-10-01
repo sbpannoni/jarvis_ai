@@ -3855,6 +3855,80 @@ async def kanban_links() -> JSONResponse:
     return JSONResponse({"edges": edges})
 
 
+def _integrate_card_body(ids: list[str]) -> str:
+    """The [Integrate] card's contract -- the trust chain, as instructions.
+
+    The engine provisions this card's worktree from its parent branches merged
+    together (dispatch_task.py: first parent is the base, the rest merged in,
+    conflicts aborted and the unmerged ones named), so the agent starts with the
+    branches combined or a clean base plus a conflict report. Weaving them into
+    one trustworthy change -- with tests -- is the job no static rule can do."""
+    return (
+        f"Integrate the {len(ids)} source branches below into ONE coherent change "
+        "on this card's branch, then COMMIT it.\n\n"
+        "Your worktree was provisioned from the source cards' branches merged "
+        "together (or, if they conflicted, from a clean base with the unmerged "
+        "ones named -- resolve them). Make the combined code a single working "
+        "feature, not a concatenation:\n"
+        "- Reconcile overlapping edits and shared interfaces so it is coherent.\n"
+        "- ADD tests that exercise the new behaviour, in `tests/`. CI runs "
+        "`pytest tests/`; new code with no tests will not be trusted.\n"
+        "- Do NOT weaken or delete existing test assertions to go green. Adding "
+        "new tests is expected; relaxing old ones is tampering and is flagged.\n"
+        "- Run `pytest tests/` and make it pass honestly before you complete.\n\n"
+        "If the branches cannot be made coherent, or tests cannot pass honestly, "
+        "BLOCK this card (`--kind needs_input`) with what is wrong. Do NOT "
+        "complete a broken or untested integration -- an integration that cannot "
+        "be trusted is a liability, not a result.\n\n"
+        "Source cards:\n" + "\n".join(f"  - {i}" for i in ids)
+    )
+
+
+@app.post("/api/darkhelix/agentic-integrate")
+async def darkhelix_agentic_integrate(request: Request) -> JSONResponse:
+    """Agentic merge for a decomposition whose branches need weaving (new
+    features), not just the one converged PR a programmatic merge handles.
+
+    Files an [Integrate] card parented to the source cards and dispatches it:
+    the provisioner merges their branches into the worktree, the editor weaves
+    them into one coherent change WITH tests (see _integrate_card_body), and the
+    result lands through the normal Merge -- which is CI-gated (`pytest tests/`),
+    so an untrustworthy integration fails to merge rather than slips through."""
+    payload = await request.json()
+    ids = [i for i in (payload.get("task_ids") or []) if _TASK_ID_RE.match(i or "")]
+    if len(ids) < 2:
+        return JSONResponse({"ok": False, "error": "need at least two source cards to integrate"},
+                            status_code=400)
+    title = (payload.get("title") or "").strip() or ids[0]
+    int_title = f"[Integrate] {title}"[:200]
+    body = _integrate_card_body(ids)
+    assignee = ((payload.get("assignee") or "").strip() or _darkhelix_assignee())
+    parents = " ".join(f"--parent {shlex.quote(i)}" for i in ids)
+    create = (
+        "hermes kanban create "
+        f"{shlex.quote(int_title)} "
+        f"--body {shlex.quote(body)} "
+        f"--workspace scratch {parents} "
+        "--created-by looking-glass --json"
+    )
+    try:
+        rc, out = await _kanban_ssh(create)
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": out[-1000:]}, status_code=502)
+        data = json.loads(out.strip())
+        int_id = str(data.get("id") or data.get("task_id") or "")
+        if not _TASK_ID_RE.match(int_id):
+            return JSONResponse({"ok": False, "error": f"integrate card id unparseable: {int_id!r}"},
+                                status_code=502)
+        # Dispatch it. Parents are done/archived (they're in the done lane), so
+        # the dependency is satisfied and it can go straight to ready.
+        await _patch_task(int_id, status="ready", assignee=assignee)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "integrate_id": int_id, "assignee": assignee,
+                         "sources": ids})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher

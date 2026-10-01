@@ -668,6 +668,7 @@ footer{
 .kb-family-members{padding:0 6px 6px 16px; display:flex; flex-direction:column; gap:6px}
 .kb-family-members[hidden]{display:none}
 .kb-merge-all{color:var(--green, #4ade80)}
+.kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the

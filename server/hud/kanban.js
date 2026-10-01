@@ -490,14 +490,27 @@ function kbRenderDoneGrouped(listEl, tasks){
     const ordered = [lead, ...members.filter(m => m.id !== lead.id)];
     const chain = kbChainKind(lead);
     const title = chain ? chain.rest : (lead.title || lead.id);
-    sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":"
+    // Code-bearing members. Two or more branches that aren't already a merged/
+    // open PR mean the family may need WEAVING, not just the one converged PR ->
+    // offer the agentic merge alongside the programmatic one.
+    const codeIds = ordered.filter(t => (kbDiffstats[t.id] || 0) > 0
+      && !(kbPrs[t.id] && (kbPrs[t.id].state === "MERGED" || kbPrs[t.id].state === "OPEN"))).map(t => t.id);
+    // Suppress when the family is already converging via the lead's PR (the
+    // programmatic path has it) -- agentic weaving is for the un-converged case.
+    const leadPr = kbPrs[lead.id];
+    const converging = !!(leadPr && (leadPr.state === "MERGED" || leadPr.state === "OPEN"));
+    const integrateBtn = (!converging && codeIds.length >= 2)
+      ? `<button class="btn kb-card-btn kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
+           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For new features whose branches must be integrated, not just the single converged PR.">⚙ Integrate ${codeIds.length}</button>`
+      : "";
+    sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":" + codeIds.length + ":"
       + ordered.map(t => t.id + kbCardSignature(t)).join(",") + ":" + JSON.stringify(kbPrs[lead.id] || null));
     parts.push(`<div class="kb-family" data-lead="${kanbanEsc(lead.id)}">
       <div class="kb-family-head">
         <span class="kb-fam-toggle">${open ? "▾" : "▸"}</span>
         <span class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</span>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
-        ${kbMergeControl(lead)}
+        ${kbMergeControl(lead)}${integrateBtn}
       </div>
       <div class="kb-family-members"${open ? "" : " hidden"}>${ordered.map(t => card(t, {noMerge: true})).join("")}</div>
     </div>`);
@@ -671,6 +684,34 @@ async function kbLandCard(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
 }
 
+/* Agentic merge: file an [Integrate] card parented to a family's code branches
+   and dispatch an editor to weave them into one coherent change WITH tests. The
+   result is an ordinary [Integrate] card you review and Merge (CI-gated), so an
+   untrustworthy integration fails to merge rather than slipping through. For new
+   features where the branches must be integrated, not just one converged PR. */
+async function kbAgenticIntegrate(panel, btn){
+  const ids = (btn.dataset.ids || "").split(",").filter(Boolean);
+  const title = btn.dataset.title || "";
+  if(ids.length < 2){ alert("Need at least two code-bearing cards to integrate."); return; }
+  if(!confirm(`Agentic merge: dispatch an editor to weave ${ids.length} branches into one coherent change WITH tests?\n\n`
+    + `It runs as a worker (GPU seat, several minutes) and produces an [Integrate] card. You then review its diff + tests and Merge it (CI-gated). Sources:\n  `
+    + ids.join("\n  "))) return;
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "filing…";
+  try{
+    const r = await fetch("/api/darkhelix/agentic-integrate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_ids: ids, title}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "⚙ integrating…";
+    btn.title = `Filed ${j.integrate_id}, dispatched to ${j.assignee}. Watch for the [Integrate] card; review its diff + tests, then Merge.`;
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = "failed — retry"; btn.title = err.message; }
+}
+
 /* Merge everything mergeable at once. The merge targets are exactly the land
    buttons currently in the done lane -- one per family (its lead) and one per
    standalone done card; members carry no button, so a family lands as one.
@@ -820,6 +861,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
         if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
+        if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;
