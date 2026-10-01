@@ -654,6 +654,10 @@ footer{
 /* Merge-to-master: the one card button that changes the shared repo, so it
    reads as the affirmative action rather than a neutral one. */
 .kb-card-btn.kb-land{color:var(--green, #4ade80); border-color:#2f6b43}
+/* Durable land state (from the PR, not the local branch). merged = settled,
+   merging = in flight. */
+.kb-chip.kb-merged{color:var(--green, #4ade80); border-color:#2f6b43}
+.kb-chip.kb-merging{color:var(--amber); border-color:#7a5a1a}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the

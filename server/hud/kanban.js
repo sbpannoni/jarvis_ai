@@ -77,6 +77,12 @@ let kbDiffstats = {};
    files in its pool-staging dir that have NOT reached the shared pool (the
    engine sees it read-only) -- i.e. there is data to Promote. */
 let kbStaged = {};
+/* PR state per done card's hermes/<id> branch (GitHub truth): {state,number,url}.
+   The durable "did it merge" signal -- a merged PR's local branch is pinned by
+   its worktree and never clears the commit count, so the Merge button is driven
+   by this, not by diffstats alone. kbLanding = ids whose land is in flight. */
+let kbPrs = {};
+let kbLanding = [];
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
 const KB_ASSIGNEE_KEY  = "lg-kb-assignee";
@@ -218,7 +224,10 @@ function kbCardSignature(t){
           // "no diff" badge and Code-fix button appear without a full rebuild.
           t.status === "done" ? kbDiffstats[t.id] : "",
           // Same for staged-file count: drives the Promote-refs button.
-          t.status === "done" ? kbStaged[t.id] : ""].join("|");
+          t.status === "done" ? kbStaged[t.id] : "",
+          // PR/landing state drives the Merge button vs merged/merging chips.
+          t.status === "done" ? JSON.stringify(kbPrs[t.id] || null) : "",
+          t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -318,13 +327,23 @@ function kbCardInner(t){
             ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
                  title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
             : "")
-        // Wrote code (commits ahead) -> one-click land to master: PR + CI +
-        // squash-merge in the background. Disappears once merged (branch
-        // deleted -> no commit count).
-        + ((commits > 0)
-            ? `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
-                 title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`
-            : "")
+        // Landing state is driven by GitHub PR truth, not the local commit
+        // count (a merged PR's branch is pinned by its worktree and never
+        // clears the count). merged -> done indicator; open -> in progress;
+        // in-flight -> just fired; else, if it wrote code, offer Merge.
+        + (() => {
+            const pr = kbPrs[t.id];
+            if(pr && pr.state === "MERGED")
+              return `<span class="kb-chip kb-merged" title="Merged to master as #${pr.number} — ${kanbanEsc(pr.url||"")}">✓ merged #${pr.number}</span>`;
+            if(pr && pr.state === "OPEN")
+              return `<span class="kb-chip kb-merging" title="PR #${pr.number} open — CI running, squash-merges when green. ${kanbanEsc(pr.url||"")}">⟳ merging #${pr.number}</span>`;
+            if(kbLanding.indexOf(t.id) !== -1)
+              return `<span class="kb-chip kb-merging" title="Landing started — opening the PR…">⟳ landing…</span>`;
+            if(commits > 0)
+              return `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
+                 title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`;
+            return "";
+          })()
         // Left reference files in pool-staging -> Promote them into the shared
         // pool (the data counterpart to Merge; code lands via git, data via this).
         + ((kbStaged[t.id] > 0)
@@ -595,15 +614,36 @@ async function kbPromoteRefs(panel, btn){
     }
     let msg = `Promote ${land.length} file(s) to ${d.destination}:\n  ` + land.join("\n  ");
     if(over.length) msg += `\n\n⚠ ${over.length} would OVERWRITE existing pool file(s):\n  ` + over.join("\n  ");
-    if(refused.length) msg += `\n\n✖ ${refused.length} have NO automatic home (NOT promoted — place by hand):\n  ` + refused.join("\n  ");
+    if(refused.length) msg += `\n\n✖ ${refused.length} have no automatic home — you'll be asked where to put them next:\n  ` + refused.join("\n  ");
     msg += over.length ? "\n\nProceed, including the overwrites?" : "\n\nProceed?";
     if(!confirm(msg)){ btn.disabled = false; btn.textContent = prev; return; }
     btn.textContent = "promoting…";
-    const p = await post({overwrite: over.length > 0});
+    const p = await post({files: land, overwrite: over.length > 0});
     if(!p.ok){ btn.disabled = false; btn.textContent = "promote failed — retry"; btn.title = p.error || ""; return; }
-    btn.textContent = `✓ promoted ${(p.promoted || []).length}`;
-    btn.title = `Into ${p.destination}: ${(p.promoted || []).join(", ") || "none"}`
-      + ((p.refused || []).length ? ` · no home (manual): ${p.refused.join(", ")}` : "");
+    const done = [...(p.promoted || [])];
+
+    // Place the no-home files: ask once for a destination under database/ and
+    // put them there (any extension, same no-clobber/md5 safety server-side).
+    if(refused.length){
+      const dest = prompt(
+        `Where should these ${refused.length} file(s) go? Path under the repo, must start with "database/" (e.g. database/toxin_hmm):\n  `
+        + refused.join("\n  "),
+        "database/");
+      if(dest && dest.trim()){
+        const q = await post({files: refused, dest: dest.trim(), allow_any_ext: true});
+        if(!q.ok && (q.existing || []).length && confirm(
+            `${(q.existing||[]).length} already exist in ${dest.trim()} and would be overwritten:\n  `
+            + (q.existing||[]).join("\n  ") + "\n\nOverwrite them?")){
+          const q2 = await post({files: refused, dest: dest.trim(), allow_any_ext: true, overwrite: true});
+          if(q2.ok) done.push(...(q2.promoted || []));
+          else { btn.title = q2.error || ""; }
+        } else if(q.ok){ done.push(...(q.promoted || [])); }
+        else { btn.title = q.error || ""; }
+      }
+    }
+
+    btn.textContent = `✓ promoted ${done.length}`;
+    btn.title = `Placed: ${done.join(", ") || "none"}`;
     refreshKanbanPanel(panel);
   }catch(err){ btn.disabled = false; btn.textContent = "promote failed — retry"; btn.title = err.message; }
 }
@@ -620,7 +660,7 @@ async function refreshKanbanPanel(panel){
     ]);
     const j = await r.json();
     if(dr && dr.ok){
-      try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; }catch{ /* keep last */ }
+      try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; }catch{ /* keep last */ }
     }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);

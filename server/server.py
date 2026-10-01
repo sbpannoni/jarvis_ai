@@ -3741,7 +3741,7 @@ async def kanban_code_fix(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "fix_id": res["fix_id"], "assignee": assignee})
 
 
-_DIFFSTAT_CACHE: dict = {"ts": 0.0, "data": {}, "staged": {}}
+_DIFFSTAT_CACHE: dict = {"ts": 0.0, "data": {}, "staged": {}, "prs": {}, "landing": []}
 _DIFFSTAT_TTL = 30.0
 
 
@@ -3761,7 +3761,10 @@ async def kanban_diffstats() -> JSONResponse:
     now = time.time()
     if now - _DIFFSTAT_CACHE["ts"] < _DIFFSTAT_TTL:
         return JSONResponse({"diffstats": _DIFFSTAT_CACHE["data"],
-                             "staged": _DIFFSTAT_CACHE["staged"], "cached": True})
+                             "staged": _DIFFSTAT_CACHE["staged"],
+                             "prs": _DIFFSTAT_CACHE.get("prs", {}),
+                             "landing": _DIFFSTAT_CACHE.get("landing", []),
+                             "cached": True})
     try:
         board = await _kanban_api_get("/api/plugins/kanban/board")
     except Exception as exc:
@@ -3770,8 +3773,8 @@ async def kanban_diffstats() -> JSONResponse:
                 if col.get("name") == "done"
                 for t in (col.get("tasks") or []) if t.get("id")]
     if not done_ids:
-        _DIFFSTAT_CACHE.update(ts=now, data={}, staged={})
-        return JSONResponse({"diffstats": {}, "staged": {}})
+        _DIFFSTAT_CACHE.update(ts=now, data={}, staged={}, prs={}, landing=[])
+        return JSONResponse({"diffstats": {}, "staged": {}, "prs": {}, "landing": []})
     ids = " ".join(shlex.quote(i) for i in done_ids[:200])
     stage_root = (_dh_pool_cfg().get("pool_staging_root") or POOL_STAGING_ROOT).rstrip("/")
     script = (
@@ -3798,8 +3801,29 @@ async def kanban_diffstats() -> JSONResponse:
                 continue
             data[parts[0]] = None if c < 0 else c
             staged[parts[0]] = s
-    _DIFFSTAT_CACHE.update(ts=now, data=data, staged=staged)
-    return JSONResponse({"diffstats": data, "staged": staged})
+    # PR state per card branch -- GitHub is the durable truth for "did it merge",
+    # unlike the local branch ref (which a lingering worktree pins even after a
+    # successful squash-merge, so commit-count alone never clears the button).
+    prs: dict = {}
+    done_set = set(done_ids)
+    try:
+        _, pout = await _fleet_ssh(
+            "snarf",
+            f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+            "gh pr list --state all --limit 300 --json number,headRefName,state,url 2>/dev/null")
+        for p in json.loads(pout.strip() or "[]"):
+            head = p.get("headRefName") or ""
+            if head.startswith("hermes/"):
+                tid = head[len("hermes/"):]
+                # Keep the most relevant: a MERGED/OPEN wins over a stale CLOSED.
+                prev = prs.get(tid)
+                if tid in done_set and (prev is None or prev.get("state") == "CLOSED"):
+                    prs[tid] = {"state": p.get("state"), "number": p.get("number"), "url": p.get("url")}
+    except Exception:
+        prs = {}
+    landing = sorted(_DH_LANDING_IN_FLIGHT & done_set)
+    _DIFFSTAT_CACHE.update(ts=now, data=data, staged=staged, prs=prs, landing=landing)
+    return JSONResponse({"diffstats": data, "staged": staged, "prs": prs, "landing": landing})
 
 
 # ------------------------------------------------------- pipeline pause
@@ -5593,19 +5617,32 @@ def _dh_staging_dir(task_id: str) -> str:
     return f"{root}/{task_id}"
 
 
-def _dh_promote_name_ok(name: str) -> bool:
-    """A flat, plain filename with an allowed extension.
+def _dh_promote_name_ok(name: str, require_ext: bool = True) -> bool:
+    """A flat, plain filename (with an allowed extension unless require_ext is
+    False, for a human-directed placement to an explicit destination).
 
     Names come off a `find` on the staging dir, but the caller may also pass a
     subset, and either way they end up in a shell command and a destination
-    path. Anything with a separator, a leading dot, or an unexpected extension
-    is refused rather than sanitised -- there is no legitimate reference file
-    that needs a path component."""
+    path. Anything with a separator, a leading dot, or `.`/`..` is refused
+    rather than sanitised -- there is no legitimate reference file that needs a
+    path component."""
     if not name or "/" in name or name.startswith("."):
         return False
     if name != Path(name).name or name in (".", ".."):
         return False
-    return Path(name).suffix.lower() in _DH_PROMOTE_EXTS
+    return (not require_ext) or Path(name).suffix.lower() in _DH_PROMOTE_EXTS
+
+
+def _dh_dest_ok(dest: str) -> bool:
+    """A safe destination subdir for a human-directed placement: relative, no
+    traversal, and confined to `database/` so a mistyped dest can never land on
+    code, `.git`, or anything outside the reference pool."""
+    if not dest or dest.startswith("/") or "\\" in dest:
+        return False
+    parts = [p for p in dest.strip("/").split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts) or parts[0] != "database":
+        return False
+    return True
 
 
 async def _dh_staged_files(task_id: str) -> list[dict]:
@@ -5672,6 +5709,16 @@ async def darkhelix_promote_refs(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
     dry_run = bool(payload.get("dry_run"))
     overwrite = bool(payload.get("overwrite"))
+    # Human-directed placement for files with no automatic home: an explicit
+    # destination under database/ plus an opt-in to ignore the extension
+    # allowlist (the operator is choosing where a .hmm/.dmnd/etc. goes). Without
+    # `dest`, behaviour is unchanged: collab_refs + the genome/table allowlist.
+    dest = (payload.get("dest") or "").strip()
+    allow_any_ext = bool(payload.get("allow_any_ext"))
+    if dest and not _dh_dest_ok(dest):
+        return JSONResponse({"ok": False,
+                             "error": "dest must be a relative path under database/ (no .. or absolute)"},
+                            status_code=400)
 
     try:
         staged = await _dh_staged_files(task_id)
@@ -5694,8 +5741,12 @@ async def darkhelix_promote_refs(request: Request) -> JSONResponse:
     else:
         names = sorted(available)
 
-    refused = [n for n in names if not _dh_promote_name_ok(n)]
-    names = [n for n in names if _dh_promote_name_ok(n)]
+    # Extension check applies to the default (collab_refs) path; a human-directed
+    # placement to an explicit dest may carry any type, but still only flat,
+    # traversal-free names.
+    require_ext = not (dest and allow_any_ext)
+    refused = [n for n in names if not _dh_promote_name_ok(n, require_ext=require_ext)]
+    names = [n for n in names if _dh_promote_name_ok(n, require_ext=require_ext)]
     if not names:
         return JSONResponse({"ok": False, "error": "no eligible files",
                              "refused": refused,
@@ -5703,7 +5754,7 @@ async def darkhelix_promote_refs(request: Request) -> JSONResponse:
                             status_code=400)
 
     staging = _dh_staging_dir(task_id)
-    dest_dir = f"{DARKHELIX_REPO_PATH}/{_DH_PROMOTE_DEST}"
+    dest_dir = f"{DARKHELIX_REPO_PATH}/{dest}" if dest else f"{DARKHELIX_REPO_PATH}/{_DH_PROMOTE_DEST}"
 
     # What is already there, so a clobber is reported before it happens.
     rc, out = await _fleet_ssh(
