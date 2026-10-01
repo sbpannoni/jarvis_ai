@@ -312,6 +312,13 @@ function kbCardInner(t){
             ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
                  title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
             : "")
+        // Wrote code (commits ahead) -> one-click land to master: PR + CI +
+        // squash-merge in the background. Disappears once merged (branch
+        // deleted -> no commit count).
+        + ((commits > 0)
+            ? `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
+                 title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`
+            : "")
         + `<button class="btn kb-card-btn" data-action="output" data-id="${kanbanEsc(t.id)}"
            title="What this card produced: its completion summary, the structured facts it recorded, the swarm blackboard if it was part of one, and any file it named — checked against disk">Findings</button>
          <button class="btn kb-card-btn" data-action="archive" data-id="${kanbanEsc(t.id)}">Archive</button>`
@@ -515,6 +522,33 @@ async function kbProcessFix(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "failed — retry"; btn.title = err.message; }
 }
 
+/* One-click merge of a finished card's work to DARKHELIX master. Fires the
+   per-card lander (/api/darkhelix/land-auto): open a PR, wait for CI, squash-
+   merge if green -- all in the background (the CI wait can run ~30m), so the
+   button can only report that landing STARTED. The real outcome shows on the
+   card: a successful merge deletes the hermes/<id> branch, so the commit badge
+   and this button vanish on the next poll; a CI/size failure moves the card to
+   blocked with the reason. skip_review_check: true because these cards are
+   landed by an explicit human click here, not via the review lane.
+
+   This merges to master, so it asks once first -- the one guard on the one
+   action here that changes the shared repo. */
+async function kbLandCard(panel, btn){
+  if(!confirm("Merge this card's work to DARKHELIX master?\n\nOpens a PR, waits for CI, and squash-merges if green (runs in the background, up to ~30m). If CI fails or the diff is over the size cap, the card is blocked with the reason instead of merging.")) return;
+  btn.disabled = true;
+  btn.textContent = "landing…";
+  try{
+    const r = await fetch("/api/darkhelix/land-auto", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id, skip_review_check: true}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "landing → PR + CI…";
+    btn.title = "PR opened; waiting on CI, squash-merges if green (up to ~30m). Watch the card: it moves to blocked with a reason if CI fails, and the branch/badge clear when it merges.";
+  }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
+}
+
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
@@ -563,6 +597,7 @@ function openKanbanBoard(){
         // button in place, which is why they go through a different path.
         if(btn.dataset.action === "output"){ openTaskOutput(btn.dataset.id); return; }
         if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
+        if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;

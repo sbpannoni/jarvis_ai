@@ -651,6 +651,9 @@ footer{
    gets the alert colour; a real diff is quiet confirmation. */
 .kb-chip.kb-nodiff{color:var(--red, #f87171); border-color:#7a2f2f; font-variant-numeric:tabular-nums}
 .kb-chip.kb-diff.ok{color:var(--green, #4ade80); border-color:#2f6b43; font-variant-numeric:tabular-nums}
+/* Merge-to-master: the one card button that changes the shared repo, so it
+   reads as the affirmative action rather than a neutral one. */
+.kb-card-btn.kb-land{color:var(--green, #4ade80); border-color:#2f6b43}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the
