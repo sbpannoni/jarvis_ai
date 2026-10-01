@@ -661,6 +661,11 @@ footer{
 /* A decomposition family reads as ONE container: an accent spine on the left, a
    tinted body, the header as its own card, and members clearly nested under a
    connecting rule and dimmed a step so the hierarchy is obvious at a glance. */
+/* The lane is a scrolling flex column; without this it SHRINKS items to fit
+   instead of scrolling, and a family (overflow:hidden) then clips to an
+   unreadable sliver when another is expanded. Items keep their height; the
+   lane scrolls. */
+.kb-lane-list > *{flex-shrink:0}
 .kb-family{
   border:1px solid var(--line); border-left:2px solid var(--cyan-dim);
   border-radius:8px; margin-bottom:6px; overflow:hidden;
