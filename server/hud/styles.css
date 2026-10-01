@@ -658,6 +658,16 @@ footer{
    merging = in flight. */
 .kb-chip.kb-merged{color:var(--green, #4ade80); border-color:#2f6b43}
 .kb-chip.kb-merging{color:var(--amber); border-color:#7a5a1a}
+/* Decomposition family: one collapsible card standing in for a whole tree. */
+.kb-family{border:1px solid var(--line); border-radius:8px; margin-bottom:6px; background:rgba(255,255,255,.02)}
+.kb-family-head{display:flex; align-items:center; gap:6px; padding:5px 7px; cursor:pointer}
+.kb-family-head:hover{background:rgba(255,255,255,.03)}
+.kb-fam-toggle{color:var(--txt-dim); width:10px; flex:0 0 auto}
+.kb-fam-title{flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px}
+.kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto}
+.kb-family-members{padding:0 6px 6px 16px; display:flex; flex-direction:column; gap:6px}
+.kb-family-members[hidden]{display:none}
+.kb-merge-all{color:var(--green, #4ade80)}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the

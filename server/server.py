@@ -3826,6 +3826,35 @@ async def kanban_diffstats() -> JSONResponse:
     return JSONResponse({"diffstats": data, "staged": staged, "prs": prs, "landing": landing})
 
 
+_LINKS_CACHE: dict = {"ts": 0.0, "edges": []}
+_LINKS_TTL = 20.0
+
+
+@app.get("/api/kanban/links")
+async def kanban_links() -> JSONResponse:
+    """Every parent->child edge in the board, so the HUD can group a
+    decomposition's cards into one family instead of scattering them across the
+    done lane. Read-only query of the shared kanban.db (the plugin API exposes
+    links only per-card, which would be a request per card). Cached a tick."""
+    now = time.time()
+    if now - _LINKS_CACHE["ts"] < _LINKS_TTL:
+        return JSONResponse({"edges": _LINKS_CACHE["edges"], "cached": True})
+    q = ("import sqlite3; c=sqlite3.connect("
+         "'file:/root/.hermes/kanban.db?mode=ro',uri=True); "
+         "[print(p,ch) for p,ch in c.execute('SELECT parent_id,child_id FROM task_links')]")
+    try:
+        rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(q)}")
+    except Exception as exc:
+        return JSONResponse({"edges": [], "error": str(exc)}, status_code=502)
+    edges = []
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and _TASK_ID_RE.match(parts[0]) and _TASK_ID_RE.match(parts[1]):
+            edges.append([parts[0], parts[1]])
+    _LINKS_CACHE.update(ts=now, edges=edges)
+    return JSONResponse({"edges": edges})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher

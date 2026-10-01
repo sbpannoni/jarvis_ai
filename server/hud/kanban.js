@@ -83,6 +83,10 @@ let kbStaged = {};
    by this, not by diffstats alone. kbLanding = ids whose land is in flight. */
 let kbPrs = {};
 let kbLanding = [];
+/* parent->child edges (from /api/kanban/links): group a decomposition's cards
+   into one collapsible family in the done lane. */
+let kbEdges = [];
+const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
 const KB_ASSIGNEE_KEY  = "lg-kb-assignee";
@@ -267,7 +271,37 @@ function kbDepChips(t){
   return chips.join("");
 }
 
-function kbCardInner(t){
+/* The landing control for a done card (or a family's lead card): merged/
+   merging/landing indicator, or the Merge button. Driven by GitHub PR truth
+   (kbPrs) first, then the in-flight set, then the local commit count. */
+function kbMergeControl(t){
+  const commits = t.status === "done" ? kbDiffstats[t.id] : undefined;
+  const pr = kbPrs[t.id];
+  if(pr && pr.state === "MERGED")
+    return `<span class="kb-chip kb-merged" title="Merged to master as #${pr.number} — ${kanbanEsc(pr.url||"")}">✓ merged #${pr.number}</span>`;
+  if(pr && pr.state === "OPEN")
+    return `<span class="kb-chip kb-merging" title="PR #${pr.number} open — CI running, squash-merges when green. ${kanbanEsc(pr.url||"")}">⟳ merging #${pr.number}</span>`;
+  if(kbLanding.indexOf(t.id) !== -1)
+    return `<span class="kb-chip kb-merging" title="Landing started — opening the PR…">⟳ landing…</span>`;
+  if(commits > 0)
+    return `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
+       title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`;
+  return "";
+}
+
+/* Is this done card the merge target for its family -- i.e. the integrating
+   card whose branch subsumes the siblings? Highest commit count wins, then a
+   card that already has a PR, then id. Used to put the family's single Merge on
+   the right card and to drive Merge-all. */
+function kbMergeable(t){
+  const pr = kbPrs[t.id];
+  if(pr && (pr.state === "MERGED" || pr.state === "OPEN")) return false;
+  if(kbLanding.indexOf(t.id) !== -1) return false;
+  return (kbDiffstats[t.id] || 0) > 0;
+}
+
+function kbCardInner(t, opts){
+  const noMerge = !!(opts && opts.noMerge);  // family members merge via the head
   const chain = kbChainKind(t);
   const seat = (t.status === "running" && kbSeat.label)
     ? `<div class="kb-seat" title="Model in snarf's GPU seat right now -- runs don't record their model, so this is only shown while the card is running">● ${kanbanEsc(kbSeat.label)}</div>`
@@ -327,23 +361,9 @@ function kbCardInner(t){
             ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
                  title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
             : "")
-        // Landing state is driven by GitHub PR truth, not the local commit
-        // count (a merged PR's branch is pinned by its worktree and never
-        // clears the count). merged -> done indicator; open -> in progress;
-        // in-flight -> just fired; else, if it wrote code, offer Merge.
-        + (() => {
-            const pr = kbPrs[t.id];
-            if(pr && pr.state === "MERGED")
-              return `<span class="kb-chip kb-merged" title="Merged to master as #${pr.number} — ${kanbanEsc(pr.url||"")}">✓ merged #${pr.number}</span>`;
-            if(pr && pr.state === "OPEN")
-              return `<span class="kb-chip kb-merging" title="PR #${pr.number} open — CI running, squash-merges when green. ${kanbanEsc(pr.url||"")}">⟳ merging #${pr.number}</span>`;
-            if(kbLanding.indexOf(t.id) !== -1)
-              return `<span class="kb-chip kb-merging" title="Landing started — opening the PR…">⟳ landing…</span>`;
-            if(commits > 0)
-              return `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
-                 title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`;
-            return "";
-          })()
+        // Landing state (merged/merging/landing/Merge) -- shared with family heads.
+        // Suppressed on a family member: the family merges as one via its head.
+        + (noMerge ? "" : kbMergeControl(t))
         // Left reference files in pool-staging -> Promote them into the shared
         // pool (the data counterpart to Merge; code lands via git, data via this).
         + ((kbStaged[t.id] > 0)
@@ -416,6 +436,76 @@ function kbLaneEl(lanesEl, name){
   return lane;
 }
 
+/* Union-find over the parent->child edges. Returns find(id) -> component root
+   (an id maps to itself if it has no links). A "family" is one component. */
+function kbComponents(edges){
+  const parent = new Map();
+  function find(x){
+    if(!parent.has(x)){ parent.set(x, x); return x; }
+    let r = x;
+    while(parent.get(r) !== r) r = parent.get(r);
+    while(parent.get(x) !== r){ const n = parent.get(x); parent.set(x, r); x = n; }
+    return r;
+  }
+  edges.forEach(([p, c]) => { const ra = find(p), rb = find(c); if(ra !== rb) parent.set(ra, rb); });
+  return find;
+}
+
+/* The family's merge target / header card: the integrating card whose branch
+   subsumes the siblings. Most commits wins, then a card that already has a PR,
+   then the newest. */
+function kbFamilyLead(members){
+  return members.slice().sort((a, b) => {
+    const ca = kbDiffstats[a.id] || 0, cb = kbDiffstats[b.id] || 0;
+    if(cb !== ca) return cb - ca;
+    const pa = (kbPrs[a.id] ? 1 : 0), pb = (kbPrs[b.id] ? 1 : 0);
+    if(pb !== pa) return pb - pa;
+    return (b.created_at || 0) - (a.created_at || 0);
+  })[0];
+}
+
+/* The done lane, grouped: each decomposition family becomes one collapsible
+   card (lead title + count + the family's single Merge), with members nested
+   and collapsed by default. Standalone done cards render flat. Rebuilt only
+   when the grouped signature changes (the done lane is not the hot path). */
+function kbRenderDoneGrouped(listEl, tasks){
+  const find = kbComponents(kbEdges);
+  const byRoot = new Map();
+  tasks.forEach(t => { const r = find(t.id); (byRoot.get(r) || byRoot.set(r, []).get(r)).push(t); });
+  const groups = [...byRoot.values()];
+  groups.sort((a, b) => Math.max(...b.map(t => t.created_at || 0)) - Math.max(...a.map(t => t.created_at || 0)));
+  const expanded = kbPrefLoad(KB_FAM_KEY, {});
+  const parts = [], sig = [];
+  const card = (t, opts) => `<div class="kb-card" data-id="${kanbanEsc(t.id)}" data-sig="${kanbanEsc(kbCardSignature(t))}">${kbCardInner(t, opts)}</div>`;
+  groups.forEach(members => {
+    if(members.length === 1){
+      const t = members[0];
+      sig.push("s:" + t.id + ":" + kbCardSignature(t) + ":" + JSON.stringify(kbMergeControl(t).slice(0,0)));
+      sig.push("m:" + JSON.stringify(kbPrs[t.id] || null) + kbDiffstats[t.id]);
+      parts.push(card(t));
+      return;
+    }
+    const lead = kbFamilyLead(members);
+    const open = !!expanded[lead.id];
+    const ordered = [lead, ...members.filter(m => m.id !== lead.id)];
+    const chain = kbChainKind(lead);
+    const title = chain ? chain.rest : (lead.title || lead.id);
+    sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":"
+      + ordered.map(t => t.id + kbCardSignature(t)).join(",") + ":" + JSON.stringify(kbPrs[lead.id] || null));
+    parts.push(`<div class="kb-family" data-lead="${kanbanEsc(lead.id)}">
+      <div class="kb-family-head">
+        <span class="kb-fam-toggle">${open ? "▾" : "▸"}</span>
+        <span class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</span>
+        <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
+        ${kbMergeControl(lead)}
+      </div>
+      <div class="kb-family-members"${open ? "" : " hidden"}>${ordered.map(t => card(t, {noMerge: true})).join("")}</div>
+    </div>`);
+  });
+  const gsig = sig.join("|");
+  if(listEl.dataset.gsig !== gsig){ listEl.dataset.gsig = gsig; listEl.innerHTML = parts.join(""); }
+}
+
 function renderKanban(panel, board, err){
   const lanesEl = panel.querySelector(".kb-lanes");
   const sourceEl = panel.querySelector(".kb-source");
@@ -483,7 +573,8 @@ function renderKanban(panel, board, err){
     // nothing visually, but skipping it left the cards of a lane that had
     // just been filtered or collapsed sitting stale in the DOM — hidden, yet
     // still matching every query over .kb-card.
-    kbSyncLane(lane.querySelector(".kb-lane-list"), list);
+    if(col.name === "done") kbRenderDoneGrouped(lane.querySelector(".kb-lane-list"), list);
+    else kbSyncLane(lane.querySelector(".kb-lane-list"), list);
     shown += list.length;
   });
   // A lane the board has stopped reporting.
@@ -580,6 +671,34 @@ async function kbLandCard(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
 }
 
+/* Merge everything mergeable at once. The merge targets are exactly the land
+   buttons currently in the done lane -- one per family (its lead) and one per
+   standalone done card; members carry no button, so a family lands as one.
+   Fires the per-card lander for each (background); any that fail CI/size land
+   in blocked with a reason, same as a single Merge. */
+async function kbMergeAll(panel, btn){
+  const targets = [...panel.querySelectorAll('.kb-lane[data-status="done"] [data-action="land"]')]
+    .map(b => b.dataset.id).filter(Boolean);
+  if(!targets.length){ alert("Nothing mergeable — no family or card has unmerged code without an open/merged PR."); return; }
+  if(!confirm(`Merge ${targets.length} item(s) to DARKHELIX master?\n\nEach opens a PR, waits for CI, and squash-merges if green (background, up to ~30m each). Any that fail CI or exceed the size cap are left blocked with the reason.`)) return;
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = `merging ${targets.length}…`;
+  let ok = 0, fail = 0;
+  for(const id of targets){
+    try{
+      const r = await fetch("/api/darkhelix/land-auto", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({task_id: id, skip_review_check: true}),
+      });
+      const j = await r.json();
+      if(j.ok) ok++; else fail++;
+    }catch{ fail++; }
+  }
+  btn.textContent = `started ${ok}${fail ? ` · ${fail} failed` : ""}`;
+  setTimeout(() => { btn.disabled = false; btn.textContent = prev; refreshKanbanPanel(panel); }, 3000);
+}
+
 /* Promote a card's STAGED reference files into the shared DARKHELIX pool. The
    data counterpart to Merge: a card can't write the read-only pool itself, so
    it leaves files in pool-staging and this copies them in (gated, md5-verified,
@@ -654,14 +773,16 @@ async function refreshKanbanPanel(panel){
     // Board and diff stats in parallel. Diff stats are server-cached for a
     // tick, so polling them every refresh is cheap; a failure just leaves the
     // "no diff" badges off, never breaks the board.
-    const [r, dr] = await Promise.all([
+    const [r, dr, lr] = await Promise.all([
       fetch("/api/kanban"),
       fetch("/api/kanban/diffstats").catch(() => null),
+      fetch("/api/kanban/links").catch(() => null),
     ]);
     const j = await r.json();
     if(dr && dr.ok){
       try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; }catch{ /* keep last */ }
     }
+    if(lr && lr.ok){ try{ kbEdges = (await lr.json()).edges || []; }catch{ /* keep last */ } }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
   }catch(err){ renderKanban(panel, {}, err.message); }
@@ -675,6 +796,7 @@ function openKanbanBoard(){
         <span class="kb-head-spacer"></span>
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
         <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">🧠 … pending learning</button>
+        <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">⤴ merge all</button>
         <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
         <span class="kb-source">loading…</span>
       </div>
@@ -700,6 +822,24 @@ function openKanbanBoard(){
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
+        return;
+      }
+      // Expand/collapse a decomposition family (anywhere on its head except the
+      // merge button, which the .kb-card-btn branch above already handled).
+      const famHead = e.target.closest(".kb-family-head");
+      if(famHead){
+        const fam = famHead.closest(".kb-family");
+        const lead = fam && fam.dataset.lead;
+        if(lead){
+          const exp = kbPrefLoad(KB_FAM_KEY, {});
+          const open = !exp[lead];
+          if(open) exp[lead] = true; else delete exp[lead];
+          kbPrefSave(KB_FAM_KEY, exp);
+          const members = fam.querySelector(".kb-family-members");
+          if(members) members.hidden = !open;
+          const tog = famHead.querySelector(".kb-fam-toggle");
+          if(tog) tog.textContent = open ? "▾" : "▸";
+        }
         return;
       }
       const head = e.target.closest(".kb-lane-head");
@@ -737,6 +877,9 @@ function openKanbanBoard(){
       refreshKanbanPause(panel);
       refreshKanbanPanel(panel);
     };
+
+    const mergeAllBtn = panel.querySelector(".kb-merge-all");
+    if(mergeAllBtn) mergeAllBtn.onclick = () => kbMergeAll(panel, mergeAllBtn);
 
     const sel = panel.querySelector(".kb-assignee");
     sel.value = kbPrefLoad(KB_ASSIGNEE_KEY, "") || "";
