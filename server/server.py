@@ -2379,8 +2379,9 @@ async def codebase_graph() -> JSONResponse:
         )
         if rc != 0:
             raise RuntimeError(f"exit {rc}: {out[-800:]}")
-        brace = out.find("{")
-        data = json.loads(out[brace:] if brace >= 0 else out)
+        data = _extract_json(out)
+        if data is None:
+            raise ValueError(f"no JSON in output: {out[-500:]}")
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     sha = data.get("generated_from") or "?"
@@ -2406,8 +2407,9 @@ async def codebase_graph_ts() -> JSONResponse:
         )
         if rc != 0:
             raise RuntimeError(f"exit {rc}: {out[-800:]}")
-        brace = out.find("{")
-        data = json.loads(out[brace:] if brace >= 0 else out)
+        data = _extract_json(out)
+        if data is None:
+            raise ValueError(f"no JSON in output: {out[-500:]}")
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     sha = data.get("generated_from") or "?"
@@ -2594,6 +2596,34 @@ def _spawn_review_job(target_file: str, task_description: str, chain: bool, mode
     task.add_done_callback(_REVIEW_JOBS.discard)
 
 
+def _extract_json(text: str):
+    """Pull the first valid top-level JSON object out of mixed command output.
+
+    Durable to our architecture: coder-engine scripts print one JSON object to
+    stdout, but _fleet_ssh/_kanban_ssh merge stdout+stderr, and the surrounding
+    stderr is whatever the active backend/model emitted -- model-seat swap notices,
+    vLLM warnings, llama.cpp load logs, deprecation lines. A plain
+    json.loads(out[first_brace:]) then dies on that trailing noise ("Extra data"),
+    which is exactly how a review failed with 'unparseable review output' once a
+    model swap started printing a 'ready' line. raw_decode parses exactly one
+    object and ignores trailing data; scanning each '{' also tolerates leading
+    noise. Returns the parsed object, or None if no '{' starts a valid object.
+    """
+    if not text:
+        return None
+    dec = json.JSONDecoder()
+    i = 0
+    while True:
+        b = text.find("{", i)
+        if b < 0:
+            return None
+        try:
+            obj, _end = dec.raw_decode(text[b:])
+            return obj
+        except json.JSONDecodeError:
+            i = b + 1
+
+
 async def _run_review(target_file: str, task_description: str, chain: bool,
                       mode: str) -> tuple[dict, int]:
     """The whole blocking body of POST /api/review-file, lifted into a helper so
@@ -2626,12 +2656,8 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     except Exception as exc:
         return {"ok": False, "error": str(exc)}, 502
 
-    brace = out.find("{")
-    try:
-        if brace < 0:
-            raise ValueError("no JSON object in output")
-        result = json.loads(out[brace:])
-    except (ValueError, json.JSONDecodeError):
+    result = _extract_json(out)
+    if result is None:
         return {"ok": False, "error": f"unparseable review output: {out[-1500:]}"}, 502
 
     if result.get("status") != "done":
@@ -2800,13 +2826,10 @@ async def _run_mechanical_gates(task_id: str, findings: list, branch_name: str) 
         f"rm -f {shlex.quote(tmp_path)}"
     )
     rc2, out2 = await _fleet_ssh("snarf", check_cmd)
-    brace = out2.find("{")
-    if brace < 0:
+    data = _extract_json(out2)
+    if data is None:
         raise _FixCardError(f"unparseable gate output: {out2[-2000:]}")
-    try:
-        return json.loads(out2[brace:])
-    except json.JSONDecodeError as exc:
-        raise _FixCardError(f"unparseable gate output: {out2[-2000:]}") from exc
+    return data
 
 
 async def _resolve_reviewer_model() -> str:
@@ -2829,13 +2852,10 @@ async def _run_closure_review(task_id: str, findings: list, branch_name: str, mo
         f"rm -f {shlex.quote(tmp_path)}"
     )
     rc2, out2 = await _fleet_ssh("snarf", closure_cmd)
-    brace = out2.find("{")
-    if brace < 0:
+    data = _extract_json(out2)
+    if data is None:
         raise _FixCardError(f"unparseable closure-review output: {out2[-2000:]}")
-    try:
-        return json.loads(out2[brace:])
-    except json.JSONDecodeError as exc:
-        raise _FixCardError(f"unparseable closure-review output: {out2[-2000:]}") from exc
+    return data
 
 
 @app.post("/api/kanban/check-fix-card")
