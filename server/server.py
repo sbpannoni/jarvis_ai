@@ -3741,54 +3741,65 @@ async def kanban_code_fix(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "fix_id": res["fix_id"], "assignee": assignee})
 
 
-_DIFFSTAT_CACHE: dict = {"ts": 0.0, "data": {}}
+_DIFFSTAT_CACHE: dict = {"ts": 0.0, "data": {}, "staged": {}}
 _DIFFSTAT_TTL = 30.0
 
 
 @app.get("/api/kanban/diffstats")
 async def kanban_diffstats() -> JSONResponse:
-    """Commits-ahead per done card, so the board can flag one that COMPLETED
-    WITHOUT WRITING CODE (`0`). A review card legitimately does this; a card
-    meant to fix something that didn't is the surprise this surfaces. One SSH
-    call loops `git rev-list --count origin/master..hermes/<id>` over the done
-    cards' branches on snarf, cached for a tick. `null` = no such branch
-    (older/merged/never dispatched), which the UI leaves unbadged."""
+    """Per done card, two "did it leave anything to land?" signals, so the board
+    can show the right action without a request per card:
+
+    - `diffstats`: commits ahead on `hermes/<id>` (code to Merge). `0` = finished
+      without writing code; `null` = no branch (older/merged/never dispatched).
+    - `staged`: count of files the card left in its pool-staging dir (reference
+      data to Promote -- these never reach the shared pool on their own, the
+      primary checkout is mounted read-only to the engine).
+
+    One SSH call loops both checks over the done cards on snarf, cached for a
+    tick."""
     now = time.time()
     if now - _DIFFSTAT_CACHE["ts"] < _DIFFSTAT_TTL:
-        return JSONResponse({"diffstats": _DIFFSTAT_CACHE["data"], "cached": True})
+        return JSONResponse({"diffstats": _DIFFSTAT_CACHE["data"],
+                             "staged": _DIFFSTAT_CACHE["staged"], "cached": True})
     try:
         board = await _kanban_api_get("/api/plugins/kanban/board")
     except Exception as exc:
-        return JSONResponse({"diffstats": {}, "error": str(exc)}, status_code=502)
+        return JSONResponse({"diffstats": {}, "staged": {}, "error": str(exc)}, status_code=502)
     done_ids = [t.get("id") for col in (board.get("columns") or [])
                 if col.get("name") == "done"
                 for t in (col.get("tasks") or []) if t.get("id")]
     if not done_ids:
-        _DIFFSTAT_CACHE.update(ts=now, data={})
-        return JSONResponse({"diffstats": {}})
+        _DIFFSTAT_CACHE.update(ts=now, data={}, staged={})
+        return JSONResponse({"diffstats": {}, "staged": {}})
     ids = " ".join(shlex.quote(i) for i in done_ids[:200])
+    stage_root = (_dh_pool_cfg().get("pool_staging_root") or POOL_STAGING_ROOT).rstrip("/")
     script = (
-        f'cd {shlex.quote(DARKHELIX_REPO_PATH)} 2>/dev/null || exit 0; '
+        f'R={shlex.quote(DARKHELIX_REPO_PATH)}; S={shlex.quote(stage_root)}; '
+        f'cd "$R" 2>/dev/null || exit 0; '
         f'for b in {ids}; do '
         f'if git rev-parse --verify -q "refs/heads/hermes/$b" >/dev/null 2>&1; then '
-        f'echo "$b $(git rev-list --count origin/master..hermes/$b 2>/dev/null || echo -1)"; '
-        f'else echo "$b -1"; fi; done'
+        f'c=$(git rev-list --count origin/master..hermes/$b 2>/dev/null || echo -1); else c=-1; fi; '
+        f's=0; if [ -d "$S/$b" ]; then s=$(find "$S/$b" -maxdepth 1 -type f 2>/dev/null | wc -l); fi; '
+        f'echo "$b $c $s"; done'
     )
     try:
         rc, out = await _fleet_ssh("snarf", script)
     except Exception as exc:
-        return JSONResponse({"diffstats": {}, "error": str(exc)}, status_code=502)
+        return JSONResponse({"diffstats": {}, "staged": {}, "error": str(exc)}, status_code=502)
     data: dict = {}
+    staged: dict = {}
     for line in (out or "").splitlines():
         parts = line.split()
-        if len(parts) == 2 and _TASK_ID_RE.match(parts[0]):
+        if len(parts) == 3 and _TASK_ID_RE.match(parts[0]):
             try:
-                n = int(parts[1])
+                c, s = int(parts[1]), int(parts[2])
             except ValueError:
                 continue
-            data[parts[0]] = None if n < 0 else n
-    _DIFFSTAT_CACHE.update(ts=now, data=data)
-    return JSONResponse({"diffstats": data})
+            data[parts[0]] = None if c < 0 else c
+            staged[parts[0]] = s
+    _DIFFSTAT_CACHE.update(ts=now, data=data, staged=staged)
+    return JSONResponse({"diffstats": data, "staged": staged})
 
 
 # ------------------------------------------------------- pipeline pause

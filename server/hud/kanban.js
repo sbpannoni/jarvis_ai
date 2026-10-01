@@ -73,6 +73,10 @@ const KB_CARD_ACTIONS = {
    changed nothing, >0 = wrote code, null/absent = no branch or not yet known.
    Refreshed alongside the board; the server caches the git calls for a tick. */
 let kbDiffstats = {};
+/* staged-file count per done card (same endpoint): >0 = the card left reference
+   files in its pool-staging dir that have NOT reached the shared pool (the
+   engine sees it read-only) -- i.e. there is data to Promote. */
+let kbStaged = {};
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
 const KB_ASSIGNEE_KEY  = "lg-kb-assignee";
@@ -212,7 +216,9 @@ function kbCardSignature(t){
           t.status === "running" ? kbSeat.label : "",
           // Re-render a done card when its commit count arrives/changes, so the
           // "no diff" badge and Code-fix button appear without a full rebuild.
-          t.status === "done" ? kbDiffstats[t.id] : ""].join("|");
+          t.status === "done" ? kbDiffstats[t.id] : "",
+          // Same for staged-file count: drives the Promote-refs button.
+          t.status === "done" ? kbStaged[t.id] : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -318,6 +324,12 @@ function kbCardInner(t){
         + ((commits > 0)
             ? `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
                  title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`
+            : "")
+        // Left reference files in pool-staging -> Promote them into the shared
+        // pool (the data counterpart to Merge; code lands via git, data via this).
+        + ((kbStaged[t.id] > 0)
+            ? `<button class="btn kb-card-btn kb-land" data-action="promote-refs" data-id="${kanbanEsc(t.id)}"
+                 title="This card staged ${kbStaged[t.id]} reference file(s) that aren't in the shared pool yet (the engine can't write it directly). Preview what would land in database/collab_refs (and what has no automatic home), then promote. Never overwrites without confirming.">⤴ Promote refs (${kbStaged[t.id]})</button>`
             : "")
         + `<button class="btn kb-card-btn" data-action="output" data-id="${kanbanEsc(t.id)}"
            title="What this card produced: its completion summary, the structured facts it recorded, the swarm blackboard if it was part of one, and any file it named — checked against disk">Findings</button>
@@ -549,6 +561,53 @@ async function kbLandCard(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
 }
 
+/* Promote a card's STAGED reference files into the shared DARKHELIX pool. The
+   data counterpart to Merge: a card can't write the read-only pool itself, so
+   it leaves files in pool-staging and this copies them in (gated, md5-verified,
+   never clobbers without an explicit yes).
+
+   Two-phase and honest about files with nowhere to go: a dry-run first shows
+   what WOULD land in collab_refs, what would be overwritten, and what is
+   "refused" -- i.e. has no automatic home (wrong type, or belongs in another
+   database/ subdir). Those are reported, never silently dropped; you place them
+   by hand. Only after you confirm does the real copy run. */
+async function kbPromoteRefs(panel, btn){
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "checking…";
+  const post = (body) => fetch("/api/darkhelix/promote-refs", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(Object.assign({task_id: btn.dataset.id}, body)),
+  }).then(r => r.json());
+  try{
+    const d = await post({dry_run: true});
+    if(!d.ok){
+      btn.disabled = false; btn.textContent = prev; btn.title = d.error || "";
+      alert(d.error || "Nothing staged to promote for this card."); return;
+    }
+    const land = d.would_promote || [], over = d.would_overwrite || [], refused = d.refused || [];
+    if(!land.length){
+      btn.disabled = false; btn.textContent = prev;
+      alert("None of the staged files have an automatic home in the pool"
+        + " (collab_refs accepts genome/table types only).\n\nNo home — place by hand:\n  "
+        + (refused.join("\n  ") || "(none)"));
+      return;
+    }
+    let msg = `Promote ${land.length} file(s) to ${d.destination}:\n  ` + land.join("\n  ");
+    if(over.length) msg += `\n\n⚠ ${over.length} would OVERWRITE existing pool file(s):\n  ` + over.join("\n  ");
+    if(refused.length) msg += `\n\n✖ ${refused.length} have NO automatic home (NOT promoted — place by hand):\n  ` + refused.join("\n  ");
+    msg += over.length ? "\n\nProceed, including the overwrites?" : "\n\nProceed?";
+    if(!confirm(msg)){ btn.disabled = false; btn.textContent = prev; return; }
+    btn.textContent = "promoting…";
+    const p = await post({overwrite: over.length > 0});
+    if(!p.ok){ btn.disabled = false; btn.textContent = "promote failed — retry"; btn.title = p.error || ""; return; }
+    btn.textContent = `✓ promoted ${(p.promoted || []).length}`;
+    btn.title = `Into ${p.destination}: ${(p.promoted || []).join(", ") || "none"}`
+      + ((p.refused || []).length ? ` · no home (manual): ${p.refused.join(", ")}` : "");
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = "promote failed — retry"; btn.title = err.message; }
+}
+
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
@@ -561,7 +620,7 @@ async function refreshKanbanPanel(panel){
     ]);
     const j = await r.json();
     if(dr && dr.ok){
-      try{ kbDiffstats = (await dr.json()).diffstats || {}; }catch{ /* keep last */ }
+      try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; }catch{ /* keep last */ }
     }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
@@ -598,6 +657,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "output"){ openTaskOutput(btn.dataset.id); return; }
         if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
         if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
+        if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;
