@@ -4221,6 +4221,93 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "fix_id": fix_id, "assignee": assignee})
 
 
+# ------------------------------------------------- research/decision log
+DARKHELIX_RESEARCH_DIR = "docs/research"
+
+
+def _research_slug(title: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    return (s or "research")[:50]
+
+
+@app.post("/api/darkhelix/capture-research")
+async def darkhelix_capture_research(request: Request) -> JSONResponse:
+    """Capture a finished card's findings into the machine-readable research log
+    (docs/research/<slug>.md, committed to master) -- so a research/analysis
+    card's summary becomes a versioned, queryable record instead of archiving
+    into oblivion. Schema in docs/research/README.md."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    try:
+        detail = await _kanban_task_detail(task_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"board unreadable: {exc}"}, status_code=502)
+    task = detail.get("task") or {}
+    title = (task.get("title") or task_id).strip()
+    summary = (task.get("latest_summary") or task.get("result") or "").strip()
+    if not summary:
+        return JSONResponse({"ok": False, "error": "this card has no summary/findings to capture"},
+                            status_code=400)
+    slug = _research_slug(title)
+    rec = re.split(r"(?<=[.!?])\s", summary)[0][:200]
+    date = time.strftime("%Y-%m-%d")
+    record = (
+        f"---\nid: {slug}\nquestion: {json.dumps(title, ensure_ascii=False)}\ndate: {date}\n"
+        f"card_id: {task_id}\nstatus: proposed\n"
+        f"recommendation: {json.dumps(rec, ensure_ascii=False)}\ntags: []\nsources: []\n---\n\n"
+        f"# {title}\n\n{summary}\n"
+    )
+    b64 = base64.b64encode(record.encode("utf-8")).decode("ascii")
+    msg = f"research: {title[:60]} (from {task_id})"
+    script = (
+        f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && git pull --rebase -q 2>/dev/null; "
+        f"d={shlex.quote(DARKHELIX_RESEARCH_DIR)}; mkdir -p \"$d\"; "
+        f"f=\"$d/{slug}.md\"; [ -e \"$f\" ] && f=\"$d/{slug}-{task_id[2:8]}.md\"; "
+        f"printf %s {shlex.quote(b64)} | base64 -d > \"$f\" && "
+        f"git add \"$f\" && git commit -q -m {shlex.quote(msg)} && git push -q && echo \"OK $f\""
+    )
+    try:
+        rc, out = await _fleet_ssh("snarf", script)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    m = re.search(r"OK (\S+)", out or "")
+    if rc != 0 or not m:
+        return JSONResponse({"ok": False, "error": (out or "")[-700:] or "capture failed"}, status_code=502)
+    return JSONResponse({"ok": True, "path": m.group(1), "slug": slug})
+
+
+@app.get("/api/darkhelix/research")
+async def darkhelix_research_list() -> JSONResponse:
+    """The research log index: the front-matter of every docs/research record,
+    for the HUD RESEARCH view and for planning a feature/upgrade."""
+    globpat = f"{DARKHELIX_REPO_PATH}/{DARKHELIX_RESEARCH_DIR}/*.md"
+    q = (
+        "import glob,os,json\n"
+        f"recs=[]\n"
+        f"for p in sorted(glob.glob({globpat!r})):\n"
+        "    b=os.path.basename(p)\n"
+        "    if b=='README.md': continue\n"
+        "    t=open(p,encoding='utf-8',errors='replace').read()\n"
+        "    fm={'file':b}\n"
+        "    if t.startswith('---'):\n"
+        "        e=t.find('\\n---',3)\n"
+        "        for line in (t[3:e] if e>0 else '').splitlines():\n"
+        "            if line[:1] in (' ','-') or ':' not in line: continue\n"
+        "            k,_,v=line.partition(':'); fm[k.strip()]=v.strip().strip('\"')\n"
+        "    recs.append(fm)\n"
+        "print(json.dumps(recs))\n"
+    )
+    try:
+        rc, out = await _fleet_ssh("snarf", f"{CODER_ENGINE_VENV_PY} -c {shlex.quote(q)}")
+        line = [ln for ln in (out or "").splitlines() if ln.strip().startswith("[")]
+        recs = json.loads(line[-1]) if line else []
+    except Exception as exc:
+        return JSONResponse({"records": [], "error": str(exc)}, status_code=502)
+    return JSONResponse({"records": recs})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher

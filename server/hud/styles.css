@@ -708,6 +708,32 @@ footer{
 .kb-arch-toggle:hover{border-color:var(--cyan); color:var(--cyan)}
 .kb-arch-toggle.on{border-color:var(--cyan); color:var(--cyan); background:color-mix(in srgb, var(--cyan) 12%, transparent)}
 .kb-card-btn.kb-fix{color:var(--amber); border-color:#7a5a1a}
+.kb-card-btn.kb-research{color:var(--cyan); border-color:var(--cyan-dim)}
+
+/* RESEARCH view -- the docs/research decision log */
+.rs-pane{display:flex; flex-direction:column; height:100%}
+.rs-bar{display:flex; align-items:center; gap:8px; padding:7px 10px; border-bottom:1px solid var(--line)}
+.rs-bar-title{color:var(--cyan); font-family:'Orbitron'; letter-spacing:2px; font-size:12px}
+.rs-bar-sub{color:var(--txt-dim); font-size:11px; font-family:'Rajdhani'}
+.rs-spacer{flex:1 1 auto}
+.rs-count{color:var(--txt-dim); font-size:11px; white-space:nowrap}
+.rs-list{flex:1 1 auto; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:7px}
+.rs-note{color:var(--txt-dim); padding:10px}
+.rs-note.err{color:var(--red)}
+.rs-item{border:1px solid var(--line); border-left:2px solid var(--cyan-dim); border-radius:7px;
+  padding:8px 10px; background:color-mix(in srgb, var(--panel) 55%, transparent)}
+.rs-head{display:flex; align-items:center; gap:8px}
+.rs-q{flex:1 1 auto; font-weight:600; color:var(--txt); font-size:13px}
+.rs-date{color:var(--txt-dim); font-size:10px; white-space:nowrap}
+.rs-rec{color:var(--txt); font-size:12px; margin-top:4px; line-height:1.35}
+.rs-meta{display:flex; align-items:center; gap:10px; margin-top:6px; font-size:10px; color:var(--txt-dim); flex-wrap:wrap}
+.rs-tags{color:var(--teal)}
+.rs-card{color:var(--cyan); text-decoration:none}
+.rs-status{font-size:9.5px; letter-spacing:.5px; border:1px solid var(--line); border-radius:8px; padding:0 6px; text-transform:uppercase; white-space:nowrap}
+.rs-proposed{color:var(--amber); border-color:#7a5a1a}
+.rs-accepted{color:var(--green,#4ade80); border-color:#2f6b43}
+.rs-rejected{color:var(--red); border-color:#7a2f2f}
+.rs-superseded{color:var(--txt-dim)}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
 .kb-card-btn.kb-review{color:var(--magenta); border-color:var(--magenta)}
 .kb-card-btn.kb-verify{color:var(--txt-dim)}

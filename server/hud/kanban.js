@@ -403,7 +403,9 @@ function kbCardInner(t, opts){
         // code the fix: files a dispatchable [Fix] card from this card's content.
         + ((noWork && !((t.link_counts || {}).children))
             ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
-                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
+                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>
+               <button class="btn kb-card-btn kb-research" data-action="capture-research" data-id="${kanbanEsc(t.id)}"
+                 title="Capture this card's findings into docs/research/ as a machine-readable record (committed to the repo), so a future feature/upgrade can query it. Use for analysis/research cards; edit the record afterward to sharpen the recommendation and tags.">⎘ Research</button>`
             : "")
         // Landing state (merged/merging/landing/Merge) -- shared with family heads.
         // Suppressed on a family member: the family merges as one via its head.
@@ -752,6 +754,27 @@ async function kbLandCard(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
 }
 
+/* Capture a research/analysis card's findings into docs/research/ as a
+   machine-readable record (committed to the repo), so future work can query it.
+   Opens the RESEARCH view afterward so you can sharpen/accept it. */
+async function kbCaptureResearch(panel, btn){
+  if(!confirm("Capture this card's findings into docs/research/ (committed to the DARKHELIX repo)?\n\nFor research/analysis cards — turns the summary into a queryable record. Edit it afterward to sharpen the recommendation and tags.")) return;
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "capturing…";
+  try{
+    const r = await fetch("/api/darkhelix/capture-research", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "capture failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "✓ captured";
+    btn.title = `Wrote ${j.path}`;
+    if(typeof openResearch === "function") openResearch();
+  }catch(err){ btn.disabled = false; btn.textContent = "capture failed — retry"; btn.title = err.message; }
+}
+
 /* Close the loop: dispatch an editor to address the review's requested changes,
    continuing from this card's branch. Files a [Fix] card and runs it; you
    re-Review / re-Verify the result before Merge. */
@@ -998,6 +1021,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "verify"){ kbVerify(panel, btn); return; }
         if(btn.dataset.action === "request-review"){ kbRequestReview(panel, btn); return; }
         if(btn.dataset.action === "fix-review"){ kbFixReview(panel, btn); return; }
+        if(btn.dataset.action === "capture-research"){ kbCaptureResearch(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;
