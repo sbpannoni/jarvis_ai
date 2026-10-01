@@ -3929,6 +3929,74 @@ async def darkhelix_agentic_integrate(request: Request) -> JSONResponse:
                          "sources": ids})
 
 
+_TEST_PATH_RE = re.compile(r"(^|/)tests?/|(^|/)test_[^/]+\.py$|_test\.py$")
+
+
+@app.post("/api/darkhelix/verify-integration")
+async def darkhelix_verify_integration(request: Request) -> JSONResponse:
+    """The STATIC pre-merge trust gate for a finished code card (an [Integrate]
+    card especially): does it bring tests for its new code, and did it avoid
+    weakening existing ones? CI is the dynamic gate that runs during Merge; this
+    is the cheap check you run first to decide a merge is even worth starting.
+
+    Pure git math on the card's `hermes/<id>` branch vs its merge-base, no model
+    call: `git diff --numstat` gives added/removed per file; we split test paths
+    from source. `tests_missing` = added source but no added tests. `test_tamper`
+    = an existing test file lost/changed lines while source changed (the "relax
+    the assertion to go green" pattern). Reports; it does not block."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    branch = f"hermes/{task_id}"
+    script = (
+        f'cd {shlex.quote(DARKHELIX_REPO_PATH)} 2>/dev/null || exit 3; '
+        f'git rev-parse --verify -q {shlex.quote("refs/heads/" + branch)} >/dev/null 2>&1 || {{ echo NOBRANCH; exit 0; }}; '
+        f'MB=$(git merge-base origin/master {shlex.quote(branch)} 2>/dev/null); '
+        f'echo "MB $MB"; '
+        f'git diff --numstat "$MB".."{branch}"'
+    )
+    try:
+        rc, out = await _fleet_ssh("snarf", script)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    text = (out or "").strip()
+    if "NOBRANCH" in text or not text:
+        return JSONResponse({"ok": False, "error": "no branch for this card (nothing to verify)"},
+                            status_code=404)
+    src_add = src_files = test_add = 0
+    tamper_files = []
+    for line in text.splitlines():
+        if line.startswith("MB "):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added, removed, path = parts
+        a = int(added) if added.isdigit() else 0
+        r = int(removed) if removed.isdigit() else 0
+        if _TEST_PATH_RE.search(path):
+            test_add += a
+            if r > 0:
+                tamper_files.append(path)  # removed/changed an existing test line
+        else:
+            src_add += a
+            src_files += 1
+    tests_missing = src_add > 0 and test_add == 0
+    test_tamper = bool(tamper_files) and src_files > 0
+    trustworthy = (not tests_missing) and (not test_tamper)
+    reasons = []
+    if tests_missing:
+        reasons.append(f"added {src_add} source lines but no tests")
+    if test_tamper:
+        reasons.append(f"changed existing test file(s) alongside source: {', '.join(tamper_files)}")
+    return JSONResponse({"ok": True, "task_id": task_id,
+                         "source_added": src_add, "tests_added": test_add,
+                         "tests_missing": tests_missing, "test_tamper": test_tamper,
+                         "trustworthy": trustworthy,
+                         "reason": "; ".join(reasons) or "tests present, no tamper"})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher

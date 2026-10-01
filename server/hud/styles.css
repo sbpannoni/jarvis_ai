@@ -669,6 +669,9 @@ footer{
 .kb-family-members[hidden]{display:none}
 .kb-merge-all{color:var(--green, #4ade80)}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
+.kb-card-btn.kb-verify{color:var(--txt-dim)}
+.kb-card-btn.kb-verify-ok{color:var(--green, #4ade80); border-color:#2f6b43}
+.kb-card-btn.kb-verify-warn{color:var(--amber); border-color:#7a5a1a}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the
