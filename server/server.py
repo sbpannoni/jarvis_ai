@@ -4344,6 +4344,41 @@ async def darkhelix_research_list() -> JSONResponse:
     return JSONResponse({"records": recs})
 
 
+@app.get("/api/darkhelix/pool-check")
+async def darkhelix_pool_check() -> JSONResponse:
+    """Reference-pool reproducibility: run build_database.sh --check (pool vs
+    database/MANIFEST.yaml) and return the manifest items plus the drift --
+    MISSING (in manifest, not on disk), UNLISTED (on disk, no manifest entry =
+    unreproducible), and items whose source is still `manual`. The data analog of
+    the code trust gate: a pool item with no recipe is untrusted."""
+    cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && bash scripts/build_database.sh --check 2>&1; "
+           "echo '===MANIFEST==='; cat database/MANIFEST.yaml 2>/dev/null")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    chk, _, many = (out or "").partition("===MANIFEST===")
+    missing = [l.split(None, 1)[1].strip() for l in chk.splitlines() if l.startswith("MISSING")]
+    unlisted = [l.split(None, 1)[1].strip() for l in chk.splitlines() if l.startswith("UNLISTED")]
+    summary = next((l.strip() for l in chk.splitlines() if l.startswith("manifest:")), "")
+    # parse the flat manifest items
+    items, cur = [], {}
+    for line in many.splitlines():
+        s = line.strip()
+        if s.startswith("- path:"):
+            if cur:
+                items.append(cur)
+            cur = {"path": s.split(":", 1)[1].strip()}
+        elif cur and ":" in s and not s.startswith("#"):
+            k, _, v = s.partition(":")
+            cur[k.strip()] = v.strip().strip('"')
+    if cur:
+        items.append(cur)
+    manual = [i.get("path") for i in items if i.get("kind") == "manual"]
+    return JSONResponse({"ok": True, "summary": summary, "missing": missing,
+                         "unlisted": unlisted, "manual": manual, "items": items})
+
+
 # ------------------------------------------------------- pipeline pause
 # `hermes pause` is Hermes's own global emergency stop, and it is exactly the
 # right shape for "stop the pipeline but do not lose anything": the dispatcher

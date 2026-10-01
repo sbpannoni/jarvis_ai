@@ -734,6 +734,30 @@ footer{
 .rs-accepted{color:var(--green,#4ade80); border-color:#2f6b43}
 .rs-rejected{color:var(--red); border-color:#7a2f2f}
 .rs-superseded{color:var(--txt-dim)}
+
+/* POOL view -- reference-pool reproducibility (database/MANIFEST.yaml) */
+.pool-pane{display:flex; flex-direction:column; height:100%}
+.pool-bar{display:flex; align-items:center; gap:8px; padding:7px 10px; border-bottom:1px solid var(--line)}
+.pool-bar-title{color:var(--teal); font-family:'Orbitron'; letter-spacing:2px; font-size:12px}
+.pool-bar-sub{color:var(--txt-dim); font-size:11px; font-family:'Rajdhani'}
+.pool-spacer{flex:1 1 auto}
+.pool-count{color:var(--txt-dim); font-size:11px; white-space:nowrap}
+.pool-list{flex:1 1 auto; overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:3px}
+.pool-note{color:var(--txt-dim); padding:10px}
+.pool-note.err{color:var(--red)}
+.pool-warn{border-radius:6px; padding:6px 9px; margin-bottom:6px; font-size:11px; line-height:1.4}
+.pool-warn.ok{color:var(--green,#4ade80); border:1px solid #2f6b43}
+.pool-warn.err{color:var(--red); border:1px solid #7a2f2f}
+.pool-warn.amber{color:var(--amber); border:1px solid #7a5a1a}
+.pool-item{display:flex; align-items:center; gap:10px; padding:4px 6px; border-bottom:1px solid color-mix(in srgb, var(--line) 50%, transparent); font-size:11px}
+.pool-kind{flex:0 0 58px; text-transform:uppercase; font-size:9px; letter-spacing:.5px; border:1px solid var(--line); border-radius:7px; padding:0 5px; text-align:center}
+.pool-fetch{color:var(--cyan); border-color:var(--cyan-dim)}
+.pool-built{color:var(--green,#4ade80); border-color:#2f6b43}
+.pool-promote{color:var(--magenta); border-color:var(--magenta)}
+.pool-manual{color:var(--amber); border-color:#7a5a1a}
+.pool-path{flex:0 0 220px; color:var(--txt); font-family:'Rajdhani'; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.pool-recipe{flex:1 1 auto; color:var(--txt-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.pool-size{flex:0 0 60px; text-align:right; color:var(--txt-dim); font-variant-numeric:tabular-nums}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
 .kb-card-btn.kb-review{color:var(--magenta); border-color:var(--magenta)}
 .kb-card-btn.kb-verify{color:var(--txt-dim)}
