@@ -667,7 +667,10 @@ footer{
 .kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto}
 .kb-family-members{padding:0 6px 6px 16px; display:flex; flex-direction:column; gap:6px}
 .kb-family-members[hidden]{display:none}
+.kb-fam-main{flex:1 1 auto; min-width:0}
+.kb-fam-sub{color:var(--txt-dim); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .kb-merge-all{color:var(--green, #4ade80)}
+.kb-card-btn.kb-fix{color:var(--amber); border-color:#7a5a1a}
 .kb-card-btn.kb-integrate{color:var(--teal); border-color:var(--teal)}
 .kb-card-btn.kb-review{color:var(--magenta); border-color:var(--magenta)}
 .kb-card-btn.kb-verify{color:var(--txt-dim)}

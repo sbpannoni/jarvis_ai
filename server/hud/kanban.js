@@ -86,6 +86,11 @@ let kbLanding = [];
 /* parent->child edges (from /api/kanban/links): group a decomposition's cards
    into one collapsible family in the done lane. */
 let kbEdges = [];
+/* latest integration-review verdict per card ({id: "approve"|"request_changes"|
+   "escalate"}) and the set of ids with a review in flight -- the live review
+   state the board shows so a running/finished review is visible, not silent. */
+let kbReviews = {};
+let kbReviewing = [];
 const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
 
 const KB_COLLAPSED_KEY = "lg-kb-collapsed";
@@ -231,7 +236,10 @@ function kbCardSignature(t){
           t.status === "done" ? kbStaged[t.id] : "",
           // PR/landing state drives the Merge button vs merged/merging chips.
           t.status === "done" ? JSON.stringify(kbPrs[t.id] || null) : "",
-          t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : ""].join("|");
+          t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : "",
+          // Review state drives the review chip / Fix-issues button.
+          t.status === "done" ? (kbReviews[t.id] || "") : "",
+          t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -309,8 +317,19 @@ function kbReviewControl(t){
   if((kbDiffstats[t.id] || 0) <= 0) return "";
   const pr = kbPrs[t.id];
   if(pr && (pr.state === "MERGED" || pr.state === "OPEN")) return "";
+  // Live state: running -> verdict. A running review shows (so it isn't silent);
+  // a non-approve verdict surfaces a one-click "Fix issues" to close the loop.
+  if(kbReviewing.indexOf(t.id) !== -1)
+    return `<span class="kb-chip kb-merging" title="Agentic review running — the verdict posts as a card comment and appears here in a minute.">⟳ reviewing…</span>`;
+  const v = kbReviews[t.id];
+  if(v === "approve")
+    return `<span class="kb-chip kb-merged" title="Agentic review: approved — see the card comment for detail. Safe to Merge.">review ✓</span>`;
+  if(v === "request_changes" || v === "escalate")
+    return `<span class="kb-chip kb-nodiff" title="Agentic review: ${v} — read the card comment. Use 'Fix issues' to dispatch an editor to address it.">review ⚠ ${v === "escalate" ? "escalate" : "changes"}</span>`
+      + `<button class="btn kb-card-btn kb-fix" data-action="fix-review" data-id="${kanbanEsc(t.id)}"
+           title="Dispatch an editor to address the review's requested changes, continuing from this branch (files a [Fix] card and runs it). Re-review and re-Verify the result before Merge.">↻ Fix issues</button>`;
   return `<button class="btn kb-card-btn kb-review" data-action="request-review" data-id="${kanbanEsc(t.id)}"
-     title="Agentic review: send this integration to Hermes's review lane, where a review agent judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. The semantic check Verify (static) and CI (mechanical) can't make.">⇄ Review</button>`;
+     title="Agentic review: a reviewer model judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. Runs in the background (a few min); the verdict posts as a comment and shows here. The semantic check Verify (static) and CI (mechanical) can't make.">⇄ Review</button>`;
 }
 
 /* Is this done card the merge target for its family -- i.e. the integrating
@@ -527,12 +546,30 @@ function kbRenderDoneGrouped(listEl, tasks){
       ? `<button class="btn kb-card-btn kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
            title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For new features whose branches must be integrated, not just the single converged PR.">⚙ Integrate ${codeIds.length}</button>`
       : "";
-    sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":" + codeIds.length + ":"
-      + ordered.map(t => t.id + kbCardSignature(t)).join(",") + ":" + JSON.stringify(kbPrs[lead.id] || null));
+    // Make a collapsed family legible: how many wrote code vs analysis, who
+    // worked it, and the merged tally -- so you can tell what's inside without
+    // expanding.
+    const coded = ordered.filter(t => (kbDiffstats[t.id] || 0) > 0).length;
+    const mergedN = ordered.filter(t => (kbPrs[t.id] || {}).state === "MERGED").length;
+    const whoSet = [...new Set(ordered.map(t => t.assignee).filter(Boolean))];
+    const who = whoSet.slice(0, 3).join(", ") + (whoSet.length > 3 ? ` +${whoSet.length - 3}` : "");
+    const subBits = [`${ordered.length} cards`];
+    if(coded) subBits.push(`${coded} wrote code`);
+    const analysis = ordered.length - coded;
+    if(analysis) subBits.push(`${analysis} analysis`);
+    if(mergedN) subBits.push(`${mergedN} merged`);
+    if(who) subBits.push(who);
+    const sub = subBits.join(" · ");
+    sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":" + codeIds.length + ":" + sub + ":"
+      + ordered.map(t => t.id + kbCardSignature(t)).join(",") + ":" + JSON.stringify(kbPrs[lead.id] || null)
+      + ":rv" + (kbReviews[lead.id] || "") + (kbReviewing.indexOf(lead.id) !== -1 ? "RUN" : ""));
     parts.push(`<div class="kb-family" data-lead="${kanbanEsc(lead.id)}">
       <div class="kb-family-head">
         <span class="kb-fam-toggle">${open ? "▾" : "▸"}</span>
-        <span class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</span>
+        <div class="kb-fam-main">
+          <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
+          <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
+        </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
         ${kbVerifyControl(lead)}${kbReviewControl(lead)}${kbMergeControl(lead)}${integrateBtn}
       </div>
@@ -693,7 +730,13 @@ async function kbProcessFix(panel, btn){
    This merges to master, so it asks once first -- the one guard on the one
    action here that changes the shared repo. */
 async function kbLandCard(panel, btn){
-  if(!confirm("Merge this card's work to DARKHELIX master?\n\nOpens a PR, waits for CI, and squash-merges if green (runs in the background, up to ~30m). If CI fails or the diff is over the size cap, the card is blocked with the reason instead of merging.")) return;
+  // Guardrail: if the agentic review asked for changes/escalated, don't let a
+  // merge slip past it silently -- make the operator acknowledge it.
+  const v = kbReviews[btn.dataset.id];
+  let warn = "";
+  if(v === "request_changes" || v === "escalate")
+    warn = `⚠ The agentic review returned "${v}" on this card — merging will land it over that objection.\nConsider "Fix issues" first.\n\n`;
+  if(!confirm(warn + "Merge this card's work to DARKHELIX master?\n\nOpens a PR, waits for CI, and squash-merges if green (runs in the background, up to ~30m). If CI fails or the diff is over the size cap, the card is blocked with the reason instead of merging.")) return;
   btn.disabled = true;
   btn.textContent = "landing…";
   try{
@@ -706,6 +749,26 @@ async function kbLandCard(panel, btn){
     btn.textContent = "landing → PR + CI…";
     btn.title = "PR opened; waiting on CI, squash-merges if green (up to ~30m). Watch the card: it moves to blocked with a reason if CI fails, and the branch/badge clear when it merges.";
   }catch(err){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = err.message; }
+}
+
+/* Close the loop: dispatch an editor to address the review's requested changes,
+   continuing from this card's branch. Files a [Fix] card and runs it; you
+   re-Review / re-Verify the result before Merge. */
+async function kbFixReview(panel, btn){
+  if(!confirm("Dispatch an editor to fix the review's requested changes?\n\nFiles a [Fix] card that continues from this branch, applies the changes, and runs (GPU seat, several minutes). Re-Review and re-Verify the result before merging.")) return;
+  btn.disabled = true;
+  btn.textContent = "filing fix…";
+  try{
+    const r = await fetch("/api/darkhelix/fix-review", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "fix failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "↻ fixing…";
+    btn.title = `Filed ${j.fix_id} (→ ${j.assignee}); it continues from this branch. Watch for the new [Fix] card.`;
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = "fix failed — retry"; btn.title = err.message; }
 }
 
 /* Agentic (semantic) review of the finished integration: a reviewer model judges
@@ -890,7 +953,7 @@ async function refreshKanbanPanel(panel){
     if(dr && dr.ok){
       try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; }catch{ /* keep last */ }
     }
-    if(lr && lr.ok){ try{ kbEdges = (await lr.json()).edges || []; }catch{ /* keep last */ } }
+    if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
   }catch(err){ renderKanban(panel, {}, err.message); }
@@ -931,6 +994,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
         if(btn.dataset.action === "verify"){ kbVerify(panel, btn); return; }
         if(btn.dataset.action === "request-review"){ kbRequestReview(panel, btn); return; }
+        if(btn.dataset.action === "fix-review"){ kbFixReview(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;

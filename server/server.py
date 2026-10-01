@@ -3826,33 +3826,52 @@ async def kanban_diffstats() -> JSONResponse:
     return JSONResponse({"diffstats": data, "staged": staged, "prs": prs, "landing": landing})
 
 
-_LINKS_CACHE: dict = {"ts": 0.0, "edges": []}
+_LINKS_CACHE: dict = {"ts": 0.0, "edges": [], "reviews": {}}
 _LINKS_TTL = 20.0
+
+# One CT111 kanban.db read: every parent->child edge (E lines) plus the latest
+# integration-review verdict per card (R lines, parsed from the comment the
+# review posts). Two signals the board needs, one round trip.
+_LINKS_QUERY = (
+    "import sqlite3,re\n"
+    "c=sqlite3.connect('file:/root/.hermes/kanban.db?mode=ro',uri=True)\n"
+    "for p,ch in c.execute('SELECT parent_id,child_id FROM task_links'): print('E',p,ch)\n"
+    "rx=re.compile(r'Integration review.*?\\u2192\\s*(\\w+)')\n"
+    "seen={}\n"
+    "for tid,body in c.execute('SELECT task_id,body FROM task_comments ORDER BY rowid'):\n"
+    "    m=rx.match(body or '')\n"
+    "    if m: seen[tid]=m.group(1)\n"
+    "for tid,v in seen.items(): print('R',tid,v)\n"
+)
 
 
 @app.get("/api/kanban/links")
 async def kanban_links() -> JSONResponse:
-    """Every parent->child edge in the board, so the HUD can group a
-    decomposition's cards into one family instead of scattering them across the
-    done lane. Read-only query of the shared kanban.db (the plugin API exposes
-    links only per-card, which would be a request per card). Cached a tick."""
+    """Board extras from the CT111 kanban.db in one read: parent->child edges
+    (so the HUD groups a decomposition into one family) and the latest
+    integration-review verdict per card (parsed from the comment the review
+    posts, so the board shows review state without a request per card). Plus the
+    in-flight review set from HUD memory, so a running review shows live."""
     now = time.time()
+    reviewing = sorted(_REVIEWING)
     if now - _LINKS_CACHE["ts"] < _LINKS_TTL:
-        return JSONResponse({"edges": _LINKS_CACHE["edges"], "cached": True})
-    q = ("import sqlite3; c=sqlite3.connect("
-         "'file:/root/.hermes/kanban.db?mode=ro',uri=True); "
-         "[print(p,ch) for p,ch in c.execute('SELECT parent_id,child_id FROM task_links')]")
+        return JSONResponse({"edges": _LINKS_CACHE["edges"], "reviews": _LINKS_CACHE["reviews"],
+                             "reviewing": reviewing, "cached": True})
     try:
-        rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(q)}")
+        rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(_LINKS_QUERY)}")
     except Exception as exc:
-        return JSONResponse({"edges": [], "error": str(exc)}, status_code=502)
+        return JSONResponse({"edges": [], "reviews": {}, "reviewing": reviewing, "error": str(exc)},
+                            status_code=502)
     edges = []
+    reviews: dict = {}
     for line in (out or "").splitlines():
         parts = line.split()
-        if len(parts) == 2 and _TASK_ID_RE.match(parts[0]) and _TASK_ID_RE.match(parts[1]):
-            edges.append([parts[0], parts[1]])
-    _LINKS_CACHE.update(ts=now, edges=edges)
-    return JSONResponse({"edges": edges})
+        if len(parts) == 3 and parts[0] == "E" and _TASK_ID_RE.match(parts[1]) and _TASK_ID_RE.match(parts[2]):
+            edges.append([parts[1], parts[2]])
+        elif len(parts) == 3 and parts[0] == "R" and _TASK_ID_RE.match(parts[1]):
+            reviews[parts[1]] = parts[2]
+    _LINKS_CACHE.update(ts=now, edges=edges, reviews=reviews)
+    return JSONResponse({"edges": edges, "reviews": reviews, "reviewing": reviewing})
 
 
 def _integrate_card_body(ids: list[str]) -> str:
@@ -4001,6 +4020,7 @@ async def darkhelix_verify_integration(request: Request) -> JSONResponse:
 
 INTEGRATION_REVIEW_PY = "/ssdpool/coder-engine/pipeline/dispatch_integration_review_task.py"
 _REVIEW_TASKS: set = set()
+_REVIEWING: set = set()  # task_ids with a review in flight, for the board's live state
 
 
 @app.post("/api/darkhelix/request-review")
@@ -4070,10 +4090,77 @@ async def darkhelix_request_review(request: Request) -> JSONResponse:
                 pass
         finally:
             _REVIEW_TASKS.discard(asyncio.current_task())
+            _REVIEWING.discard(task_id)
 
+    _REVIEWING.add(task_id)
     t = asyncio.get_running_loop().create_task(_run())
     _REVIEW_TASKS.add(t)
     return JSONResponse({"ok": True, "started": True, "task_id": task_id, "model": model})
+
+
+@app.post("/api/darkhelix/fix-review")
+async def darkhelix_fix_review(request: Request) -> JSONResponse:
+    """Close the loop when a review (or Verify) finds issues: file a [Fix] card
+    that dispatches an editor to ADDRESS the feedback and commit, continuing from
+    the reviewed card's branch (it is the parent, so the provisioner bases the
+    worktree on it -- the editor builds on the integration, it doesn't start
+    over). The latest integration-review comment is handed in as the brief."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    try:
+        detail = await _kanban_task_detail(task_id)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"board unreadable: {exc}"}, status_code=502)
+    task = detail.get("task") or {}
+    feedback = (payload.get("feedback") or "").strip()
+    if not feedback:
+        for c in reversed(detail.get("comments") or []):
+            b = (c.get("body") or "")
+            if b.startswith("Integration review"):
+                feedback = b
+                break
+    if not feedback:
+        feedback = "(no review comment found; address any outstanding Verify/review issues on this card)"
+    title = (task.get("title") or "").strip()
+    base = title
+    for p in ("[Integrate]", "[Fix]", "[Review]"):
+        if base.startswith(p):
+            base = base[len(p):].strip()
+    fix_title = (f"[Fix] {base} — review changes" if base else f"[Fix] {task_id} — review changes")[:200]
+    body = (
+        "Address the integration review's requested changes below, then COMMIT to "
+        "this card's branch. Your worktree is provisioned from the reviewed card's "
+        "branch (its parent) -- continue from that work, do not start over.\n\n"
+        "- Make the changes the review asks for.\n"
+        "- Keep/extend tests for the new behaviour; do not weaken existing tests.\n"
+        "- Run `pytest tests/` and make it pass before completing.\n\n"
+        "If the feedback cannot be addressed safely, BLOCK this card "
+        "(`--kind needs_input`) with why -- do not complete it unaddressed.\n\n"
+        f"Reviewed card: {task_id} ({title})\n\n--- review feedback ---\n{feedback}"
+    )
+    assignee = ((payload.get("assignee") or "").strip() or (task.get("assignee") or "").strip()
+                or _darkhelix_assignee())
+    create = (
+        "hermes kanban create "
+        f"{shlex.quote(fix_title)} "
+        f"--body {shlex.quote(body)} "
+        f"--workspace scratch --parent {shlex.quote(task_id)} "
+        "--created-by looking-glass --json"
+    )
+    try:
+        rc, out = await _kanban_ssh(create)
+        if rc != 0:
+            return JSONResponse({"ok": False, "error": out[-1000:]}, status_code=502)
+        data = json.loads(out.strip())
+        fix_id = str(data.get("id") or data.get("task_id") or "")
+        if not _TASK_ID_RE.match(fix_id):
+            return JSONResponse({"ok": False, "error": f"fix card id unparseable: {fix_id!r}"}, status_code=502)
+        await _patch_task(fix_id, status="ready", assignee=assignee)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "fix_id": fix_id, "assignee": assignee})
 
 
 # ------------------------------------------------------- pipeline pause
