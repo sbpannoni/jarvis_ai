@@ -4311,12 +4311,18 @@ async def darkhelix_capture_research(request: Request) -> JSONResponse:
     )
     b64 = base64.b64encode(record.encode("utf-8")).decode("ascii")
     msg = f"research: {title[:60]} (from {task_id})"
+    # Idempotent: re-submitting the SAME card overwrites its own record rather
+    # than making a duplicate. Only a DIFFERENT card whose title yields the same
+    # slug gets a card-keyed name, so distinct cards never clobber each other.
+    # If the write changes nothing, succeed without an empty commit/push.
     script = (
         f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && git pull --rebase -q 2>/dev/null; "
         f"d={shlex.quote(DARKHELIX_RESEARCH_DIR)}; mkdir -p \"$d\"; "
-        f"f=\"$d/{slug}.md\"; [ -e \"$f\" ] && f=\"$d/{slug}-{task_id[2:8]}.md\"; "
-        f"printf %s {shlex.quote(b64)} | base64 -d > \"$f\" && "
-        f"git add \"$f\" && git commit -q -m {shlex.quote(msg)} && git push -q && echo \"OK $f\""
+        f"f=\"$d/{slug}.md\"; "
+        f"if [ -e \"$f\" ] && ! grep -q {shlex.quote('card_id: ' + task_id)} \"$f\"; then f=\"$d/{slug}-{task_id[2:8]}.md\"; fi; "
+        f"printf %s {shlex.quote(b64)} | base64 -d > \"$f\"; git add \"$f\"; "
+        f"if git diff --cached --quiet -- \"$f\"; then echo \"OK $f\"; "
+        f"else git commit -q -m {shlex.quote(msg)} && git push -q && echo \"OK $f\"; fi"
     )
     try:
         rc, out = await _fleet_ssh("snarf", script)

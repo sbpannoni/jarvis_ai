@@ -109,6 +109,10 @@ let kbActSeeded = false;
 let kbPrevRunning = {};
 let kbPrevReviewing = {};
 let kbPrevPrState = {};
+/* card_ids that already have a docs/research record (findings submitted), so a
+   done analysis card shows "✓ submitted" instead of re-arming the Submit button
+   -- re-submitting is now idempotent server-side, but the UI shouldn't invite it. */
+let kbCaptured = {};
 const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
 const KB_ARCHIVED_KEY = "lg-kb-show-archived";  // show the archived lane
 
@@ -260,7 +264,9 @@ function kbCardSignature(t){
           t.status === "done" ? (kbReviews[t.id] || "") : "",
           t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : "",
           // Static-verify verdict drives the ✓/⚠ tests chip.
-          t.status === "done" ? (kbVerified[t.id] || "") : ""].join("|");
+          t.status === "done" ? (kbVerified[t.id] || "") : "",
+          // Captured flag swaps Submit findings → "✓ submitted".
+          t.status === "done" ? (kbCaptured[t.id] ? "C" : "") : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -365,9 +371,12 @@ function kbDoneControls(t, opts){
   // into docs/research (committed), so a done analysis card -- including one with
   // no branch (diffstats null) and an analysis family's lead -- isn't a GUI dead
   // end. Not offered on review/fix-chain cards, which have their own flow.
-  if(!kbChainKind(t))
+  if(!kbChainKind(t)){
+    if(kbCaptured[id])
+      return chip("kb-st-done", "✓ submitted", "Findings already filed to docs/research/. Archive when you're done; re-submitting only updates that record.");
     return btn("kb-primary", "capture-research", "Submit findings",
       "File this card's findings into docs/research/ (committed to the repo) as a queryable record — the analysis counterpart to Merge. Edit the record afterward to sharpen the recommendation/tags.");
+  }
   return "";
 }
 
@@ -929,6 +938,8 @@ async function kbCaptureResearch(panel, btn){
     if(!j.ok){ btn.disabled = false; btn.textContent = "capture failed — retry"; btn.title = j.error || ""; return; }
     btn.textContent = "✓ captured";
     btn.title = `Wrote ${j.path}`;
+    kbCaptured[btn.dataset.id] = true;
+    kbRefreshCaptured(panel);   // re-render so the card shows "✓ submitted" + Archive
     if(typeof openResearch === "function") openResearch();
   }catch(err){ btn.disabled = false; btn.textContent = "capture failed — retry"; btn.title = err.message; }
 }
@@ -1104,6 +1115,19 @@ async function kbActivityPoll(){
   }catch{ /* leave the feed as-is */ }
 }
 setInterval(kbActivityPoll, 20000);
+
+/* Which done cards already have a docs/research record (by card_id). Refreshed
+   on board open and after a capture; a card in here shows "✓ submitted". */
+async function kbRefreshCaptured(panel){
+  try{
+    const r = await fetch("/api/darkhelix/research");
+    const j = await r.json();
+    const map = {};
+    (j.records || []).forEach(rec => { if(rec.card_id) map[rec.card_id] = true; });
+    kbCaptured = map;
+    if(panel) refreshKanbanPanel(panel);
+  }catch{ /* leave the flags as-is */ }
+}
 
 /* Archive every card in a merged family in one go -- the done lane keeps the
    whole decomposition around after it lands, which is clutter once it's in
@@ -1410,6 +1434,7 @@ function openKanbanBoard(){
     sel.onchange = () => { kbPrefSave(KB_ASSIGNEE_KEY, sel.value); refreshKanbanPanel(panel); };
 
     refreshKanbanPanel(panel);
+    kbRefreshCaptured(panel);   // which analysis cards already have a research record
     // Cards change state on the dispatcher's tick; keep it current but light.
     const iv = setInterval(()=>refreshKanbanPanel(panel), 15000);
     tab.onBeforeClose = () => clearInterval(iv);
