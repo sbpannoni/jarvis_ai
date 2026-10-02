@@ -359,6 +359,15 @@ function kbDoneControls(t, opts){
     return chips + btn("kb-primary", "land", "Merge",
       "Merge this card's work to master: opens a PR, waits for CI, squash-merges if green (background). Asks once.");
   }
+
+  // No code produced: a finished analysis / findings card (code lands via Merge;
+  // analysis lands via this). Its submittable action is to file the findings
+  // into docs/research (committed), so a done analysis card -- including one with
+  // no branch (diffstats null) and an analysis family's lead -- isn't a GUI dead
+  // end. Not offered on review/fix-chain cards, which have their own flow.
+  if(!kbChainKind(t))
+    return btn("kb-primary", "capture-research", "Submit findings",
+      "File this card's findings into docs/research/ (committed to the repo) as a queryable record — the analysis counterpart to Merge. Edit the record afterward to sharpen the recommendation/tags.");
   return "";
 }
 
@@ -432,9 +441,7 @@ function kbCardInner(t, opts){
         // code the fix: files a dispatchable [Fix] card from this card's content.
         + ((noWork && !((t.link_counts || {}).children))
             ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
-                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>
-               <button class="btn kb-card-btn kb-research" data-action="capture-research" data-id="${kanbanEsc(t.id)}"
-                 title="Capture this card's findings into docs/research/ as a machine-readable record (committed to the repo), so a future feature/upgrade can query it. Use for analysis/research cards; edit the record afterward to sharpen the recommendation and tags.">⎘ Research</button>`
+                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
             : "")
         // Landing state (merged/merging/landing/Merge) -- shared with family heads.
         // Suppressed on a family member: the family merges as one via its head.
