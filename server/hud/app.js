@@ -44,6 +44,10 @@ const LG_ICONS = {
   theme:      '<path d="M20 13A8 8 0 1 1 11 4a6 6 0 0 0 9 9Z"/>',
   panels:     '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M14 4.5v15"/>',
   idea:       '<path d="M9.5 18.5h5M10.5 21.5h3M12 2.5a6 6 0 0 0-3.7 10.8c.6.5.9 1 .9 1.7v.5h5.6v-.5c0-.7.3-1.2.9-1.7A6 6 0 0 0 12 2.5Z"/>',
+  merge:      '<path d="M12 20V9M12 9l-4 4M12 9l4 4M5 4h14"/>',
+  archive:    '<rect x="3.5" y="4" width="17" height="4" rx="1"/><path d="M5 8v10.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/>',
+  pause:      '<path d="M9 5v14M15 5v14"/>',
+  play:       '<path d="M8 5.5v13l10.5-6.5z"/>',
 };
 function lgIcon(name, cls){
   return `<svg class="lg-ic${cls ? " " + cls : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" `

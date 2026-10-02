@@ -563,13 +563,19 @@ function kbRenderDoneGrouped(listEl, tasks){
     // offer the agentic merge alongside the programmatic one.
     const codeIds = ordered.filter(t => (kbDiffstats[t.id] || 0) > 0
       && !(kbPrs[t.id] && (kbPrs[t.id].state === "MERGED" || kbPrs[t.id].state === "OPEN"))).map(t => t.id);
-    // Suppress when the family is already converging via the lead's PR (the
-    // programmatic path has it) -- agentic weaving is for the un-converged case.
+    // Agentic Integrate is for a family of LOOSE code branches that nothing has
+    // woven yet. Suppress it when:
+    //  - the lead already has a PR (the programmatic path is converging), OR
+    //  - the lead is itself a done [Integrate] card WITH commits -- its branch
+    //    already subsumes the siblings, so re-weaving it is wrong; Merge it.
+    // Without this, every multi-code family (including already-integrated ones)
+    // showed "Integrate N" and hid Merge -- the lead's work had nowhere to land.
     const leadPr = kbPrs[lead.id];
     const converging = !!(leadPr && (leadPr.state === "MERGED" || leadPr.state === "OPEN"));
-    const integrateBtn = (!converging && codeIds.length >= 2)
+    const leadIsIntegration = (lead.title || "").startsWith("[Integrate]") && (kbDiffstats[lead.id] || 0) > 0;
+    const integrateBtn = (!converging && !leadIsIntegration && codeIds.length >= 2)
       ? `<button class="btn kb-card-btn kb-primary kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
-           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For new features whose branches must be integrated, not just the single converged PR.">Integrate ${codeIds.length}</button>`
+           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For loose feature branches that no integration card has woven yet.">Integrate ${codeIds.length}</button>`
       : "";
     // Make a collapsed family legible: how many wrote code vs analysis, who
     // worked it, and the merged tally -- so you can tell what's inside without
@@ -713,7 +719,7 @@ async function refreshKanbanPause(panel){
     const j = await r.json();
     const paused = !!j.paused;
     btn.dataset.paused = paused ? "1" : "";
-    btn.textContent = paused ? "▶ resume dispatch" : "⏸ pause dispatch";
+    btn.innerHTML = (paused ? lgIcon("play") : lgIcon("pause")) + (paused ? " resume dispatch" : " pause dispatch");
     btn.classList.toggle("on", paused);
     banner.hidden = !paused;
     if(paused){
@@ -1072,9 +1078,9 @@ function openKanbanBoard(){
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
         <span class="kb-head-group">
           <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">${lgIcon("idea")} … pending learning</button>
-          <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">⤴ merge all</button>
-          <button class="kb-arch-toggle" type="button" title="Show the archived lane — merged cards (auto-archived on merge) and dismissed ones live here.">⊟ archived</button>
-          <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
+          <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">${lgIcon("merge")} merge all</button>
+          <button class="kb-arch-toggle" type="button" title="Show the archived lane — merged cards (auto-archived on merge) and dismissed ones live here.">${lgIcon("archive")} archived</button>
+          <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">${lgIcon("pause")} pause dispatch</button>
         </span>
       </div>
       <div class="kb-paused-banner" hidden></div>
@@ -1168,7 +1174,7 @@ function openKanbanBoard(){
       const sync = () => {
         const on = kbPrefLoad(KB_ARCHIVED_KEY, false);
         archBtn.classList.toggle("on", on);
-        archBtn.textContent = on ? "⊟ hide archived" : "⊟ archived";
+        archBtn.innerHTML = lgIcon("archive") + (on ? " hide archived" : " archived");
       };
       sync();
       archBtn.onclick = () => {
