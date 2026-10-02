@@ -102,6 +102,13 @@ let kbVerified = {};
 let kbVerifyInflight = [];
 let kbAutoReviewInflight = [];
 let kbAutoAssessOn = kbPrefLoad("lg-kb-autoassess", true);
+/* AGENT ACTIVITY feed: the left panel was dead (it only logged HUD chat
+   tool-use, which goes unused). These track the last poll so kbTrackActivity
+   can emit real agent work -- dispatches, reviews, merges -- into #activity. */
+let kbActSeeded = false;
+let kbPrevRunning = {};
+let kbPrevReviewing = {};
+let kbPrevPrState = {};
 const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
 const KB_ARCHIVED_KEY = "lg-kb-show-archived";  // show the archived lane
 
@@ -497,6 +504,7 @@ function kbLaneEl(lanesEl, name){
   lane.dataset.status = name;
   lane.innerHTML = `<div class="kb-lane-head" title="Collapse or expand this lane">
       <span class="kb-lane-name">${kanbanEsc(name)}</span>
+      <span class="kb-lane-active" hidden></span>
       <span class="kb-lane-count">0</span>
     </div>
     <div class="kb-lane-list"></div>`;
@@ -670,6 +678,22 @@ function renderKanban(panel, board, err){
       ? (col.tasks || []).filter(t => t.assignee === filter)
       : (col.tasks || []);
     lane.querySelector(".kb-lane-count").textContent = list.length;
+    // The DONE lane hosts real background processes the vendor's `running` lane
+    // can't show: agentic reviews, lands, and open-PR merges (CI). Surface a
+    // live count in the lane header so Done isn't just a static pile.
+    const actEl = lane.querySelector(".kb-lane-active");
+    if(actEl){
+      if(col.name === "done"){
+        const merging = list.filter(t => (kbPrs[t.id] || {}).state === "OPEN").length;
+        const bits = [];
+        if(kbReviewing.length) bits.push(kbReviewing.length + " assessing");
+        if(merging) bits.push(merging + " merging");
+        if(kbLanding.length) bits.push(kbLanding.length + " landing");
+        if(bits.length){ actEl.hidden = false; actEl.textContent = "⟳ " + bits.join(" · ");
+          actEl.title = "Background processes on done cards — not kanban workers, so they don't show in the running lane"; }
+        else actEl.hidden = true;
+      } else actEl.hidden = true;
+    }
     // Auto: an empty lane collapses to a rail so the occupied lanes get the
     // width. An explicit click overrides that, in either direction.
     const override = collapsed[col.name];
@@ -918,6 +942,64 @@ function kbAutoReview(id){
     .finally(() => { kbAutoReviewInflight = kbAutoReviewInflight.filter(x => x !== id); });
 }
 
+/* Emit real agent work into the AGENT ACTIVITY feed by diffing each poll
+   against the last: workers dispatched/finished, reviews started/returned, PRs
+   opened/merged. The first poll seeds state silently so opening the board
+   doesn't replay the whole backlog. Reuses addActivity() from app.js. */
+function kbActTitle(t){
+  const c = kbChainKind(t);
+  let s = ((c ? c.rest : (t && t.title)) || (t && t.id) || "").replace(/^\[(Integrate|Fix|Review)\]\s*/, "");
+  return s.length > 46 ? s.slice(0, 45) + "…" : s;
+}
+function kbTrackActivity(tasks){
+  if(typeof addActivity !== "function") return;
+  const byId = {}; (tasks || []).forEach(t => { byId[t.id] = t; });
+  const titleOf = id => byId[id] ? kbActTitle(byId[id]) : id;
+  const running = {}, reviewing = {}, prState = {};
+  (tasks || []).forEach(t => { if(t.status === "running") running[t.id] = kbActTitle(t); });
+  kbReviewing.forEach(id => { reviewing[id] = true; });
+  Object.keys(kbPrs).forEach(id => { const pr = kbPrs[id]; if(pr && pr.state) prState[id] = pr.state; });
+
+  if(!kbActSeeded){
+    // Seed: show what's happening NOW so the panel reflects live agent work on
+    // load, not a blank until the next transition.
+    Object.keys(running).forEach(id => addActivity("running · " + running[id]));
+    Object.keys(reviewing).forEach(id => addActivity("reviewing · " + titleOf(id)));
+  }else{
+    Object.keys(running).forEach(id => { if(!kbPrevRunning[id]) addActivity("dispatched · " + running[id]); });
+    Object.keys(kbPrevRunning).forEach(id => { if(!running[id]) addActivity("worker done · " + kbPrevRunning[id]); });
+    Object.keys(reviewing).forEach(id => { if(!kbPrevReviewing[id]) addActivity("reviewing · " + titleOf(id)); });
+    Object.keys(kbPrevReviewing).forEach(id => { if(!reviewing[id]) addActivity("review " + (kbReviews[id] || "done") + " · " + titleOf(id)); });
+    Object.keys(prState).forEach(id => {
+      if(kbPrevPrState[id] !== prState[id]){
+        const n = (kbPrs[id] || {}).number || "?";
+        if(prState[id] === "OPEN") addActivity("merging #" + n + " · " + titleOf(id));
+        else if(prState[id] === "MERGED") addActivity("merged #" + n + " · " + titleOf(id));
+      }
+    });
+  }
+  kbPrevRunning = running; kbPrevReviewing = reviewing; kbPrevPrState = prState; kbActSeeded = true;
+}
+
+/* Always-on, lightweight feed poll so AGENT ACTIVITY stays live even when the
+   kanban tab is closed. Fetches only tasks + links (NOT the git-heavy
+   diffstats); PR-merge transitions still arrive via the board's own poll when
+   it's open. kbTrackActivity is idempotent (it advances kbPrev* each call), so
+   running it here and in refreshKanbanPanel cannot double-emit. */
+async function kbActivityPoll(){
+  try{
+    const [tr, lr] = await Promise.all([
+      fetch("/api/kanban").catch(() => null),
+      fetch("/api/kanban/links").catch(() => null),
+    ]);
+    let tasks = [];
+    if(tr && tr.ok){ try{ tasks = (await tr.json()).tasks || []; }catch{ /* keep */ } }
+    if(lr && lr.ok){ try{ const lj = await lr.json(); kbReviewing = lj.reviewing || kbReviewing; kbReviews = lj.reviews || kbReviews; }catch{ /* keep */ } }
+    kbTrackActivity(tasks);
+  }catch{ /* leave the feed as-is */ }
+}
+setInterval(kbActivityPoll, 20000);
+
 /* Agentic merge: file an [Integrate] card parented to a family's code branches
    and dispatch an editor to weave them into one coherent change WITH tests. The
    result is an ordinary [Integrate] card you review and Merge (CI-gated), so an
@@ -1065,6 +1147,8 @@ async function refreshKanbanPanel(panel){
     // already on the card, not a gate the human clicks through. Results land in
     // kbVerified / kbReviews and show on the next poll (or sooner, below).
     kbAutoAssess(j.tasks || []);
+    // Feed real agent work (dispatches / reviews / merges) into AGENT ACTIVITY.
+    kbTrackActivity(j.tasks || []);
   }catch(err){ renderKanban(panel, {}, err.message); }
 }
 
