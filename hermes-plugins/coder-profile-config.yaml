@@ -1,6 +1,6 @@
 model:
   provider: vllm
-  default: qwen3.6-27b-awq
+  default: deepseek-v4-flash-0731-long
   # Route via the model-name-rewriting proxy (hermes-model-proxy.service),
   # NOT snarf:8000 directly. snarf serves ONE model at a time, so the
   # `default:` name above 404s whenever a different one is loaded; the
@@ -57,6 +57,8 @@ approvals:
     - git push* origin master*
     - git branch -D main*
 skills:
+  external_dirs:
+  - /root/.hermes/shared-skills
   write_approval: true
   guard_agent_created: true
 memory:
@@ -94,6 +96,7 @@ platform_toolsets:
 plugins:
   enabled:
     - darkhelix-engine
+    - darkhelix-triage-guard
 
 # Serialise sub-agent spawning. Kanban workers run with HERMES_HOME set to THIS
 # profile, and delegation caps are read per-profile (delegate_tool._load_config),
@@ -103,3 +106,15 @@ delegation:
   max_concurrent_children: 1
   max_spawn_depth: 1
   max_async_children: 1
+
+# Agent tool-executor deadline for one tool call. The default (420s,
+# tool_executor._DEFAULT_CONCURRENT_TOOL_TIMEOUT_S) was abandoning
+# dispatch_to_engine mid-run: the darkhelix-engine plugin gives the engine
+# SSH_TIMEOUT=2100s, but the executor killed the call at 420s, so a test-suite
+# build (slow on the v4-flash editor) never returned and the worker looped,
+# burning engine attempts. Match the plugin so the executor waits as long as
+# the engine is allowed to run. (CT112 under the kanban/engine lease, 2026-10-01.)
+timeouts:
+  tools:
+    sequential_call: 3900
+    concurrent_batch: 3900

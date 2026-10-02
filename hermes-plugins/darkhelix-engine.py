@@ -64,7 +64,7 @@ HERMES = "/usr/local/bin/hermes"
 # The container itself is capped at 1500s by dispatch_task.py; allow headroom
 # for image pull, worktree setup and teardown, then give up rather than hang
 # a worker session forever.
-SSH_TIMEOUT = 2100
+SSH_TIMEOUT = 3800
 
 # Attempts are bounded here, not by asking the model to keep count. Past this
 # the answer is not another run.
@@ -236,6 +236,39 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
     if patch_remote and patch_remote.startswith("/output/"):
         patch_remote = out_dir.rstrip("/") + patch_remote[len("/output"):]
     attached = None
+
+    # Advance the CARD's own branch to the work the engine just committed.
+    # The merge must happen before we compute the commit SHA, because
+    # `git rev-parse <branch>` reads the card branch (which is advanced by
+    # this merge) — not the engine branch itself.
+    #
+    # Without this the card branch stays empty and the work lives only on
+    # hermes/<task>-engine-<n>. Provisioning chains a child off its PARENT'S
+    # CARD BRANCH, so every child was cut from an empty branch and inherited
+    # nothing -- the exact "each task spawns without the previous task's
+    # changes" problem the worktree chaining was built to solve, reappearing
+    # one level down.
+    #
+    # It is not cosmetic. On 2026-08-28 t_9df9cb50 removed a workaround in
+    # coord_liftover.py that only becomes safe once its parent's
+    # gene_prediction.py fix is present -- and gated its tests against a tree
+    # where that fix was absent. The suite passed, proving the change works
+    # against the OLD behaviour, which is precisely backwards.
+    #
+    # --ff-only on purpose: the engine cut its branch from this branch's HEAD,
+    # so a fast-forward is the only correct outcome. If it is not a
+    # fast-forward something moved underneath us and the right answer is to
+    # say so, not to merge.
+    ff = _ssh(f"cd {shlex.quote(worktree)} && "
+              f"git merge --ff-only {shlex.quote(branch)} 2>&1", timeout=120)
+    card_branch_advanced = ff.returncode == 0
+
+    # The commit this attempt actually produced. Used to NAME the patch, so an
+    # artifact can never misrepresent which code it is.
+    sha_p = _ssh(f"cd {shlex.quote(worktree)} && git rev-parse --short {shlex.quote(branch)}",
+                 timeout=60)
+    sha = (sha_p.stdout or "").strip()[:12] or f"attempt{n}"
+
     if patch_remote:
         os.makedirs(LOCAL_PATCHES, exist_ok=True)
         # Named by COMMIT, not by attempt number.
@@ -265,35 +298,6 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
             attached = f"scp failed: {scp.stderr[-300:]}"
 
     patch_ok = bool(attached) and not str(attached).startswith(("scp failed", "attach failed"))
-    # Advance the CARD's own branch to the work the engine just committed.
-    #
-    # Without this the card branch stays empty and the work lives only on
-    # hermes/<task>-engine-<n>. Provisioning chains a child off its PARENT'S
-    # CARD BRANCH, so every child was cut from an empty branch and inherited
-    # nothing -- the exact "each task spawns without the previous task's
-    # changes" problem the worktree chaining was built to solve, reappearing
-    # one level down.
-    #
-    # It is not cosmetic. On 2026-08-28 t_9df9cb50 removed a workaround in
-    # coord_liftover.py that only becomes safe once its parent's
-    # gene_prediction.py fix is present -- and gated its tests against a tree
-    # where that fix was absent. The suite passed, proving the change works
-    # against the OLD behaviour, which is precisely backwards.
-    #
-    # --ff-only on purpose: the engine cut its branch from this branch's HEAD,
-    # so a fast-forward is the only correct outcome. If it is not a
-    # fast-forward something moved underneath us and the right answer is to
-    # say so, not to merge.
-    ff = _ssh(f"cd {shlex.quote(worktree)} && "
-              f"git merge --ff-only {shlex.quote(branch)} 2>&1", timeout=120)
-    card_branch_advanced = ff.returncode == 0
-
-    # The commit this attempt actually produced. Used to NAME the patch, so an
-    # artifact can never misrepresent which code it is.
-    sha_p = _ssh(f"cd {shlex.quote(worktree)} && git rev-parse --short {shlex.quote(branch)}",
-                 timeout=60)
-    sha = (sha_p.stdout or "").strip()[:12] or f"attempt{n}"
-
     # Name the commit in the summary too: whoever reviews this should be able
     # to check any artifact against the branch without guessing.
     summary = (f"engine attempt {n} passed its test gate on {branch} at {sha}; "
