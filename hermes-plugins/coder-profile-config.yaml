@@ -116,5 +116,5 @@ delegation:
 # the engine is allowed to run. (CT112 under the kanban/engine lease, 2026-10-01.)
 timeouts:
   tools:
-    sequential_call: 3900
-    concurrent_batch: 3900
+    sequential_call: 13200
+    concurrent_batch: 13200

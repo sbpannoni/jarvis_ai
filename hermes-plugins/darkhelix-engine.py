@@ -64,7 +64,7 @@ HERMES = "/usr/local/bin/hermes"
 # The container itself is capped at 1500s by dispatch_task.py; allow headroom
 # for image pull, worktree setup and teardown, then give up rather than hang
 # a worker session forever.
-SSH_TIMEOUT = 3800
+SSH_TIMEOUT = 12600
 
 # Attempts are bounded here, not by asking the model to keep count. Past this
 # the answer is not another run.
