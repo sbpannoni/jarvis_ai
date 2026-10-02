@@ -552,6 +552,16 @@ footer{
 .kb-head-help:hover{border-color:var(--cyan); color:var(--cyan)}
 .kb-head-group{display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end}
 .kb-board-err{padding:10px}
+/* Branch ribbon above the board: active branches vs the master spine. */
+.kb-branchbar{flex:0 0 auto; padding:1px 6px 3px; overflow:hidden}
+.kb-branchbar[hidden]{display:none}
+.kb-branchbar svg{display:block; height:54px}
+.kb-br{cursor:pointer}
+.kb-br:hover circle{filter:brightness(1.35)}
+.kb-br:hover path, .kb-br:hover line{stroke-width:3}
+.kb-br-master{font-family:'Orbitron'; font-size:8px; letter-spacing:1px; fill:var(--txt-dim); text-transform:uppercase}
+.kb-br-more{font-family:'Rajdhani'; font-size:10px; fill:var(--txt-dim)}
+.kb-br-live{animation:kbPulse 1.4s ease-in-out infinite}
 
 /* ---- lanes ----
    Horizontal strip of status columns. The lane row is the only thing that

@@ -620,6 +620,69 @@ function kbRenderDoneGrouped(listEl, tasks){
   if(listEl.dataset.gsig !== gsig){ listEl.dataset.gsig = gsig; listEl.innerHTML = parts.join(""); }
 }
 
+/* Branch ribbon above the board: each active DARKHELIX branch vs master, one
+   per done family lead that wrote code (same grouping as the done lane, so the
+   strip stays legible instead of drawing every child branch). Master is a
+   horizontal spine; a merged branch arcs ABOVE and rejoins it (green), an
+   open/unmerged branch drops BELOW to a node (cyan = open PR/CI, amber =
+   unmerged, hollow). Driven by the kbDiffstats/kbPrs the board already has. */
+function kbRenderBranchBar(host, tasks){
+  if(!host) return;
+  const done = (tasks || []).filter(t => t.status === "done");
+  const find = kbComponents(kbEdges);
+  const byRoot = new Map();
+  done.forEach(t => { const r = find(t.id); (byRoot.get(r) || byRoot.set(r, []).get(r)).push(t); });
+  let branches = [];
+  byRoot.forEach(members => {
+    const lead = members.length === 1 ? members[0] : kbFamilyLead(members);
+    if((kbDiffstats[lead.id] || 0) > 0){
+      const pr = kbPrs[lead.id] || {};
+      let state = "unmerged";
+      if(pr.state === "MERGED") state = "merged";
+      else if(pr.state === "OPEN" || kbLanding.indexOf(lead.id) !== -1) state = "merging";
+      branches.push({ id: lead.id, title: kbActTitle(lead), ahead: kbDiffstats[lead.id] || 0,
+                      state, pr: pr.number, url: pr.url });
+    }
+  });
+  if(!branches.length){ host.hidden = true; host.innerHTML = ""; host.dataset.sig = ""; return; }
+  const rank = { merging: 2, unmerged: 1, merged: 0 };
+  const CAP = 18;
+  branches.sort((a, b) => (rank[b.state] - rank[a.state]) || (b.ahead - a.ahead));  // live first, for the cap
+  let extra = 0;
+  if(branches.length > CAP){ extra = branches.length - CAP; branches = branches.slice(0, CAP); }
+  branches.sort((a, b) => (rank[a.state] - rank[b.state]) || (b.ahead - a.ahead));  // display: merged (history) left → live right
+
+  host.hidden = false;
+  const W = Math.max(host.clientWidth || 900, 240), H = 54, spineY = 28, topY = 9, botY = 46, mL = 52, mR = 20;
+  const sig = W + "|" + extra + "|" + branches.map(b => b.id + b.state + b.ahead).join(",");
+  if(host.dataset.sig === sig) return;   // nothing changed; don't rebuild (kills no hover)
+  host.dataset.sig = sig;
+  const usable = (W - mL - mR - (extra ? 34 : 0));
+  const step = usable / branches.length;
+  const COL = { merged: "var(--teal)", merging: "var(--cyan)", unmerged: "var(--amber)" };
+  let g = "";
+  branches.forEach((b, i) => {
+    const x = mL + step * (i + 0.5), c = COL[b.state];
+    const label = `${b.state}${b.pr ? " #" + b.pr : ""} · ${b.title} (+${b.ahead})`;
+    let shape;
+    if(b.state === "merged"){
+      shape = `<path d="M${(x-10).toFixed(1)},${spineY} Q${x.toFixed(1)},${topY} ${(x+10).toFixed(1)},${spineY}" fill="none" stroke="${c}" stroke-width="2"/>`
+            + `<circle cx="${x.toFixed(1)}" cy="${topY+3}" r="3" fill="${c}"/>`;
+    }else{
+      const hollow = b.state === "unmerged";
+      shape = `<line x1="${x.toFixed(1)}" y1="${spineY}" x2="${x.toFixed(1)}" y2="${botY}" stroke="${c}" stroke-width="2"/>`
+            + `<circle cx="${x.toFixed(1)}" cy="${botY}" r="3.4" fill="${hollow ? "var(--bg)" : c}" stroke="${c}" stroke-width="2"${b.state === "merging" ? ' class="kb-br-live"' : ""}/>`;
+    }
+    g += `<g class="kb-br" data-id="${kanbanEsc(b.id)}"${b.url ? ` data-url="${kanbanEsc(b.url)}"` : ""}>`
+       + `<title>${kanbanEsc(label)}</title><circle cx="${x.toFixed(1)}" cy="${spineY}" r="2.2" fill="${c}"/>${shape}</g>`;
+  });
+  const spine = `<line x1="${mL}" y1="${spineY}" x2="${W-mR}" y2="${spineY}" stroke="var(--line)" stroke-width="2"/>`
+    + `<path d="M${W-mR},${spineY} l-7,-4 v8 z" fill="var(--line)"/>`
+    + `<text x="6" y="${spineY+3.5}" class="kb-br-master">master</text>`;
+  const more = extra ? `<text x="${W-mR}" y="${botY}" text-anchor="end" class="kb-br-more">+${extra}</text>` : "";
+  host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMinYMid meet">${spine}${g}${more}</svg>`;
+}
+
 function renderKanban(panel, board, err){
   const lanesEl = panel.querySelector(".kb-lanes");
   const sourceEl = panel.querySelector(".kb-source");
@@ -712,6 +775,8 @@ function renderKanban(panel, board, err){
   lanesEl.querySelectorAll(".kb-lane").forEach(l => {
     if(!names.has(l.dataset.status)) l.remove();
   });
+
+  kbRenderBranchBar(panel.querySelector(".kb-branchbar"), tasks);
 
   if(sourceEl){
     // Say so when the board came from the ssh fallback: the cards are real
@@ -1168,6 +1233,7 @@ function openKanbanBoard(){
         </span>
       </div>
       <div class="kb-paused-banner" hidden></div>
+      <div class="kb-branchbar" hidden title="Active DARKHELIX branches vs master — green=merged, cyan=open PR (CI), amber=unmerged. Click a branch for its card / PR."></div>
       <div class="kb-lanes"></div>`;
     panel.classList.add("kanban-pane");
     const learnBtn = panel.querySelector(".kb-learning");
@@ -1225,6 +1291,15 @@ function openKanbanBoard(){
       }
       const card = e.target.closest(".kb-card");
       if(card) openTaskLog(card.dataset.id);
+    });
+
+    // Branch ribbon: click a branch to open its PR (if it has one) or its card.
+    const branchbar = panel.querySelector(".kb-branchbar");
+    if(branchbar) branchbar.addEventListener("click", (e) => {
+      const br = e.target.closest(".kb-br");
+      if(!br) return;
+      if(br.dataset.url) window.open(br.dataset.url, "_blank", "noopener");
+      else if(br.dataset.id) openTaskLog(br.dataset.id);
     });
 
     const pauseBtn = panel.querySelector(".kb-pause");
