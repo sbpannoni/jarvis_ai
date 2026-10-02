@@ -828,6 +828,9 @@ button.btn.kb-card-btn.kb-primary{
 button.btn.kb-card-btn.kb-primary:hover{
   box-shadow:0 0 10px color-mix(in srgb, var(--cyan) 55%, transparent); filter:brightness(1.08);
 }
+/* Archive-family is a secondary cleanup action, not the primary one. */
+.kb-card-btn.kb-fam-archive{color:var(--txt-dim); border-color:var(--line); background:transparent}
+.kb-card-btn.kb-fam-archive:hover{color:var(--txt); border-color:var(--txt-dim)}
 .kb-chip.kb-st-done{color:var(--teal); border-color:#2f6b43}
 .kb-chip.kb-st-live{color:var(--amber); border-color:#7a5a1a; animation:kbPulse 1.6s ease-in-out infinite}
 .kb-chip.kb-st-attn{color:var(--red); border-color:#7a2f2f}

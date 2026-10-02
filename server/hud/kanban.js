@@ -621,8 +621,12 @@ function kbRenderDoneGrouped(listEl, tasks){
           <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
           <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
           <div class="kb-fam-actions">${integrateBtn || kbDoneControls(lead, {})}${
-            (kbPrs[lead.id] || {}).state === "MERGED"
-              ? `<button class="btn kb-card-btn kb-fam-archive" data-action="archive-family" data-ids="${kanbanEsc(ordered.map(t => t.id).join(","))}" title="Archive this merged family — all ${ordered.length} cards move to the archived lane.">Archive family</button>`
+            // Archivable once there's nothing left to land: the family merged,
+            // or its lead is a no-code card (the PR-bearing-lead rule means no
+            // member has mergeable code either -- it's a finished analysis
+            // family). Still has unmerged/merging code -> no archive-all yet.
+            ((kbPrs[lead.id] || {}).state === "MERGED" || !((kbDiffstats[lead.id] || 0) > 0))
+              ? `<button class="btn kb-card-btn kb-fam-archive" data-action="archive-family" data-ids="${kanbanEsc(ordered.map(t => t.id).join(","))}" title="Archive this family — all ${ordered.length} cards move to the archived lane. Shown once nothing is left to merge (the work has merged, or it's a finished analysis family).">Archive family</button>`
               : ""}</div>
         </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
