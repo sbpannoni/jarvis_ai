@@ -4201,6 +4201,16 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
     # If the reviewed card already MERGED, its fix must branch from current master
     # (which has the merged work) and correct the errors there -- NOT continue the
     # old pre-squash branch. Only continue the branch when it hasn't merged yet.
+    #
+    # `source_merged` decides the BODY (branch-from-master vs continue-the-branch)
+    # ONLY. It no longer decides whether to nest: the fix card is ALWAYS --parent'd
+    # to the reviewed card so the board shows the relationship (a merged-source fix
+    # used to orphan into a standalone card -- that is the bug this closes). The
+    # worktree base is kept correct independently: the provisioner's base-picker
+    # (_darkhelix_worktree_create) skips any parent whose PR is already merged, so a
+    # merged parent contributes the board link but never becomes the git base --
+    # the tree is still cut from origin/master. Branch-link and git-base were one
+    # knob here; they are now two.
     try:
         _, mout = await _fleet_ssh(
             "snarf",
@@ -4240,7 +4250,7 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
         f"{shlex.quote(fix_title)} "
         f"--body {shlex.quote(body)} "
         "--workspace scratch "
-        + ("" if source_merged else f"--parent {shlex.quote(task_id)} ")
+        + f"--parent {shlex.quote(task_id)} "
         + "--created-by looking-glass --json"
     )
     try:
@@ -4875,15 +4885,27 @@ async def _darkhelix_worktree_create(
     # lines so the card can state what it was actually cut from rather than
     # what was asked for.
     quoted_parents = " ".join(shlex.quote(b) for b in parent_branches)
+    # A parent whose PR is already MERGED to master is skipped as a base/merge
+    # source: its work is in origin/master, which is the default base, so basing
+    # on its (un-deleted, possibly squash-superseded) branch instead would cut
+    # from stale pre-merge code. This is what lets a merged-source fix card nest
+    # under its reviewed parent (for the board) while still being cut from master
+    # (for git). `gh pr list ... | grep -q .` is used rather than `--is-ancestor`
+    # because DARKHELIX squash-merges, so a merged branch tip is NOT an ancestor
+    # of master; the PR state is the only reliable signal. gh runs in the repo dir
+    # (the enclosing cmd cd's there first) and its exit status is masked by the
+    # pipe, so a gh failure cannot trip `set -e`.
     pick_base = (
-        f"BASE={shlex.quote(default_base)}; MERGED=''; UNMERGED=''; MISSING=''; "
+        f"BASE={shlex.quote(default_base)}; MERGED=''; UNMERGED=''; MISSING=''; INMASTER=''; "
         + (f"for PB in {quoted_parents}; do "
            f'  if ! git rev-parse --verify --quiet "$PB" >/dev/null; then '
            f'    MISSING="$MISSING $PB"; continue; fi; '
+           f'  if gh pr list --state merged --head "$PB" 2>/dev/null | grep -q .; then '
+           f'    INMASTER="$INMASTER $PB"; continue; fi; '
            f'  if [ "$BASE" = {shlex.quote(default_base)} ]; then BASE="$PB"; '
            f'  else MERGE_LIST="$MERGE_LIST $PB"; fi; '
            f"done; " if parent_branches else "")
-        + 'echo "BASE=$BASE"; echo "MISSING=$MISSING"; '
+        + 'echo "BASE=$BASE"; echo "MISSING=$MISSING"; echo "INMASTER=$INMASTER"; '
     )
     # Merges happen inside the new worktree, after it exists. `|| true` on the
     # loop keeps `set -e` from killing the whole provisioning on a conflict --
@@ -4922,6 +4944,7 @@ async def _darkhelix_worktree_create(
     merged = _line("MERGED=").split()
     unmerged = _line("UNMERGED=").split()
     missing = _line("MISSING=").split()
+    in_master = _line("INMASTER=").split()
     # Structured, not a packed display string. What lands on the card is a
     # claim about which parents' work is really in the tree, and a caller that
     # has to substring-match "CONFLICTED" out of a base ref will eventually
@@ -4933,6 +4956,7 @@ async def _darkhelix_worktree_create(
         "merged": merged,
         "unmerged": unmerged,
         "missing": missing,
+        "in_master": in_master,
     }
 
 
@@ -5078,14 +5102,17 @@ def _dispatch_target_note(task_id: str, wt: dict,
     merged = wt.get("merged") or []
     unmerged = wt.get("unmerged") or []
     missing = wt.get("missing") or []
+    in_master = wt.get("in_master") or []
 
     def _tasks_for(branches: list[str]) -> list[str]:
         prefix = _dh_branch("")
         return [b[len(prefix):] for b in branches if b.startswith(prefix)]
 
     # Whose work is genuinely present: the base branch's card, plus anything
-    # merged in cleanly.
+    # merged in cleanly, plus any parent whose PR is already in master (which is
+    # the base) -- their work is present even though their branch was skipped.
     present = _tasks_for([base] + merged) if base.startswith(_dh_branch("")) else _tasks_for(merged)
+    present_via_master = _tasks_for(in_master)
     absent_conflict = _tasks_for(unmerged)
     absent_nobranch = _tasks_for(missing)
 
@@ -5109,7 +5136,12 @@ def _dispatch_target_note(task_id: str, wt: dict,
             f"NOT IN YOUR TREE: {', '.join(absent_conflict)} — their branches\n"
             "CONFLICTED with this base and the merge was aborted. Reconcile them\n"
             "by hand; do not assume their work is present.\n\n")
-    if parent_task_ids and not present:
+    if present_via_master:
+        lineage += (
+            f"IN YOUR TREE (via master): {', '.join(present_via_master)} — already\n"
+            f"merged to master, which is your base ({base}). Their fix is here; do\n"
+            "not re-apply it. Correct the errors the review names, no more.\n\n")
+    if parent_task_ids and not present and not present_via_master:
         lineage += (
             f"This card was cut from {base}, not from any parent.\n\n")
 
