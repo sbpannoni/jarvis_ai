@@ -576,9 +576,9 @@ function kbRenderDoneGrouped(listEl, tasks){
         <div class="kb-fam-main">
           <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
           <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
+          <div class="kb-fam-actions">${kbVerifyControl(lead)}${kbReviewControl(lead)}${kbMergeControl(lead)}${integrateBtn}</div>
         </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
-        ${kbVerifyControl(lead)}${kbReviewControl(lead)}${kbMergeControl(lead)}${integrateBtn}
       </div>
       <div class="kb-family-members"${open ? "" : " hidden"}>${ordered.map(t => card(t, {noMerge: true})).join("")}</div>
     </div>`);

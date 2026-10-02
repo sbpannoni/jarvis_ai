@@ -681,7 +681,19 @@ footer{
   display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden}
 .kb-fam-sub{color:var(--txt-dim); font-size:10.5px; margin-top:3px; line-height:1.35;
   display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden}
-.kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto}
+.kb-chip.kb-fam-count{color:var(--txt-dim); flex:0 0 auto; margin-top:1px}
+/* Actions sit UNDER the title/sub (original card style: short description, then
+   options) rather than sharing the title's flex row -- in the row they squeezed
+   the description to an unreadable sliver and the buttons read as a centred
+   block. Here they're a left-aligned, inline, wrapping row with the icon beside
+   its label. */
+.kb-fam-actions{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:7px}
+.kb-fam-actions:empty{display:none}
+.kb-fam-actions > button.btn.kb-card-btn{
+  display:inline-flex; align-items:center; gap:4px;
+  margin-top:0; align-self:auto;
+}
+.kb-fam-actions > .kb-chip{margin-top:0; align-self:center}
 .kb-family-members{
   padding:7px 8px 8px 14px; margin-left:5px;
   display:flex; flex-direction:column; gap:5px;
