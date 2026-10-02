@@ -121,6 +121,9 @@ header h1{flex-shrink:0}
 .hdr-right{display:flex; align-items:center; gap:10px; flex-shrink:0}
 .hdr-conn{font-family:'Orbitron'; font-size:9px; letter-spacing:2px; color:var(--txt-dim)}
 header h1{font-family:'Orbitron'; font-size:19px; letter-spacing:6px; color:var(--cyan)}
+header h1[data-action="reload"]{cursor:pointer; transition:text-shadow .15s, filter .15s}
+header h1[data-action="reload"]:hover{text-shadow:0 0 9px var(--cyan); filter:brightness(1.15)}
+header h1[data-action="reload"]:focus-visible{outline:2px solid var(--cyan); outline-offset:3px}
 header .sub{font-size:12px; letter-spacing:3px; color:var(--txt-dim)}
 #clock{font-family:'Orbitron'; font-size:15px; letter-spacing:2px; color:var(--teal)}
 .col{display:flex; flex-direction:column; gap:8px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--line) transparent}

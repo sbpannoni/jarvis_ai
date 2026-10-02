@@ -889,6 +889,17 @@ addEventListener("keydown",e=>{
 document.querySelectorAll('[data-action="theme"]').forEach(btn=>{
   btn.addEventListener("click",toggleTheme);
 });
+// The LOOKING GLASS title is a reload button: in fullscreen/kiosk a plain
+// page refresh (to pick up a code change) is a multi-step chore, so clicking
+// the title — or Enter/Space when it's focused — does it. The server sends
+// no-cache headers, so a normal reload already fetches fresh assets.
+document.querySelectorAll('[data-action="reload"]').forEach(el=>{
+  const reload=()=>location.reload();
+  el.addEventListener("click",reload);
+  el.addEventListener("keydown",e=>{
+    if(e.key==="Enter"||e.key===" "){ e.preventDefault(); reload(); }
+  });
+});
 document.querySelectorAll('[data-action="pair"]').forEach(btn=>{
   // The review setup in one click: live Hermes on the left, Claude in the
   // repo on the right, already split. Hunting for two buttons and then a
