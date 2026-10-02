@@ -125,7 +125,12 @@ header h1[data-action="reload"]{cursor:pointer; transition:text-shadow .15s, fil
 header h1[data-action="reload"]:hover{text-shadow:0 0 9px var(--cyan); filter:brightness(1.15)}
 header h1[data-action="reload"]:focus-visible{outline:2px solid var(--cyan); outline-offset:3px}
 header .sub{font-size:12px; letter-spacing:3px; color:var(--txt-dim)}
-#clock{font-family:'Orbitron'; font-size:15px; letter-spacing:2px; color:var(--teal)}
+/* Fixed width + tabular figures so the per-second update can't change the
+   clock's size and shove the header/composer sideways. Centered inside the
+   reserved box; ch scales with font-size so the responsive step still fits. */
+#clock{font-family:'Orbitron'; font-size:15px; letter-spacing:2px; color:var(--teal);
+  display:inline-block; width:10ch; text-align:center;
+  font-variant-numeric:tabular-nums; font-feature-settings:"tnum" 1}
 .col{display:flex; flex-direction:column; gap:8px; overflow-y:auto; scrollbar-width:thin; scrollbar-color:var(--line) transparent}
 .panel{
   --panel-accent:var(--cyan);
@@ -778,6 +783,21 @@ footer{
 .kb-card-btn.kb-verify{color:var(--txt-dim)}
 .kb-card-btn.kb-verify-ok{color:var(--green, #4ade80); border-color:#2f6b43}
 .kb-card-btn.kb-verify-warn{color:var(--amber); border-color:#7a5a1a}
+/* --- done-card state language: COLOUR = state, not button identity ---------
+   One primary action (cyan, filled) + passive chips. green=finished/passed,
+   amber=in-flight, red=needs attention. Replaces the per-button palette
+   (kb-land green, kb-review magenta, kb-verify grey, kb-fix amber) that made
+   the Done column read as a second kanban. */
+button.btn.kb-card-btn.kb-primary{
+  color:#041016; background:var(--cyan); border-color:var(--cyan); font-weight:600;
+}
+button.btn.kb-card-btn.kb-primary:hover{
+  box-shadow:0 0 10px color-mix(in srgb, var(--cyan) 55%, transparent); filter:brightness(1.08);
+}
+.kb-chip.kb-st-done{color:var(--teal); border-color:#2f6b43}
+.kb-chip.kb-st-live{color:var(--amber); border-color:#7a5a1a; animation:kbPulse 1.6s ease-in-out infinite}
+.kb-chip.kb-st-attn{color:var(--red); border-color:#7a2f2f}
+@keyframes kbPulse{0%,100%{opacity:1} 50%{opacity:.5}}
 .kb-seat{font-size:10px; color:var(--teal); margin:2px 0 0}
 .kb-age{color:var(--txt-dim); font-size:10px; font-variant-numeric:tabular-nums}
 /* `button.btn` is element+class, so a single-class rule here loses the

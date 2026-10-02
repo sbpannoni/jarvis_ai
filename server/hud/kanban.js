@@ -91,6 +91,17 @@ let kbEdges = [];
    state the board shows so a running/finished review is visible, not silent. */
 let kbReviews = {};
 let kbReviewing = [];
+/* Auto-assessment (client-side): a done code card is Verified (static, instant,
+   no model) and Reviewed (agentic) automatically, so the human never clicks
+   through a gate pipeline -- they only decide Merge / Fix. kbVerified holds the
+   static verdict ("pass"/"fail"); review verdicts live in kbReviews (server).
+   Auto-review is serialized to one in-flight and skipped while a worker holds
+   the GPU seat (reviewer == engine model, so no seat swap, but we don't want to
+   share throughput with a live run). */
+let kbVerified = {};
+let kbVerifyInflight = [];
+let kbAutoReviewInflight = [];
+let kbAutoAssessOn = kbPrefLoad("lg-kb-autoassess", true);
 const KB_FAM_KEY = "lg-kb-fam-expanded";  // {leadId: true} -- which families are open
 const KB_ARCHIVED_KEY = "lg-kb-show-archived";  // show the archived lane
 
@@ -240,7 +251,9 @@ function kbCardSignature(t){
           t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : "",
           // Review state drives the review chip / Fix-issues button.
           t.status === "done" ? (kbReviews[t.id] || "") : "",
-          t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : ""].join("|");
+          t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : "",
+          // Static-verify verdict drives the ✓/⚠ tests chip.
+          t.status === "done" ? (kbVerified[t.id] || "") : ""].join("|");
 }
 
 /* ---- dependency state -------------------------------------------------
@@ -280,60 +293,65 @@ function kbDepChips(t){
   return chips.join("");
 }
 
-/* The landing control for a done card (or a family's lead card): merged/
-   merging/landing indicator, or the Merge button. Driven by GitHub PR truth
-   (kbPrs) first, then the in-flight set, then the local commit count. */
-function kbMergeControl(t){
-  const commits = t.status === "done" ? kbDiffstats[t.id] : undefined;
-  const pr = kbPrs[t.id];
-  if(pr && pr.state === "MERGED")
-    return `<span class="kb-chip kb-merged" title="Merged to master as #${pr.number} — ${kanbanEsc(pr.url||"")}">✓ merged #${pr.number}</span>`;
-  if(pr && pr.state === "OPEN")
-    return `<span class="kb-chip kb-merging" title="PR #${pr.number} open — CI running, squash-merges when green. ${kanbanEsc(pr.url||"")}">⟳ merging #${pr.number}</span>`;
-  if(kbLanding.indexOf(t.id) !== -1)
-    return `<span class="kb-chip kb-merging" title="Landing started — opening the PR…">⟳ landing…</span>`;
-  if(commits > 0)
-    return `<button class="btn kb-card-btn kb-land" data-action="land" data-id="${kanbanEsc(t.id)}"
-       title="Merge this card's work to DARKHELIX master: opens a PR, waits for CI, squash-merges if green (background, up to ~30m). Blocks the card with a reason if CI fails or the diff is over the size cap. Asks once before merging.">⤴ Merge</button>`;
-  return "";
-}
-
-/* Static pre-merge trust check, offered on an [Integrate] card before its Merge:
-   did the integration bring tests for its new code and leave existing tests
-   intact? (CI is the dynamic gate that runs during Merge.) */
-function kbVerifyControl(t){
-  if(!(t.title || "").startsWith("[Integrate]")) return "";
-  if((kbDiffstats[t.id] || 0) <= 0) return "";
-  const pr = kbPrs[t.id];
-  if(pr && (pr.state === "MERGED" || pr.state === "OPEN")) return "";
-  return `<button class="btn kb-card-btn kb-verify" data-action="verify" data-id="${kanbanEsc(t.id)}"
-     title="Static pre-merge trust check: does this integration add tests for its new code, and did it avoid weakening existing tests? Run it before Merge — CI runs the tests during Merge.">✓ Verify</button>`;
-}
-
-/* Agentic (semantic) review for an [Integrate] card: hand it to Hermes's review
-   lane, which judges coherence, test quality and regressions -- the check CI and
-   the static Verify can't. Offered after the branch exists, before Merge. */
-function kbReviewControl(t){
+/* ---- done-card controls: ONE actionable next step + passive state chips ----
+   Done was turning into a second kanban: every card showed up to four
+   differently-coloured buttons (Verify / Review / Merge / Integrate), several
+   of them no-ops in the card's current state. Now a done card surfaces exactly
+   one PRIMARY action (what to do next) plus status chips, and COLOUR means
+   STATE, not button identity:
+     cyan  = the one action to take    (.kb-primary)
+     green = finished / passed         (.kb-st-done)
+     amber = in-flight / assessing     (.kb-st-live)
+     red   = needs attention           (.kb-st-attn)
+   Verify and Review run automatically (kbAutoAssess), so the human decides only
+   Merge / Fix / Integrate. Merge stays a deliberate click -- it is the one
+   irreversible, master-touching action -- and it stays AVAILABLE even while the
+   assessment is still running, so the human is never blocked by the pipeline.
+   The chips just say what is known so far. */
+function kbDoneControls(t, opts){
   if(t.status !== "done") return "";
-  const id = t.id;
-  // Review STATE shows for any reviewed card -- including a merged one, so a card
-  // that merged with review errors stays visible and actionable (not buried).
-  if(kbReviewing.indexOf(id) !== -1)
-    return `<span class="kb-chip kb-merging" title="Agentic review running — the verdict posts as a card comment and appears here in a minute.">⟳ reviewing…</span>`;
-  const v = kbReviews[id];
-  if(v === "approve")
-    return `<span class="kb-chip kb-merged" title="Agentic review: approved — see the card comment for detail.">review ✓</span>`;
-  if(v === "request_changes" || v === "escalate")
-    return `<span class="kb-chip kb-nodiff" title="Agentic review: ${v} — read the card comment. 'Fix issues' dispatches an editor to address it (from master if this already merged).">review ⚠ ${v === "escalate" ? "escalate" : "changes"}</span>`
-      + `<button class="btn kb-card-btn kb-fix" data-action="fix-review" data-id="${kanbanEsc(id)}"
-           title="Dispatch an editor to address the review's requested changes. If this card already merged, the fix branches from master and corrects the errors there; otherwise it continues this branch. Files a [Fix] card and runs it.">↻ Fix issues</button>`;
-  // Not reviewed yet: offer Review on a code-bearing [Integrate] card that hasn't
-  // merged -- the pre-merge semantic gate.
+  const noMerge = !!(opts && opts.noMerge);   // family members land via the lead
+  const id = t.id, esc = kanbanEsc;
   const pr = kbPrs[id];
-  const settled = pr && (pr.state === "MERGED" || pr.state === "OPEN");
-  if(!settled && (kbDiffstats[id] || 0) > 0 && (t.title || "").startsWith("[Integrate]"))
-    return `<button class="btn kb-card-btn kb-review" data-action="request-review" data-id="${kanbanEsc(id)}"
-       title="Agentic review: a reviewer model judges spec adherence, whether the new tests are meaningful, and regressions — approve / request changes / escalate. Runs in the background (a few min); the verdict posts as a comment and shows here.">⇄ Review</button>`;
+  const commits = kbDiffstats[id] || 0;
+  const review = kbReviews[id];
+  const chip = (cls, text, title) =>
+    `<span class="kb-chip ${cls}" title="${esc(title)}">${esc(text)}</span>`;
+  const btn = (cls, action, label, title) =>
+    `<button class="btn kb-card-btn ${cls}" data-action="${action}" data-id="${esc(id)}" title="${esc(title)}">${esc(label)}</button>`;
+
+  // Terminal / in-flight: status only, nothing to click.
+  if(pr && pr.state === "MERGED")
+    return chip("kb-st-done", "merged #" + pr.number, "Merged to master as #" + pr.number + " — " + (pr.url || ""));
+  if(pr && pr.state === "OPEN")
+    return chip("kb-st-live", "merging #" + pr.number, "PR #" + pr.number + " open — CI running, squash-merges when green. " + (pr.url || ""));
+  if(kbLanding.indexOf(id) !== -1)
+    return chip("kb-st-live", "landing…", "Landing started — opening the PR…");
+
+  // Family members land via their lead; no per-member control.
+  if(noMerge) return "";
+
+  // Review flagged problems -> the one action is Fix. Never offer Merge on
+  // known-bad work; the red chip says why.
+  if(review === "request_changes" || review === "escalate")
+    return chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"),
+                "Agentic review asked for changes — open the card for the comment.")
+         + btn("kb-primary", "fix-review", "Fix issues",
+               "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.");
+
+  // Code-bearing card, not yet landed: show the auto-assessment verdicts as
+  // chips, and offer Merge. Merge is available throughout -- the chips inform,
+  // they don't gate.
+  if(commits > 0){
+    let chips = "";
+    const verify = kbVerified[id];
+    if(verify === "pass") chips += chip("kb-st-done", "tests", "Static pre-merge check passed: brought tests for the new code, didn't weaken existing ones.");
+    else if(verify === "fail") chips += chip("kb-st-attn", "tests", "Static check: missing tests for new code, or an existing test was weakened — read the diff before merging.");
+    if(review === "approve") chips += chip("kb-st-done", "review", "Agentic review approved this change.");
+    else if(kbReviewing.indexOf(id) !== -1) chips += chip("kb-st-live", "assessing…", "Pre-merge review is running automatically — its verdict will appear here.");
+    return chips + btn("kb-primary", "land", "Merge",
+      "Merge this card's work to master: opens a PR, waits for CI, squash-merges if green (background). Asks once.");
+  }
   return "";
 }
 
@@ -413,7 +431,7 @@ function kbCardInner(t, opts){
             : "")
         // Landing state (merged/merging/landing/Merge) -- shared with family heads.
         // Suppressed on a family member: the family merges as one via its head.
-        + (noMerge ? "" : kbVerifyControl(t) + kbReviewControl(t) + kbMergeControl(t))
+        + kbDoneControls(t, {noMerge})
         // Left reference files in pool-staging -> Promote them into the shared
         // pool (the data counterpart to Merge; code lands via git, data via this).
         + ((kbStaged[t.id] > 0)
@@ -530,7 +548,7 @@ function kbRenderDoneGrouped(listEl, tasks){
   groups.forEach(members => {
     if(members.length === 1){
       const t = members[0];
-      sig.push("s:" + t.id + ":" + kbCardSignature(t) + ":" + JSON.stringify(kbMergeControl(t).slice(0,0)));
+      sig.push("s:" + t.id + ":" + kbCardSignature(t));
       sig.push("m:" + JSON.stringify(kbPrs[t.id] || null) + kbDiffstats[t.id]);
       parts.push(card(t));
       return;
@@ -550,8 +568,8 @@ function kbRenderDoneGrouped(listEl, tasks){
     const leadPr = kbPrs[lead.id];
     const converging = !!(leadPr && (leadPr.state === "MERGED" || leadPr.state === "OPEN"));
     const integrateBtn = (!converging && codeIds.length >= 2)
-      ? `<button class="btn kb-card-btn kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
-           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For new features whose branches must be integrated, not just the single converged PR.">⚙ Integrate ${codeIds.length}</button>`
+      ? `<button class="btn kb-card-btn kb-primary kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
+           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For new features whose branches must be integrated, not just the single converged PR.">Integrate ${codeIds.length}</button>`
       : "";
     // Make a collapsed family legible: how many wrote code vs analysis, who
     // worked it, and the merged tally -- so you can tell what's inside without
@@ -569,14 +587,15 @@ function kbRenderDoneGrouped(listEl, tasks){
     const sub = subBits.join(" · ");
     sig.push("f:" + lead.id + ":" + ordered.length + ":" + open + ":" + codeIds.length + ":" + sub + ":"
       + ordered.map(t => t.id + kbCardSignature(t)).join(",") + ":" + JSON.stringify(kbPrs[lead.id] || null)
-      + ":rv" + (kbReviews[lead.id] || "") + (kbReviewing.indexOf(lead.id) !== -1 ? "RUN" : ""));
+      + ":rv" + (kbReviews[lead.id] || "") + (kbReviewing.indexOf(lead.id) !== -1 ? "RUN" : "")
+      + ":vf" + (kbVerified[lead.id] || ""));
     parts.push(`<div class="kb-family" data-lead="${kanbanEsc(lead.id)}">
       <div class="kb-family-head">
         <span class="kb-fam-toggle">${open ? "▾" : "▸"}</span>
         <div class="kb-fam-main">
           <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
           <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
-          <div class="kb-fam-actions">${kbVerifyControl(lead)}${kbReviewControl(lead)}${kbMergeControl(lead)}${integrateBtn}</div>
+          <div class="kb-fam-actions">${integrateBtn || kbDoneControls(lead, {})}</div>
         </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
       </div>
@@ -842,6 +861,57 @@ async function kbVerify(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = prev; btn.title = err.message; }
 }
 
+/* Auto-assessment driver: run after each board refresh. Verifies every
+   un-verified done code card (static, instant, no model) and kicks off ONE
+   agentic review at a time -- and only while no worker holds the GPU seat, so
+   it never competes with a live run (reviewer == engine model, so there is no
+   seat swap, only shared throughput). The human still decides Merge / Fix; this
+   just means the verdict is already on the card when they look, instead of a
+   gate they must click through. Toggle via kbAutoAssessOn. */
+function kbAutoAssess(tasks){
+  if(!kbAutoAssessOn) return;
+  const cands = (tasks || []).filter(t =>
+    t.status === "done" &&
+    (t.title || "").startsWith("[Integrate]") &&
+    (kbDiffstats[t.id] || 0) > 0 &&
+    !(kbPrs[t.id] && (kbPrs[t.id].state === "MERGED" || kbPrs[t.id].state === "OPEN")));
+  // Static verify: cheap and model-free, so run it for every un-verified card.
+  cands.forEach(t => {
+    if(kbVerified[t.id] === undefined && kbVerifyInflight.indexOf(t.id) === -1) kbAutoVerify(t.id);
+  });
+  // Agentic review: one at a time, and never while a worker is generating.
+  const seatBusy = (tasks || []).some(t => t.status === "running");
+  if(seatBusy || kbReviewing.length || kbAutoReviewInflight.length) return;
+  const next = cands.find(t => !kbReviews[t.id] && kbAutoReviewInflight.indexOf(t.id) === -1);
+  if(next) kbAutoReview(next.id);
+}
+
+function kbAutoVerify(id){
+  kbVerifyInflight.push(id);
+  fetch("/api/darkhelix/verify-integration", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({task_id: id}),
+  }).then(r => r.json()).then(j => {
+    // "err" is a sentinel: attempted, verdict unknown. It shows no chip but
+    // stops the per-poll retry from re-hitting snarf's git calls on a bad card.
+    kbVerified[id] = (j && j.ok) ? (j.trustworthy ? "pass" : "fail") : "err";
+  }).catch(() => { kbVerified[id] = "err"; })
+    .finally(() => { kbVerifyInflight = kbVerifyInflight.filter(x => x !== id); });
+}
+
+function kbAutoReview(id){
+  kbAutoReviewInflight.push(id);
+  fetch("/api/darkhelix/request-review", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({task_id: id}),
+  }).then(r => r.json()).then(j => {
+    // The server owns the 'reviewing' state (kbReviewing, refreshed from
+    // /api/kanban/links); nudge it locally so the chip shows until the next poll.
+    if(j && j.ok && kbReviewing.indexOf(id) === -1) kbReviewing.push(id);
+  }).catch(() => {})
+    .finally(() => { kbAutoReviewInflight = kbAutoReviewInflight.filter(x => x !== id); });
+}
+
 /* Agentic merge: file an [Integrate] card parented to a family's code branches
    and dispatch an editor to weave them into one coherent change WITH tests. The
    result is an ordinary [Integrate] card you review and Merge (CI-gated), so an
@@ -985,6 +1055,10 @@ async function refreshKanbanPanel(panel){
     if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
+    // Fire-and-forget: verify + review the done code cards so their verdicts are
+    // already on the card, not a gate the human clicks through. Results land in
+    // kbVerified / kbReviews and show on the next poll (or sooner, below).
+    kbAutoAssess(j.tasks || []);
   }catch(err){ renderKanban(panel, {}, err.message); }
 }
 
