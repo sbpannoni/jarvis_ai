@@ -34,6 +34,22 @@ const feed=$("feed");
 /* ============================== clock ============================== */
 setInterval(()=>{const d=new Date();$("clock").textContent=d.toTimeString().slice(0,8)},500);
 
+/* ============================== icons =============================
+   One cohesive line-icon set (bold rounded stroke, inherits currentColor,
+   sized to the text) replacing the full-colour emoji that read as cartoonish
+   chat glyphs in the toolbars. 24-grid, stroke-width 2 so they stay legible
+   zoomed out. Static dock buttons inline the same <svg> markup directly. */
+const LG_ICONS = {
+  transcript: '<path d="M4 6h16M4 12h11M4 18h7"/>',
+  theme:      '<path d="M20 13A8 8 0 1 1 11 4a6 6 0 0 0 9 9Z"/>',
+  panels:     '<rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M14 4.5v15"/>',
+  idea:       '<path d="M9.5 18.5h5M10.5 21.5h3M12 2.5a6 6 0 0 0-3.7 10.8c.6.5.9 1 .9 1.7v.5h5.6v-.5c0-.7.3-1.2.9-1.7A6 6 0 0 0 12 2.5Z"/>',
+};
+function lgIcon(name, cls){
+  return `<svg class="lg-ic${cls ? " " + cls : ""}" viewBox="0 0 24 24" fill="none" stroke="currentColor" `
+    + `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LG_ICONS[name] || ""}</svg>`;
+}
+
 /* ============================== status indicator ==================== */
 const STATUS_DOT_CLASSES=["standby","listening","thinking","tool","speaking","error"];
 function setState(st,label,hint){

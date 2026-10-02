@@ -104,7 +104,13 @@ body.sidebars-hidden #colRight{right:8px; transform:translateX(110%)}
   background:color-mix(in srgb, var(--cyan) 10%, transparent);
   border:1px solid var(--cyan-dim); border-radius:8px; color:var(--txt);
   width:32px; height:32px; cursor:pointer; font-size:14px; line-height:1; flex-shrink:0;
+  display:inline-flex; align-items:center; justify-content:center;
 }
+/* Shared inline icon: inherits the button's colour, scales with its text, and
+   keeps a bold enough stroke to stay legible zoomed out. */
+.lg-ic{width:1.15em; height:1.15em; display:inline-block; vertical-align:-0.18em; flex:0 0 auto}
+#sidebarToggleBtn .lg-ic, #theme-toggle .lg-ic, .dock-icon .lg-ic{width:18px; height:18px; vertical-align:0}
+.kb-learning .lg-ic{width:13px; height:13px; vertical-align:-0.16em}
 #sidebarToggleBtn:hover{border-color:var(--magenta); color:var(--magenta); background:color-mix(in srgb, var(--magenta) 14%, transparent)}
 
 #theme-toggle:hover, .dock-icon:hover{border-color:var(--cyan); color:var(--cyan); background:color-mix(in srgb, var(--cyan) 18%, transparent)}
@@ -535,7 +541,16 @@ footer{
   font-family:'Rajdhani'; font-size:11px; padding:3px 6px; cursor:pointer; outline:none;
 }
 .kb-assignee:focus-visible{border-color:var(--cyan); box-shadow:0 0 0 2px #00e5ff33}
-.kb-source{font-family:'Rajdhani'; font-size:11px; letter-spacing:0; white-space:nowrap}
+.kb-source{font-family:'Rajdhani'; font-size:11px; letter-spacing:0; white-space:nowrap; color:var(--txt-dim)}
+/* Legend moved off the toolbar into a ⓘ: the inline sentence crowded the
+   controls and was read once and never again. Controls grouped on the right. */
+.kb-head-help{
+  background:none; border:1px solid var(--line); border-radius:50%;
+  width:16px; height:16px; padding:0; line-height:1; cursor:help; color:var(--txt-dim);
+  font-size:11px; display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto;
+}
+.kb-head-help:hover{border-color:var(--cyan); color:var(--cyan)}
+.kb-head-group{display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end}
 .kb-board-err{padding:10px}
 
 /* ---- lanes ----

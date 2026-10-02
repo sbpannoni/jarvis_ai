@@ -62,7 +62,7 @@
          bar at the bottom of #center it took a permanent strip off every
          view, while the header's middle was a line of static text. -->
     <div id="hermesDock">
-      <button class="dock-icon" id="feedToggleBtn" title="Toggle chat history">💬</button>
+      <button class="dock-icon" id="feedToggleBtn" title="Toggle chat history" aria-label="Toggle chat history"><svg class="lg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M4 12h11M4 18h7"/></svg></button>
       <div id="reactorWrap" title="Click to talk (STOP is on the VOICE LINK panel, or press Esc)">
         <div id="status-indicator" class="status-dot"></div>
         <div id="coreState"><div class="st" id="stateLabel">STANDBY</div><div class="hint" id="stateHint">CLICK OR SPACE TO TALK</div></div>
@@ -74,8 +74,8 @@
     <div class="hdr-right">
       <span id="connState" class="hdr-conn">LINK DOWN</span>
       <div id="clock">--:--:--</div>
-      <button id="sidebarToggleBtn" data-action="sidebars" title="Hide side panels (S)" aria-label="Toggle side panels">▤</button>
-      <button id="theme-toggle" data-action="theme" aria-label="Toggle light/dark theme">🌓</button>
+      <button id="sidebarToggleBtn" data-action="sidebars" title="Hide side panels (S)" aria-label="Toggle side panels"><svg class="lg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2"/><path d="M14 4.5v15"/></svg></button>
+      <button id="theme-toggle" data-action="theme" aria-label="Toggle light/dark theme"><svg class="lg-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13A8 8 0 1 1 11 4a6 6 0 0 0 9 9Z"/></svg></button>
     </div>
   </header>
   <!-- Chat history drops down under the header composer. It lives at the

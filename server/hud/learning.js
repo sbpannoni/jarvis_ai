@@ -102,7 +102,7 @@ async function plRefreshBadge(panel){
   try{
     const r = await fetch("/api/learning/pending"); const j = await r.json();
     const n = (j.pending || []).length;
-    b.textContent = `🧠 ${n} pending learning`;
+    b.innerHTML = `${lgIcon("idea")} ${n} pending learning`;
     b.classList.toggle("has", n > 0);
   }catch{ /* never disturb the board */ }
 }

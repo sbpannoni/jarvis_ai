@@ -1066,14 +1066,16 @@ function openKanbanBoard(){
   openWorkTabTurning("kanban","board","KANBAN",(panel,tab)=>{
     panel.innerHTML = `<div class="kb-head">
         <span class="kb-head-title">BOARD</span>
-        <span class="kb-head-sub">click a card for its run log · ⛓ = waiting on unfinished parents · n/m = children done · REVIEW/FIX = review chain</span>
+        <span class="kb-source">loading…</span>
+        <button class="kb-head-help" type="button" aria-label="Board legend" title="click a card for its run log  ·  ⛓ = waiting on unfinished parents  ·  n/m = children done  ·  REVIEW/FIX = review chain">ⓘ</button>
         <span class="kb-head-spacer"></span>
         <label class="kb-filter">assignee <select class="kb-assignee"></select></label>
-        <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">🧠 … pending learning</button>
-        <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">⤴ merge all</button>
-        <button class="kb-arch-toggle" type="button" title="Show the archived lane — merged cards (auto-archived on merge) and dismissed ones live here.">⊟ archived</button>
-        <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
-        <span class="kb-source">loading…</span>
+        <span class="kb-head-group">
+          <button class="kb-learning" type="button" title="Lessons Hermes workers tried to save (memory/skills) that need a decision. Audited by Claude daily at 05:00; click to review.">${lgIcon("idea")} … pending learning</button>
+          <button class="kb-merge-all" type="button" title="Merge every unmerged, mergeable family/card to DARKHELIX master at once — each opens a PR, waits for CI, squash-merges if green (background). Asks once.">⤴ merge all</button>
+          <button class="kb-arch-toggle" type="button" title="Show the archived lane — merged cards (auto-archived on merge) and dismissed ones live here.">⊟ archived</button>
+          <button class="kb-pause" type="button" title="Halt NEW dispatch. In-flight workers are never killed and cards stay ready, so resuming picks up exactly where it left off.">⏸ pause dispatch</button>
+        </span>
       </div>
       <div class="kb-paused-banner" hidden></div>
       <div class="kb-lanes"></div>`;
