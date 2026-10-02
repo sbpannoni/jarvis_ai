@@ -527,15 +527,19 @@ function kbComponents(edges){
   return find;
 }
 
-/* The family's merge target / header card: the integrating card whose branch
-   subsumes the siblings. Most commits wins, then a card that already has a PR,
-   then the newest. */
+/* The family's merge target / header card. A card that already has a real PR
+   IS the convergence point, so it wins first (merged over open) -- otherwise a
+   sibling with more commits but no PR becomes the lead and the family hides the
+   PR's merging/merged state (the "shows Integrate but #9 is already open" bug,
+   and the reason the done-lane merging count didn't match the cards). Then most
+   commits, then newest. */
 function kbFamilyLead(members){
+  const prRank = t => { const s = (kbPrs[t.id] || {}).state; return s === "MERGED" ? 2 : s === "OPEN" ? 1 : 0; };
   return members.slice().sort((a, b) => {
+    const pa = prRank(a), pb = prRank(b);
+    if(pb !== pa) return pb - pa;
     const ca = kbDiffstats[a.id] || 0, cb = kbDiffstats[b.id] || 0;
     if(cb !== ca) return cb - ca;
-    const pa = (kbPrs[a.id] ? 1 : 0), pb = (kbPrs[b.id] ? 1 : 0);
-    if(pb !== pa) return pb - pa;
     return (b.created_at || 0) - (a.created_at || 0);
   })[0];
 }
@@ -609,7 +613,10 @@ function kbRenderDoneGrouped(listEl, tasks){
         <div class="kb-fam-main">
           <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
           <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
-          <div class="kb-fam-actions">${integrateBtn || kbDoneControls(lead, {})}</div>
+          <div class="kb-fam-actions">${integrateBtn || kbDoneControls(lead, {})}${
+            (kbPrs[lead.id] || {}).state === "MERGED"
+              ? `<button class="btn kb-card-btn kb-fam-archive" data-action="archive-family" data-ids="${kanbanEsc(ordered.map(t => t.id).join(","))}" title="Archive this merged family — all ${ordered.length} cards move to the archived lane.">Archive family</button>`
+              : ""}</div>
         </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
       </div>
@@ -676,8 +683,8 @@ function kbRenderBranchBar(host, tasks){
     g += `<g class="kb-br" data-id="${kanbanEsc(b.id)}"${b.url ? ` data-url="${kanbanEsc(b.url)}"` : ""}>`
        + `<title>${kanbanEsc(label)}</title><circle cx="${x.toFixed(1)}" cy="${spineY}" r="2.2" fill="${c}"/>${shape}</g>`;
   });
-  const spine = `<line x1="${mL}" y1="${spineY}" x2="${W-mR}" y2="${spineY}" stroke="var(--line)" stroke-width="2"/>`
-    + `<path d="M${W-mR},${spineY} l-7,-4 v8 z" fill="var(--line)"/>`
+  const spine = `<line x1="${mL}" y1="${spineY}" x2="${W-mR}" y2="${spineY}" stroke="var(--txt-dim)" stroke-width="4" stroke-linecap="round"/>`
+    + `<path d="M${W-mR+1},${spineY} l-9,-6 v12 z" fill="var(--txt-dim)"/>`
     + `<text x="6" y="${spineY+3.5}" class="kb-br-master">master</text>`;
   const more = extra ? `<text x="${W-mR}" y="${botY}" text-anchor="end" class="kb-br-more">+${extra}</text>` : "";
   host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMinYMid meet">${spine}${g}${more}</svg>`;
@@ -1065,6 +1072,27 @@ async function kbActivityPoll(){
 }
 setInterval(kbActivityPoll, 20000);
 
+/* Archive every card in a merged family in one go -- the done lane keeps the
+   whole decomposition around after it lands, which is clutter once it's in
+   master. Archives each member (the archive endpoint is per-card). */
+async function kbArchiveFamily(panel, btn){
+  const ids = (btn.dataset.ids || "").split(",").filter(Boolean);
+  if(!ids.length) return;
+  if(!confirm(`Archive this merged family — all ${ids.length} cards move to the archived lane?`)) return;
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = "archiving…";
+  try{
+    for(const id of ids){
+      await fetch("/api/kanban/archive", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({task_id: id}),
+      });
+    }
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = prev + " — retry"; btn.title = err.message; }
+}
+
 /* Agentic merge: file an [Integrate] card parented to a family's code branches
    and dispatch an editor to weave them into one coherent change WITH tests. The
    result is an ordinary [Integrate] card you review and Merge (CI-gated), so an
@@ -1254,6 +1282,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
+        if(btn.dataset.action === "archive-family"){ kbArchiveFamily(panel, btn); return; }
         if(btn.dataset.action === "verify"){ kbVerify(panel, btn); return; }
         if(btn.dataset.action === "request-review"){ kbRequestReview(panel, btn); return; }
         if(btn.dataset.action === "fix-review"){ kbFixReview(panel, btn); return; }
