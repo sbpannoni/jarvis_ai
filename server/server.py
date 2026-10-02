@@ -3815,7 +3815,7 @@ async def kanban_diffstats() -> JSONResponse:
         _, pout = await _fleet_ssh(
             "snarf",
             f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
-            "gh pr list --state all --limit 300 --json number,headRefName,state,url 2>/dev/null")
+            "gh pr list --state all --limit 300 --json number,headRefName,state,url,createdAt,mergedAt 2>/dev/null")
         for p in json.loads(pout.strip() or "[]"):
             head = p.get("headRefName") or ""
             if head.startswith("hermes/"):
@@ -3823,7 +3823,11 @@ async def kanban_diffstats() -> JSONResponse:
                 # Keep the most relevant: a MERGED/OPEN wins over a stale CLOSED.
                 prev = prs.get(tid)
                 if tid in done_set and (prev is None or prev.get("state") == "CLOSED"):
-                    prs[tid] = {"state": p.get("state"), "number": p.get("number"), "url": p.get("url")}
+                    # createdAt/mergedAt let the branch ribbon draw a branch as a
+                    # line over time (open → now, merged → its merge point) rather
+                    # than a single node.
+                    prs[tid] = {"state": p.get("state"), "number": p.get("number"), "url": p.get("url"),
+                                "createdAt": p.get("createdAt"), "mergedAt": p.get("mergedAt")}
     except Exception:
         prs = {}
     landing = sorted(_DH_LANDING_IN_FLIGHT & done_set)

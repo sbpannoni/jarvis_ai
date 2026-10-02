@@ -627,18 +627,25 @@ function kbRenderDoneGrouped(listEl, tasks){
   if(listEl.dataset.gsig !== gsig){ listEl.dataset.gsig = gsig; listEl.innerHTML = parts.join(""); }
 }
 
-/* Branch ribbon above the board: each active DARKHELIX branch vs master, one
-   per done family lead that wrote code (same grouping as the done lane, so the
-   strip stays legible instead of drawing every child branch). Master is a
-   horizontal spine; a merged branch arcs ABOVE and rejoins it (green), an
-   open/unmerged branch drops BELOW to a node (cyan = open PR/CI, amber =
-   unmerged, hollow). Driven by the kbDiffstats/kbPrs the board already has. */
+/* Branch ribbon above the board: a true git graph over TIME. Master is a
+   horizontal time axis (oldest → now). Each active branch (one per done family
+   lead that wrote code) diverges from master at the card's creation and runs as
+   a parallel LINE in an assigned lane -- not a single node, because a branch
+   progresses in time. An open/unmerged branch extends to NOW with an end node
+   (cyan = open PR/CI, amber = unmerged, hollow); a merged branch rejoins master
+   at its real merge time (green). Lanes are packed greedily so non-overlapping
+   branches share a row; concurrent ones stack (that's why many open branches
+   make it taller -- they genuinely are parallel). Positions use the card
+   created_at and the PR createdAt/mergedAt the board already fetches. */
 function kbRenderBranchBar(host, tasks){
   if(!host) return;
   const done = (tasks || []).filter(t => t.status === "done");
   const find = kbComponents(kbEdges);
   const byRoot = new Map();
   done.forEach(t => { const r = find(t.id); (byRoot.get(r) || byRoot.set(r, []).get(r)).push(t); });
+  const nowS = Date.now() / 1000;
+  const toSec = v => { const n = +v; return n > 1e12 ? n / 1000 : n; };          // created_at may be ms or s
+  const iso = v => { const m = v ? Date.parse(v) : NaN; return isNaN(m) ? null : m / 1000; };
   let branches = [];
   byRoot.forEach(members => {
     const lead = members.length === 1 ? members[0] : kbFamilyLead(members);
@@ -647,47 +654,62 @@ function kbRenderBranchBar(host, tasks){
       let state = "unmerged";
       if(pr.state === "MERGED") state = "merged";
       else if(pr.state === "OPEN" || kbLanding.indexOf(lead.id) !== -1) state = "merging";
+      const start = toSec(lead.created_at) || nowS;
+      const end = (state === "merged" && iso(pr.mergedAt)) ? iso(pr.mergedAt) : nowS;
       branches.push({ id: lead.id, title: kbActTitle(lead), ahead: kbDiffstats[lead.id] || 0,
-                      state, pr: pr.number, url: pr.url });
+                      state, pr: pr.number, url: pr.url, start, end: Math.max(end, start) });
     }
   });
   if(!branches.length){ host.hidden = true; host.innerHTML = ""; host.dataset.sig = ""; return; }
-  const rank = { merging: 2, unmerged: 1, merged: 0 };
-  const CAP = 18;
-  branches.sort((a, b) => (rank[b.state] - rank[a.state]) || (b.ahead - a.ahead));  // live first, for the cap
-  let extra = 0;
-  if(branches.length > CAP){ extra = branches.length - CAP; branches = branches.slice(0, CAP); }
-  branches.sort((a, b) => (rank[a.state] - rank[b.state]) || (b.ahead - a.ahead));  // display: merged (history) left → live right
-
   host.hidden = false;
-  const W = Math.max(host.clientWidth || 900, 240), H = 54, spineY = 28, topY = 9, botY = 46, mL = 52, mR = 20;
-  const sig = W + "|" + extra + "|" + branches.map(b => b.id + b.state + b.ahead).join(",");
-  if(host.dataset.sig === sig) return;   // nothing changed; don't rebuild (kills no hover)
+
+  // Ordered oldest → newest along master (a time SENSE, left to right), but
+  // evenly spaced so branches don't pile up when they were all created close
+  // together. Each branch is a LINE whose length encodes its progression
+  // (commits ahead), diverging off master into a lane, then merged → rejoin
+  // master, open → end in a node. Lanes cycle so neighbours never overlap.
+  branches.sort((a, b) => a.start - b.start);
+  const CAP = 24;
+  const overflow = Math.max(0, branches.length - CAP);
+  if(overflow) branches = branches.slice(-CAP);   // keep the most recent
+  const N = branches.length;
+  const maxAhead = Math.max(1, ...branches.map(b => b.ahead));
+
+  const LANES = Math.min(3, N), laneH = 13;
+  const W = Math.max(host.clientWidth || 900, 240), mL = 52, mR = 26, spineY = 12, laneTop = 24;
+  const H = laneTop + LANES * laneH;
+  const sig = W + "|" + overflow + "|" + branches.map(b => b.id + b.state + b.ahead).join(",");
+  if(host.dataset.sig === sig) return;
   host.dataset.sig = sig;
-  const usable = (W - mL - mR - (extra ? 34 : 0));
-  const step = usable / branches.length;
+  const usable = W - mL - mR;
+  const step = usable / N;
   const COL = { merged: "var(--teal)", merging: "var(--cyan)", unmerged: "var(--amber)" };
   let g = "";
   branches.forEach((b, i) => {
-    const x = mL + step * (i + 0.5), c = COL[b.state];
-    const label = `${b.state}${b.pr ? " #" + b.pr : ""} · ${b.title} (+${b.ahead})`;
-    let shape;
+    const x1 = mL + step * (i + 0.45), c = COL[b.state], lane = i % LANES;
+    const y = laneTop + lane * laneH;
+    const len = 14 + (b.ahead / maxAhead) * Math.min(step * 1.6, 120);  // progression ∝ commits
+    const x2 = x1 + len;
+    const label = `${b.state}${b.pr ? " #" + b.pr : ""} · ${b.title} (+${b.ahead} commit${b.ahead === 1 ? "" : "s"})`;
+    let d = `M${x1.toFixed(1)},${spineY} C${x1.toFixed(1)},${(spineY+6).toFixed(1)} ${x1.toFixed(1)},${y.toFixed(1)} ${(x1+5).toFixed(1)},${y.toFixed(1)} L${x2.toFixed(1)},${y.toFixed(1)}`;
+    let endmark;
     if(b.state === "merged"){
-      shape = `<path d="M${(x-10).toFixed(1)},${spineY} Q${x.toFixed(1)},${topY} ${(x+10).toFixed(1)},${spineY}" fill="none" stroke="${c}" stroke-width="2"/>`
-            + `<circle cx="${x.toFixed(1)}" cy="${topY+3}" r="3" fill="${c}"/>`;
+      d += ` C${(x2+6).toFixed(1)},${y.toFixed(1)} ${x2.toFixed(1)},${(spineY+6).toFixed(1)} ${x2.toFixed(1)},${spineY}`;
+      endmark = `<circle cx="${x2.toFixed(1)}" cy="${spineY}" r="2.8" fill="${c}"/>`;
     }else{
       const hollow = b.state === "unmerged";
-      shape = `<line x1="${x.toFixed(1)}" y1="${spineY}" x2="${x.toFixed(1)}" y2="${botY}" stroke="${c}" stroke-width="2"/>`
-            + `<circle cx="${x.toFixed(1)}" cy="${botY}" r="3.4" fill="${hollow ? "var(--bg)" : c}" stroke="${c}" stroke-width="2"${b.state === "merging" ? ' class="kb-br-live"' : ""}/>`;
+      endmark = `<circle cx="${x2.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${hollow ? "var(--bg)" : c}" stroke="${c}" stroke-width="2"${b.state === "merging" ? ' class="kb-br-live"' : ""}/>`;
     }
     g += `<g class="kb-br" data-id="${kanbanEsc(b.id)}"${b.url ? ` data-url="${kanbanEsc(b.url)}"` : ""}>`
-       + `<title>${kanbanEsc(label)}</title><circle cx="${x.toFixed(1)}" cy="${spineY}" r="2.2" fill="${c}"/>${shape}</g>`;
+       + `<title>${kanbanEsc(label)}</title><circle cx="${x1.toFixed(1)}" cy="${spineY}" r="2.2" fill="${c}"/>`
+       + `<path d="${d}" fill="none" stroke="${c}" stroke-width="2"/>${endmark}</g>`;
   });
   const spine = `<line x1="${mL}" y1="${spineY}" x2="${W-mR}" y2="${spineY}" stroke="var(--txt-dim)" stroke-width="4" stroke-linecap="round"/>`
     + `<path d="M${W-mR+1},${spineY} l-9,-6 v12 z" fill="var(--txt-dim)"/>`
-    + `<text x="6" y="${spineY+3.5}" class="kb-br-master">master</text>`;
-  const more = extra ? `<text x="${W-mR}" y="${botY}" text-anchor="end" class="kb-br-more">+${extra}</text>` : "";
-  host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMinYMid meet">${spine}${g}${more}</svg>`;
+    + `<text x="6" y="${spineY+3.5}" class="kb-br-master">master</text>`
+    + `<text x="${W-mR}" y="${spineY-5}" text-anchor="end" class="kb-br-more">now ▸</text>`;
+  const more = overflow ? `<text x="${W-mR}" y="${H-2}" text-anchor="end" class="kb-br-more">+${overflow} older</text>` : "";
+  host.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">${spine}${g}${more}</svg>`;
 }
 
 function renderKanban(panel, board, err){
