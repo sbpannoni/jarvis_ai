@@ -7034,24 +7034,47 @@ class _DhOutage(Exception):
 
 
 async def _dh_reviewed(task_id: str) -> int | None:
-    """The latest review_requested event's created_at (unix seconds) if the
-    card's history carries one, else None. An int, not a bool: callers that
-    need to know whether the review is still CURRENT (see
-    _dh_review_still_fresh below) need the timestamp, not just presence --
-    a stale review from before later commits must not satisfy the gate.
+    """The created_at (unix seconds) of the card's latest APPROVED integration
+    review, or None if its latest integration-review verdict is not 'approve'
+    (or it was never reviewed).
+
+    This is the merge gate, and DARKHELIX's review is the HUD integration-review
+    (a reviewer model that posts an 'Integration review (<model>) -> <verdict>'
+    comment), NOT the Hermes review lane -- that lane's review_requested event is
+    never emitted on this fleet (0 ever), so gating on it meant nothing ever
+    merged. We read the same comment the board's review chips are parsed from
+    (/api/kanban/links) and take the LATEST verdict, so a later request_changes
+    overrides an earlier approve. A timestamp, not a bool, so
+    _dh_review_still_fresh can reject an approval from before later commits.
 
     Raises _DhOutage on a failed lookup rather than swallowing to a bare
-    False/None -- an outage and a genuine "never reviewed" must be
-    distinguishable to the caller, per the same reasoning _kanban_block's
-    three-way return already documents for its own failure mode."""
+    False/None -- an outage and a genuine "not approved" must stay
+    distinguishable to the caller."""
+    q = (
+        "import sqlite3,re,json\n"
+        "c=sqlite3.connect('file:/root/.hermes/kanban.db?mode=ro',uri=True)\n"
+        "rx=re.compile(r'Integration review.*?\\u2192\\s*(\\w+)')\n"
+        "latest=None\n"
+        f"for body,ts in c.execute(\"SELECT body,created_at FROM task_comments WHERE task_id=? ORDER BY rowid\",({task_id!r},)):\n"
+        "    m=rx.match(body or '')\n"
+        "    if m: latest=[m.group(1),int(ts)]\n"
+        "print(json.dumps(latest))\n"
+    )
     try:
-        detail = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
+        rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(q)}")
     except Exception as exc:
         raise _DhOutage(str(exc)) from exc
-    review_events = [e for e in (detail.get("events") or []) if e.get("kind") == "review_requested"]
-    if not review_events:
+    if rc != 0:
+        raise _DhOutage((out or "")[-300:] or "review lookup failed")
+    try:
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        latest = json.loads(lines[-1]) if lines else None
+    except Exception as exc:
+        raise _DhOutage(f"unparseable review lookup: {exc}")
+    if not latest:
         return None
-    return max(int(e.get("created_at") or 0) for e in review_events)
+    verdict, ts = latest[0], int(latest[1])
+    return ts if verdict == "approve" else None
 
 
 async def _dh_review_still_fresh(task_id: str, review_ts: int, repo_path: str, branch: str) -> tuple[bool, str]:
@@ -7251,11 +7274,11 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
             return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
                     "reason": str(exc), "block_result": outcome}
         if review_ts is None:
-            outcome = await _kanban_block(task_id, f"opened {pr_url} but its review_requested "
-                                           "event disappeared between the gate check and landing",
+            outcome = await _kanban_block(task_id, f"opened {pr_url} but its integration review is no "
+                                           "longer 'approve' (verdict changed between the gate check and landing)",
                                            kind="needs_input")
             return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
-                    "reason": "no review event found on recheck", "block_result": outcome}
+                    "reason": "latest integration-review verdict is not approve", "block_result": outcome}
         fresh, fresh_reason = await _dh_review_still_fresh(task_id, review_ts, DARKHELIX_REPO_PATH, branch)
     if not fresh:
         outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
@@ -7365,7 +7388,7 @@ async def _land_darkhelix_tick() -> None:
         _dh_land_mark_seen(task_id)
         if review_ts is None:
             _dh_land_record({"task_id": task_id, "verdict": "skipped",
-                             "reason": "no review_requested event on this card"})
+                             "reason": "latest integration-review verdict is not approve"})
             continue
         _dh_land_record({"task_id": task_id, "verdict": "landing"})
 
@@ -7448,10 +7471,9 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
     if review_ts is None and not skip_review_check:
         return JSONResponse({
             "ok": False,
-            "error": ("this card has no review_requested event -- it has not been "
-                      "through the board's review lane. Pass skip_review_check:true "
-                      "to land it anyway (e.g. for a card completed before the "
-                      "review-lane gate existed)."),
+            "error": ("this card's latest integration review is not 'approve' -- run the "
+                      "review (or address its requested changes) first. Pass "
+                      "skip_review_check:true to land it anyway."),
         }, status_code=409)
 
     async def _run() -> None:
