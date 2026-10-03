@@ -325,63 +325,114 @@ function kbDepChips(t){
    irreversible, master-touching action -- and it stays AVAILABLE even while the
    assessment is still running, so the human is never blocked by the pipeline.
    The chips just say what is known so far. */
+/* kbCardStage: the SINGLE source of truth for a done card's lifecycle stage.
+   Every signal the done-card UI shows -- the one primary action, the status
+   chips, whether it's archivable -- derives from ONE stage computed here, in
+   priority order, so no combination of (code/no-code, PR state, review verdict,
+   captured, family, children) can emit the contradictory signals that scattered
+   conditionals used to. Returns a data descriptor; kbStageHtml renders it.
+   opts.family={codeIds,ids} on a family head (enables Integrate + archive-all);
+   opts.noMerge on a nested member. */
+function kbCardStage(t, opts){
+  opts = opts || {};
+  const id = t.id;
+  const pr = kbPrs[id] || {};
+  const rawCommits = kbDiffstats[id];               // null = no branch, 0 = ran but no change
+  const commits = rawCommits || 0;
+  const review = kbReviews[id];
+  const reviewing = kbReviewing.indexOf(id) !== -1;
+  const landing = kbLanding.indexOf(id) !== -1;
+  const verify = kbVerified[id];
+  const captured = !!kbCaptured[id];
+  const chain = kbChainKind(t);
+  const children = (t.link_counts || {}).children || 0;
+  const fam = opts.family;
+  const chip = (cls, text, title) => ({cls, text, title});
+  const act = (action, label, title, data) => ({action, label, title, data: data || {}});
+  const S = (stage, extra) => Object.assign({stage, primary: null, chips: [], secondary: [], archivable: false}, extra || {});
+
+  if(t.status !== "done") return S("NONE");
+
+  // terminal / in-flight -- status only, nothing to click
+  if(pr.state === "MERGED")
+    return S("MERGED", {chips: [chip("kb-st-done", "merged #" + pr.number, "Merged to master as #" + pr.number + " — " + (pr.url || ""))], archivable: true});
+  if(pr.state === "OPEN")
+    return S("MERGING", {chips: [chip("kb-st-live", "merging #" + pr.number, "PR #" + pr.number + " open — CI running, squash-merges when green. " + (pr.url || ""))]});
+  if(landing)
+    return S("LANDING", {chips: [chip("kb-st-live", "landing…", "Landing started — opening the PR…")]});
+
+  // nested family member -- it lands via the lead
+  if(opts.noMerge) return S("MEMBER");
+
+  // a family of loose code branches nothing has woven yet -> Integrate (a lead
+  // that already has a PR hit MERGED/MERGING above; one that IS an [Integrate]
+  // card falls through to Merge)
+  if(fam && (fam.codeIds || []).length >= 2 && commits > 0 && !(t.title || "").startsWith("[Integrate]"))
+    return S("INTEGRATE", {primary: act("integrate", "Integrate " + fam.codeIds.length,
+      "Agentic merge: weave these " + fam.codeIds.length + " code branches into ONE coherent change WITH tests, then land it CI-gated. For loose feature branches no integration card has woven yet.",
+      {ids: fam.codeIds.join(","), title: (chain ? chain.rest : t.title)})});
+
+  // review flagged problems -> Fix (never Merge known-bad work)
+  if(review === "request_changes" || review === "escalate")
+    return S("NEEDS_FIX", {chips: [chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"), "Agentic review asked for changes — open the card for the comment.")],
+      primary: act("fix-review", "Fix issues", "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.")});
+
+  // review-chain fix card carrying a findings block -> its own closure pipeline
+  if(chain && chain.kind === "fix" && t.has_findings)
+    return S("PROCESS_FIX", {primary: act("process-fix", "Process",
+      "Run the review chain on this finished fix: mechanical gates, then closure review, then accept / retry / escalate.")});
+
+  // code-bearing card, not yet landed -> Merge, annotated with assessment chips
+  if(commits > 0){
+    const chips = [];
+    if(verify === "pass") chips.push(chip("kb-st-done", "tests", "Static pre-merge check passed: brought tests, didn't weaken existing ones."));
+    else if(verify === "fail") chips.push(chip("kb-st-attn", "tests", "Static check: missing tests, or an existing test was weakened — read the diff before merging."));
+    if(review === "approve") chips.push(chip("kb-st-done", "review", "Agentic review approved this change."));
+    else if(reviewing) chips.push(chip("kb-st-live", "assessing…", "Pre-merge review is running automatically — its verdict will appear here."));
+    return S("READY_MERGE", {chips, primary: act("land", "Merge",
+      "Merge this card's work to master: opens a PR, waits for CI, squash-merges if green (background). Asks once.")});
+  }
+
+  // review-chain card with nothing to process -> no action here
+  if(chain) return S("CHAIN_DONE");
+
+  // no code: an analysis / findings card
+  if(captured)
+    return S("SUBMITTED", {chips: [chip("kb-st-done", "✓ submitted", "Findings already filed to docs/research/. Archive when done; re-submitting only updates that record.")], archivable: true});
+  // Submit is the primary; a card that RAN but committed nothing (0, not a
+  // branch-less analysis card) can instead be turned into a dispatched fix.
+  const secondary = (rawCommits === 0 && !children)
+    ? [act("codefix", "Code the fix", "This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to write and commit the fix, linked back to this card.")]
+    : [];
+  return S("NEEDS_SUBMIT", {secondary, primary: act("capture-research", "Submit findings",
+    "File this card's findings into docs/research/ (committed to the repo) — the analysis counterpart to Merge. Edit it afterward to sharpen the recommendation/tags.")});
+}
+
+/* Render a stage descriptor: chips, then the one primary (cyan), then any
+   secondary actions (muted). The only place button/chip HTML is built. */
+function kbStageHtml(desc, id){
+  const esc = kanbanEsc;
+  const data = d => Object.keys(d || {}).map(k => `data-${k}="${esc(String(d[k]))}"`).join(" ");
+  const button = (b, cls) =>
+    `<button class="btn kb-card-btn ${cls}" data-action="${esc(b.action)}" data-id="${esc(id)}" ${data(b.data)} title="${esc(b.title || "")}">${esc(b.label)}</button>`;
+  let h = desc.chips.map(c => `<span class="kb-chip ${c.cls}" title="${esc(c.title || "")}">${esc(c.text)}</span>`).join("");
+  if(desc.primary) h += button(desc.primary, "kb-primary");
+  (desc.secondary || []).forEach(b => { h += button(b, "kb-secondary"); });
+  return h;
+}
+
+/* Thin wrapper over the stage machine for the done-card and family-head call
+   sites. On a family head (opts.family) it also offers Archive-all once the
+   stage says the family is archivable (merged, or a finished analysis family). */
 function kbDoneControls(t, opts){
   if(t.status !== "done") return "";
-  const noMerge = !!(opts && opts.noMerge);   // family members land via the lead
-  const id = t.id, esc = kanbanEsc;
-  const pr = kbPrs[id];
-  const commits = kbDiffstats[id] || 0;
-  const review = kbReviews[id];
-  const chip = (cls, text, title) =>
-    `<span class="kb-chip ${cls}" title="${esc(title)}">${esc(text)}</span>`;
-  const btn = (cls, action, label, title) =>
-    `<button class="btn kb-card-btn ${cls}" data-action="${action}" data-id="${esc(id)}" title="${esc(title)}">${esc(label)}</button>`;
-
-  // Terminal / in-flight: status only, nothing to click.
-  if(pr && pr.state === "MERGED")
-    return chip("kb-st-done", "merged #" + pr.number, "Merged to master as #" + pr.number + " — " + (pr.url || ""));
-  if(pr && pr.state === "OPEN")
-    return chip("kb-st-live", "merging #" + pr.number, "PR #" + pr.number + " open — CI running, squash-merges when green. " + (pr.url || ""));
-  if(kbLanding.indexOf(id) !== -1)
-    return chip("kb-st-live", "landing…", "Landing started — opening the PR…");
-
-  // Family members land via their lead; no per-member control.
-  if(noMerge) return "";
-
-  // Review flagged problems -> the one action is Fix. Never offer Merge on
-  // known-bad work; the red chip says why.
-  if(review === "request_changes" || review === "escalate")
-    return chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"),
-                "Agentic review asked for changes — open the card for the comment.")
-         + btn("kb-primary", "fix-review", "Fix issues",
-               "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.");
-
-  // Code-bearing card, not yet landed: show the auto-assessment verdicts as
-  // chips, and offer Merge. Merge is available throughout -- the chips inform,
-  // they don't gate.
-  if(commits > 0){
-    let chips = "";
-    const verify = kbVerified[id];
-    if(verify === "pass") chips += chip("kb-st-done", "tests", "Static pre-merge check passed: brought tests for the new code, didn't weaken existing ones.");
-    else if(verify === "fail") chips += chip("kb-st-attn", "tests", "Static check: missing tests for new code, or an existing test was weakened — read the diff before merging.");
-    if(review === "approve") chips += chip("kb-st-done", "review", "Agentic review approved this change.");
-    else if(kbReviewing.indexOf(id) !== -1) chips += chip("kb-st-live", "assessing…", "Pre-merge review is running automatically — its verdict will appear here.");
-    return chips + btn("kb-primary", "land", "Merge",
-      "Merge this card's work to master: opens a PR, waits for CI, squash-merges if green (background). Asks once.");
+  const desc = kbCardStage(t, opts);
+  let h = kbStageHtml(desc, t.id);
+  if(opts && opts.family && desc.archivable){
+    const ids = opts.family.ids || [];
+    h += `<button class="btn kb-card-btn kb-fam-archive" data-action="archive-family" data-ids="${kanbanEsc(ids.join(","))}" title="Archive this family — all ${ids.length} cards move to the archived lane.">Archive family</button>`;
   }
-
-  // No code produced: a finished analysis / findings card (code lands via Merge;
-  // analysis lands via this). Its submittable action is to file the findings
-  // into docs/research (committed), so a done analysis card -- including one with
-  // no branch (diffstats null) and an analysis family's lead -- isn't a GUI dead
-  // end. Not offered on review/fix-chain cards, which have their own flow.
-  if(!kbChainKind(t)){
-    if(kbCaptured[id])
-      return chip("kb-st-done", "✓ submitted", "Findings already filed to docs/research/. Archive when you're done; re-submitting only updates that record.");
-    return btn("kb-primary", "capture-research", "Submit findings",
-      "File this card's findings into docs/research/ (committed to the repo) as a queryable record — the analysis counterpart to Merge. Edit the record afterward to sharpen the recommendation/tags.");
-  }
-  return "";
+  return h;
 }
 
 /* Is this done card the merge target for its family -- i.e. the integrating
@@ -439,26 +490,11 @@ function kbCardInner(t, opts){
     : t.status === "blocked"
     ? `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>`
     : t.status === "done"
-      // Findings first: on a finished card the question is almost always
-      // "what did it produce", and the answer used to be reachable only by
-      // reading the run log to the end -- a transcript, not a result.
-      // Process only on a fix card that actually carries a findings block --
-      // the gates 400 without one, so offering it on a prose-derived fix card
-      // was just a button that always failed. Those get Code-the-fix / Findings
-      // + merge instead.
-      ? ((chain && chain.kind === "fix" && t.has_findings)
-          ? `<button class="btn kb-card-btn" data-action="process-fix" data-id="${kanbanEsc(t.id)}"
-               title="Run the review chain on this finished fix: mechanical gates, then closure review, then ACT -- accept (left for a human to merge), retry (files a new linked attempt), or escalate. Never auto-lands from here; use the transit map's auto-land box for that.">Process</button>`
-          : "")
-        // Did no work (0 commits) and hasn't already spawned a fix -> offer to
-        // code the fix: files a dispatchable [Fix] card from this card's content.
-        + ((noWork && !((t.link_counts || {}).children))
-            ? `<button class="btn kb-card-btn" data-action="codefix" data-id="${kanbanEsc(t.id)}"
-                 title="This card identified a problem but committed no code. File a [Fix] card that dispatches a worker to actually write and commit the fix, linked back to this card.">Code the fix</button>`
-            : "")
-        // Landing state (merged/merging/landing/Merge) -- shared with family heads.
-        // Suppressed on a family member: the family merges as one via its head.
-        + kbDoneControls(t, {noMerge})
+      // One source of truth for the done-card lifecycle: kbCardStage decides the
+      // single primary action + chips (Merge / Fix / Submit / Process /
+      // Code-the-fix / ✓ submitted / merged / merging). Only the orthogonal,
+      // data-driven extras stay here: Promote (staged files), Findings, Archive.
+      ? kbDoneControls(t, {noMerge})
         // Left reference files in pool-staging -> Promote them into the shared
         // pool (the data counterpart to Merge; code lands via git, data via this).
         + ((kbStaged[t.id] > 0)
@@ -593,22 +629,11 @@ function kbRenderDoneGrouped(listEl, tasks){
     // Code-bearing members. Two or more branches that aren't already a merged/
     // open PR mean the family may need WEAVING, not just the one converged PR ->
     // offer the agentic merge alongside the programmatic one.
+    // Loose code branches nothing has woven yet -> the stage machine offers
+    // Integrate on the lead when there are >=2 of these and the lead isn't
+    // already converging/an integration card (kbCardStage handles that).
     const codeIds = ordered.filter(t => (kbDiffstats[t.id] || 0) > 0
       && !(kbPrs[t.id] && (kbPrs[t.id].state === "MERGED" || kbPrs[t.id].state === "OPEN"))).map(t => t.id);
-    // Agentic Integrate is for a family of LOOSE code branches that nothing has
-    // woven yet. Suppress it when:
-    //  - the lead already has a PR (the programmatic path is converging), OR
-    //  - the lead is itself a done [Integrate] card WITH commits -- its branch
-    //    already subsumes the siblings, so re-weaving it is wrong; Merge it.
-    // Without this, every multi-code family (including already-integrated ones)
-    // showed "Integrate N" and hid Merge -- the lead's work had nowhere to land.
-    const leadPr = kbPrs[lead.id];
-    const converging = !!(leadPr && (leadPr.state === "MERGED" || leadPr.state === "OPEN"));
-    const leadIsIntegration = (lead.title || "").startsWith("[Integrate]") && (kbDiffstats[lead.id] || 0) > 0;
-    const integrateBtn = (!converging && !leadIsIntegration && codeIds.length >= 2)
-      ? `<button class="btn kb-card-btn kb-primary kb-integrate" data-action="integrate" data-ids="${kanbanEsc(codeIds.join(","))}" data-title="${kanbanEsc(title)}"
-           title="Agentic merge: dispatch an editor to weave these ${codeIds.length} code branches into ONE coherent change WITH tests, then land it CI-gated. For loose feature branches that no integration card has woven yet.">Integrate ${codeIds.length}</button>`
-      : "";
     // Make a collapsed family legible: how many wrote code vs analysis, who
     // worked it, and the merged tally -- so you can tell what's inside without
     // expanding.
@@ -633,14 +658,7 @@ function kbRenderDoneGrouped(listEl, tasks){
         <div class="kb-fam-main">
           <div class="kb-fam-title" title="${kanbanEsc(lead.title || "")}">${kanbanEsc(title)}</div>
           <div class="kb-fam-sub">${kanbanEsc(sub)}</div>
-          <div class="kb-fam-actions">${integrateBtn || kbDoneControls(lead, {})}${
-            // Archivable once there's nothing left to land: the family merged,
-            // or its lead is a no-code card (the PR-bearing-lead rule means no
-            // member has mergeable code either -- it's a finished analysis
-            // family). Still has unmerged/merging code -> no archive-all yet.
-            ((kbPrs[lead.id] || {}).state === "MERGED" || !((kbDiffstats[lead.id] || 0) > 0))
-              ? `<button class="btn kb-card-btn kb-fam-archive" data-action="archive-family" data-ids="${kanbanEsc(ordered.map(t => t.id).join(","))}" title="Archive this family — all ${ordered.length} cards move to the archived lane. Shown once nothing is left to merge (the work has merged, or it's a finished analysis family).">Archive family</button>`
-              : ""}</div>
+          <div class="kb-fam-actions">${kbDoneControls(lead, {family: {codeIds, ids: ordered.map(t => t.id)}})}</div>
         </div>
         <span class="kb-chip kb-fam-count" title="${ordered.length} cards in this decomposition">${ordered.length}</span>
       </div>
