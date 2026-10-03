@@ -4960,6 +4960,24 @@ async def _darkhelix_worktree_create(
         f'echo "MISSING="; echo "MERGED="; echo "UNMERGED="; exit 0; fi; '
         f"set -e; mkdir -p {shlex.quote(_dh_task_dir(task_id))}; "
         f"cd {shlex.quote(DARKHELIX_REPO_PATH)}; git fetch origin --quiet; "
+        # Bring the primary checkout's base branch up to origin BEFORE cutting
+        # the worktree. The worktree is cut from origin/<base> (current after
+        # the fetch), but the shared dirs it symlinks in -- database/,
+        # thirdParty/, bin/, .venv-dev/ -- come from this checkout's WORKING
+        # TREE, which a human merge to origin never advances. Left stale, every
+        # card tests its fresh code against last-pulled reference data and
+        # binaries. Guarded hard because this is the ONE shared checkout: only
+        # fast-forward when it is ON the base branch with no tracked
+        # modifications, so a worktree (always on its own branch) or a dirty
+        # tree is never touched. `|| echo` keeps a non-ff from tripping set -e;
+        # a skip is logged on BASE_UPDATE_SKIP, never fatal to provisioning.
+        f'CUR="$(git rev-parse --abbrev-ref HEAD)"; '
+        f'if [ "$CUR" = {shlex.quote(DARKHELIX_BASE_BRANCH)} ] && '
+        f'[ -z "$(git status --porcelain --untracked-files=no)" ]; then '
+        f'  git merge --ff-only --quiet {shlex.quote("origin/" + DARKHELIX_BASE_BRANCH)} '
+        f'&& echo "BASE_UPDATE=$(git rev-parse --short HEAD)" '
+        f'|| echo "BASE_UPDATE_SKIP ff-refused"; '
+        f'else echo "BASE_UPDATE_SKIP cur=$CUR"; fi; '
         f"MERGE_LIST=''; MISSING=''; {pick_base}"
         f'git worktree add {shlex.quote(wt)} -b {shlex.quote(branch)} "$BASE"; '
         f"cd {shlex.quote(wt)}; {links}; "
@@ -5196,8 +5214,12 @@ def _dispatch_target_note(task_id: str, wt: dict,
         "all — a local ls or grep of the path above will simply report that it\n"
         "does not exist. That is expected and is NOT a broken card.\n\n"
         "You do not need to reach it yourself: dispatch_to_engine operates on\n"
-        "it for you, on snarf. Call that. Only if you need to READ something\n"
-        "first, go over ssh with ~/.hermes/profiles/coder/snarf_key as sam.\n\n"
+        "it for you, on snarf. Call that. A red startup line 'Unknown toolsets:\n"
+        "darkhelix' is COSMETIC — that toolset is plugin-provided and the\n"
+        "validator does not know it, but dispatch_to_engine is loaded and works.\n"
+        "Only if you need to READ something first, go over ssh as sam with the\n"
+        "ABSOLUTE key path (do not use ~ — your profile home is not coder's):\n"
+        "  ssh -i /root/.hermes/profiles/coder/snarf_key sam@192.168.1.239\n\n"
         "It is a real git worktree on its own branch off\n"
         f"{base}, with database/, thirdParty/, testData/, .venv-dev/ and bin/\n"
         "symlinked in. Do NOT edit /ssdpool/DARKHELIX — and note that on snarf\n"
