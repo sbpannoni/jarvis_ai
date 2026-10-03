@@ -95,6 +95,12 @@ let kbEdges = [];
    state the board shows so a running/finished review is visible, not silent. */
 let kbReviews = {};
 let kbReviewing = [];
+/* card_ids that have an in-flight [Fix] child (a fix was dispatched for their
+   review changes and hasn't finished). Drives the FIXING stage so a flagged
+   card reads "↻ fixing…" after you click Fix, instead of reverting to the Fix
+   button on the next re-render (the verdict stays request_changes until the fix
+   completes and re-reviews). Computed from tasks + kbEdges each refresh. */
+let kbFixInFlight = {};
 /* Auto-assessment (client-side): a done code card is Verified (static, instant,
    no model) and Reviewed (agentic) automatically, so the human never clicks
    through a gate pipeline -- they only decide Merge / Fix. kbVerified holds the
@@ -264,6 +270,7 @@ function kbCardSignature(t){
           t.status === "done" ? JSON.stringify(kbPrs[t.id] || null) : "",
           t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : "",
           t.status === "done" ? (kbFinalizing.indexOf(t.id) !== -1) : "",
+          t.status === "done" ? (!!kbFixInFlight[t.id]) : "",
           // Review state drives the review chip / Fix-issues button.
           t.status === "done" ? (kbReviews[t.id] || "") : "",
           t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : "",
@@ -381,6 +388,10 @@ function kbCardStage(t, opts){
   // fixed first, even if a stale PR is still open for it (this is why #8/#9 read
   // "merging" before -- the open PR masked their requested changes).
   if(review === "request_changes" || review === "escalate"){
+    // A fix was already dispatched and is still running -> show that, don't keep
+    // offering (and re-arming) the Fix button on every re-render.
+    if(kbFixInFlight[id])
+      return S("FIXING", {chips: [chip("kb-st-live", "↻ fixing…", "A [Fix] card is addressing the requested changes; it re-reviews when it finishes.")].concat(stalledPr ? [stalledPr] : [])});
     const chips = [chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"), "Agentic review asked for changes — open the card for the comment.")];
     if(stalledPr) chips.push(stalledPr);
     return S("NEEDS_FIX", {chips, primary: act("fix-review", "Fix issues", "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.")});
@@ -834,11 +845,14 @@ function renderKanban(panel, board, err){
     const actEl = lane.querySelector(".kb-lane-active");
     if(actEl){
       if(col.name === "done"){
-        const merging = list.filter(t => (kbPrs[t.id] || {}).state === "OPEN").length;
+        // Only ACTIVE finalizes count as merging -- an open PR that isn't
+        // landing/finalizing is stalled, not a running process (matches the
+        // cards, which now read "PR #N stalled", not "merging").
+        const merging = list.filter(t => (kbPrs[t.id] || {}).state === "OPEN"
+          && (kbLanding.indexOf(t.id) !== -1 || kbFinalizing.indexOf(t.id) !== -1)).length;
         const bits = [];
         if(kbReviewing.length) bits.push(kbReviewing.length + " assessing");
         if(merging) bits.push(merging + " merging");
-        if(kbLanding.length) bits.push(kbLanding.length + " landing");
         if(bits.length){ actEl.hidden = false; actEl.textContent = "⟳ " + bits.join(" · ");
           actEl.title = "Background processes on done cards — not kanban workers, so they don't show in the running lane"; }
         else actEl.hidden = true;
@@ -1329,6 +1343,20 @@ async function kbPromoteRefs(panel, btn){
   }catch(err){ btn.disabled = false; btn.textContent = "promote failed — retry"; btn.title = err.message; }
 }
 
+/* card_id -> true if it has a child [Fix] card that hasn't finished, so a
+   flagged card reads "fixing…" while its fix is in flight. */
+function kbComputeFixInFlight(tasks){
+  const byId = {};
+  (tasks || []).forEach(t => { byId[t.id] = t; });
+  const inflight = {};
+  (kbEdges || []).forEach(([p, c]) => {
+    const child = byId[c];
+    if(child && (child.title || "").startsWith("[Fix]") && child.status !== "done" && child.status !== "archived")
+      inflight[p] = true;
+  });
+  return inflight;
+}
+
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
@@ -1346,6 +1374,7 @@ async function refreshKanbanPanel(panel){
       try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; kbFinalizing = dj.finalizing || []; }catch{ /* keep last */ }
     }
     if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
+    kbFixInFlight = kbComputeFixInFlight(j.tasks || []);   // needs kbEdges (just set)
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
     // Fire-and-forget: verify + review the done code cards so their verdicts are
