@@ -2696,6 +2696,59 @@ def _extract_json(text: str):
             i = b + 1
 
 
+async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: str,
+                                  applied_findings: list) -> list:
+    """File one kanban card per inline-applied fix, parented to the review card,
+    so each auto-applied patch is tracked on the board. Created directly in
+    `blocked` -- the human column, which nothing drains -- so the card is NOT
+    re-dispatched (it would re-do finished work) and NOT re-reviewed (the patch
+    is already test-gated + closure-verified): it only awaits a human's land /
+    discard decision, the same "reviewer never merges" boundary as everywhere
+    else. Returns the created card ids. Best-effort; never raises -- a tracking
+    failure must not fail the review."""
+    cards = []
+    for a in applied_findings:
+        f = a["finding"]
+        r = a["result"]
+        loc = (f"{f.get('file', target_file)}:{f['line']}"
+               if f.get("line") is not None else f.get("file", target_file))
+        branch = r.get("branch_name") or "?"
+        dl = r.get("diff_lines")
+        title = f"[Applied Fix] {loc} -- {(f.get('summary') or '')[:80]}"
+        body_lines = [
+            f"Auto-applied by the reviewer's implement stage ({model}). A VERIFIED "
+            f"patch: it passed the engine's no-new-failures test gate and the "
+            f"closure review. NOT merged -- land the branch or discard it.",
+            "",
+            f"Branch: {branch}  ({dl if dl is not None else '?'} line(s) changed)",
+            f"File: {loc}",
+            f"Defect: {f.get('summary', '')}",
+        ]
+        if f.get("failure_scenario"):
+            body_lines.append(f"Failure scenario: {f['failure_scenario']}")
+        if f.get("suggested_fix"):
+            body_lines.append(f"Suggested fix: {f['suggested_fix']}")
+        verdicts = (r.get("closure") or {}).get("verdicts") or []
+        if verdicts:
+            body_lines += ["", "Closure verdict: " + json.dumps(verdicts)]
+        body = "\n".join(body_lines)
+        try:
+            rc, out = await _kanban_ssh(
+                "hermes kanban create "
+                f"{shlex.quote(title[:200])} "
+                f"--body {shlex.quote(body)} "
+                "--workspace scratch --initial-status blocked "
+                f"--parent {shlex.quote(review_task_id)} "
+                "--created-by looking-glass --json")
+            if rc == 0:
+                cid = json.loads(out.strip()).get("id")
+                if cid:
+                    cards.append(cid)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[applied-fix-card] create failed for {loc}: {exc!r}", flush=True)
+    return cards
+
+
 async def _run_review(target_file: str, task_description: str, chain: bool,
                       mode: str) -> tuple[dict, int]:
     """The whole blocking body of POST /api/review-file, lifted into a helper so
@@ -2816,6 +2869,18 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     except json.JSONDecodeError:
         return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
 
+    review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
+    review_id_ok = bool(_TASK_ID_RE.match(review_task_id))
+
+    # Track each inline-applied fix as its own board card (parented to the
+    # review), so an auto-applied patch is first-class on the kanban board --
+    # visible and auditable -- not just a note in the review body. Filed whether
+    # or not there are also unresolved findings. Best-effort; never fails the review.
+    applied_cards = []
+    if review_id_ok and applied_findings:
+        applied_cards = await _file_applied_fix_cards(
+            target_file, model, review_task_id, applied_findings)
+
     response = {
         "ok": True, "task": task_data, "model": model, "review_text": review_text,
         "findings": findings, "no_issues_found": no_issues_found, "chained": False,
@@ -2826,6 +2891,7 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         "applied": result.get("applied"),
         "applied_count": len(applied_findings),
         "unresolved_count": len(unresolved_findings),
+        "applied_cards": applied_cards,   # board cards tracking each applied fix
     }
     # Combined flow, part 2: the heavy path (a dispatchable [Fix] kanban card)
     # runs whenever acting-on-findings is on (the apply toggle) OR a caller
@@ -2844,8 +2910,7 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         response["chain_skipped_reason"] = "all findings resolved by the inline implement stage"
         return response, 200
 
-    review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
-    if not _TASK_ID_RE.match(review_task_id):
+    if not review_id_ok:
         response["chain_skipped_reason"] = f"review card id unparseable: {review_task_id!r}"
         return response, 200
 
