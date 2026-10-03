@@ -3791,6 +3791,7 @@ async def kanban_diffstats() -> JSONResponse:
                              "staged": _DIFFSTAT_CACHE["staged"],
                              "prs": _DIFFSTAT_CACHE.get("prs", {}),
                              "landing": _DIFFSTAT_CACHE.get("landing", []),
+                             "finalizing": sorted(_DH_FINALIZE_PENDING.keys()),
                              "cached": True})
     try:
         board = await _kanban_api_get("/api/plugins/kanban/board")
@@ -3853,8 +3854,13 @@ async def kanban_diffstats() -> JSONResponse:
     except Exception:
         prs = {}
     landing = sorted(_DH_LANDING_IN_FLIGHT & done_set)
+    # PRs the finalize reconciler is actively driving to merge. An OPEN PR that
+    # is NOT landing/finalizing is stalled, not "merging" -- the board uses this
+    # to stop labelling an abandoned open PR as in-progress.
+    finalizing = sorted(set(_DH_FINALIZE_PENDING) & done_set)
     _DIFFSTAT_CACHE.update(ts=now, data=data, staged=staged, prs=prs, landing=landing)
-    return JSONResponse({"diffstats": data, "staged": staged, "prs": prs, "landing": landing})
+    return JSONResponse({"diffstats": data, "staged": staged, "prs": prs,
+                         "landing": landing, "finalizing": finalizing})
 
 
 _LINKS_CACHE: dict = {"ts": 0.0, "edges": [], "reviews": {}}

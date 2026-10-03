@@ -83,6 +83,10 @@ let kbStaged = {};
    by this, not by diffstats alone. kbLanding = ids whose land is in flight. */
 let kbPrs = {};
 let kbLanding = [];
+/* task_ids whose PR the finalize reconciler is actively driving to merge. An
+   OPEN PR that is in neither kbLanding nor kbFinalizing is STALLED, not merging
+   -- so the stage machine doesn't label an abandoned PR as in-progress. */
+let kbFinalizing = [];
 /* parent->child edges (from /api/kanban/links): group a decomposition's cards
    into one collapsible family in the done lane. */
 let kbEdges = [];
@@ -259,6 +263,7 @@ function kbCardSignature(t){
           // PR/landing state drives the Merge button vs merged/merging chips.
           t.status === "done" ? JSON.stringify(kbPrs[t.id] || null) : "",
           t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : "",
+          t.status === "done" ? (kbFinalizing.indexOf(t.id) !== -1) : "",
           // Review state drives the review chip / Fix-issues button.
           t.status === "done" ? (kbReviews[t.id] || "") : "",
           t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : "",
@@ -341,6 +346,7 @@ function kbCardStage(t, opts){
   const review = kbReviews[id];
   const reviewing = kbReviewing.indexOf(id) !== -1;
   const landing = kbLanding.indexOf(id) !== -1;
+  const finalizing = kbFinalizing.indexOf(id) !== -1;
   const verify = kbVerified[id];
   const captured = !!kbCaptured[id];
   const chain = kbChainKind(t);
@@ -355,26 +361,36 @@ function kbCardStage(t, opts){
   // terminal / in-flight -- status only, nothing to click
   if(pr.state === "MERGED")
     return S("MERGED", {chips: [chip("kb-st-done", "merged #" + pr.number, "Merged to master as #" + pr.number + " — " + (pr.url || ""))], archivable: true});
-  if(pr.state === "OPEN")
-    return S("MERGING", {chips: [chip("kb-st-live", "merging #" + pr.number, "PR #" + pr.number + " open — CI running, squash-merges when green. " + (pr.url || ""))]});
+  // "merging" means ACTIVELY being finalized -- an open PR the reconciler/land
+  // is driving, or a land just started. An OPEN PR in NEITHER set is STALLED,
+  // not merging (e.g. an old PR with requested changes, or one orphaned before
+  // the durable reconciler) -- it falls through to its real stage below.
+  if(pr.state === "OPEN" && (landing || finalizing))
+    return S("MERGING", {chips: [chip("kb-st-live", "merging #" + pr.number, "PR #" + pr.number + " — being finalized (CI → squash-merge). " + (pr.url || ""))]});
   if(landing)
     return S("LANDING", {chips: [chip("kb-st-live", "landing…", "Landing started — opening the PR…")]});
 
   // nested family member -- it lands via the lead
   if(opts.noMerge) return S("MEMBER");
 
-  // a family of loose code branches nothing has woven yet -> Integrate (a lead
-  // that already has a PR hit MERGED/MERGING above; one that IS an [Integrate]
-  // card falls through to Merge)
+  const stalledPr = pr.state === "OPEN"
+    ? chip("kb-st-attn", "PR #" + pr.number + " stalled", "A PR is open but nothing is merging it. " + (pr.url || ""))
+    : null;
+
+  // review flagged problems -> Fix, BEFORE Integrate/Merge: known-bad work is
+  // fixed first, even if a stale PR is still open for it (this is why #8/#9 read
+  // "merging" before -- the open PR masked their requested changes).
+  if(review === "request_changes" || review === "escalate"){
+    const chips = [chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"), "Agentic review asked for changes — open the card for the comment.")];
+    if(stalledPr) chips.push(stalledPr);
+    return S("NEEDS_FIX", {chips, primary: act("fix-review", "Fix issues", "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.")});
+  }
+
+  // a family of loose code branches nothing has woven yet -> Integrate
   if(fam && (fam.codeIds || []).length >= 2 && commits > 0 && !(t.title || "").startsWith("[Integrate]"))
     return S("INTEGRATE", {primary: act("integrate", "Integrate " + fam.codeIds.length,
       "Agentic merge: weave these " + fam.codeIds.length + " code branches into ONE coherent change WITH tests, then land it CI-gated. For loose feature branches no integration card has woven yet.",
       {ids: fam.codeIds.join(","), title: (chain ? chain.rest : t.title)})});
-
-  // review flagged problems -> Fix (never Merge known-bad work)
-  if(review === "request_changes" || review === "escalate")
-    return S("NEEDS_FIX", {chips: [chip("kb-st-attn", "review: " + (review === "escalate" ? "escalate" : "changes"), "Agentic review asked for changes — open the card for the comment.")],
-      primary: act("fix-review", "Fix issues", "Dispatch an editor to address the review's requested changes. Files a [Fix] card and runs it.")});
 
   // review-chain fix card carrying a findings block -> its own closure pipeline
   if(chain && chain.kind === "fix" && t.has_findings)
@@ -384,6 +400,7 @@ function kbCardStage(t, opts){
   // code-bearing card, not yet landed -> Merge, annotated with assessment chips
   if(commits > 0){
     const chips = [];
+    if(stalledPr) chips.push(stalledPr);   // an open-but-stalled PR; Merge re-drives it
     if(verify === "pass") chips.push(chip("kb-st-done", "tests", "Static pre-merge check passed: brought tests, didn't weaken existing ones."));
     else if(verify === "fail") chips.push(chip("kb-st-attn", "tests", "Static check: missing tests, or an existing test was weakened — read the diff before merging."));
     if(review === "approve") chips.push(chip("kb-st-done", "review", "Agentic review approved this change."));
@@ -1326,7 +1343,7 @@ async function refreshKanbanPanel(panel){
     ]);
     const j = await r.json();
     if(dr && dr.ok){
-      try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; }catch{ /* keep last */ }
+      try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; kbFinalizing = dj.finalizing || []; }catch{ /* keep last */ }
     }
     if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
