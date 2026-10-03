@@ -297,7 +297,11 @@ function kbDepChips(t){
         : `Depends on ${parents} earlier card${parents === 1 ? "" : "s"}`}"
       >${waiting ? "⛓" : "↳"} ${parents}</span>`);
   }
-  if(pr && pr.total){
+  // Child progress is a LIVE signal (how far a decomposition has got). On a
+  // done/archived card it's misleading: a child that merged and archived no
+  // longer counts as "done" here, so a finished analysis parent whose children
+  // all landed reads "0/2" and looks blocked when its only next step is Archive.
+  if(pr && pr.total && t.status !== "done" && t.status !== "archived"){
     const done = pr.done === pr.total;
     chips.push(`<span class="kb-chip kb-kids${done ? " ok" : ""}"
       title="${pr.done} of ${pr.total} child card${pr.total === 1 ? "" : "s"} done"
