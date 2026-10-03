@@ -2414,6 +2414,9 @@ async def set_review_apply_setting(request: Request) -> JSONResponse:
 
 CODER_ENGINE_VENV_PY = "/ssdpool/coder-engine/.venv/bin/python3"
 DISPATCH_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_review_task.py"
+DISPATCH_FIX_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_fix_task.py"
+# Where a detached apply job writes its result + progress, polled by the HUD.
+APPLY_JOBS_ROOT = "/ssdpool/agent-work/apply-jobs"
 CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"
 DISPATCH_CLOSURE_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_closure_review_task.py"
 _FENCED_FINDINGS_RE = re.compile(r"```json:review-findings\n(.*?)\n```", re.DOTALL)
@@ -2581,10 +2584,16 @@ async def review_file(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "status": "running", "target_file": target_file})
 
     tracker = await _sweep_tracker_open(target_file, mode)
+    handoff = False
     try:
-        body, code = await _run_review(target_file, task_description, chain, mode)
+        body, code = await _run_review(target_file, task_description, chain, mode,
+                                       tracker_id=tracker)
+        handoff = bool(body.get("tracker_handoff"))
     finally:
-        await _sweep_tracker_close(tracker)
+        # Apply (when launched) runs detached with a poller that owns the
+        # tracker; don't close it here or it gets reclaimed mid-apply.
+        if not handoff:
+            await _sweep_tracker_close(tracker)
     return JSONResponse(body, status_code=code)
 
 
@@ -2653,14 +2662,20 @@ async def _sweep_tracker_close(card_id: str | None) -> None:
 def _spawn_review_job(target_file: str, task_description: str, chain: bool, mode: str) -> None:
     async def _job():
         tracker = await _sweep_tracker_open(target_file, mode)
+        handoff = False
         try:
-            body, _code = await _run_review(target_file, task_description, chain, mode)
+            body, _code = await _run_review(target_file, task_description, chain, mode,
+                                            tracker_id=tracker)
+            handoff = bool(body.get("tracker_handoff"))
             if not body.get("ok"):
                 print(f"[review-async] {target_file} failed: {body.get('error')}", flush=True)
         except Exception as exc:  # never let a background job die silently
             print(f"[review-async] {target_file} crashed: {exc!r}", flush=True)
         finally:
-            await _sweep_tracker_close(tracker)
+            # When apply was launched, the poller owns the tracker and closes it
+            # after the apply finishes -- closing here would reclaim it early.
+            if not handoff:
+                await _sweep_tracker_close(tracker)
             _REVIEW_JOBS_ACTIVE.discard(target_file)
     _REVIEW_JOBS_ACTIVE.add(target_file)
     task = asyncio.get_running_loop().create_task(_job())
@@ -2749,175 +2764,17 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
     return cards
 
 
-async def _run_review(target_file: str, task_description: str, chain: bool,
-                      mode: str) -> tuple[dict, int]:
-    """The whole blocking body of POST /api/review-file, lifted into a helper so
-    the endpoint can run it inline (sync) or as a background job (async:true)
-    without duplicating the kanban-filing / chain logic. Returns (body, http
-    status). Runs one reviewer-role review of target_file on snarf against the
-    reviewer's currently-assigned model and files the result as a --triage
-    kanban card (and, when chain and there are findings, a linked --parent fix
-    card)."""
-    try:
-        rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
-        model = json.loads(out0).get("reviewer") if rc0 == 0 else None
-    except Exception:
-        model = None
-    if not model:
-        return {"ok": False, "error": "could not resolve reviewer's assigned model"}, 502
-
-    cmd = (
-        f"{CODER_ENGINE_VENV_PY} {DISPATCH_REVIEW_TASK_PY} "
-        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
-        f"--target-file {shlex.quote(target_file)} "
-        f"--model {shlex.quote(model)} "
-        f"--mode {shlex.quote(mode)}"
-    )
-    if task_description:
-        cmd += f" --task-description {shlex.quote(task_description)}"
-    # The reviewer's inline implement stage, controlled by the CODEBASE MAP
-    # toggle. Passed explicitly either way so the toggle -- not the engine's own
-    # default -- is the single source of truth for HUD-triggered reviews. When
-    # on, it also arms the combined flow below (heavy chain picks up the rest).
-    apply_on = _review_apply_enabled()
-    cmd += " --apply-straightforward" if apply_on else " --no-apply-straightforward"
-
-    try:
-        rc, out = await _fleet_ssh("snarf", cmd)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}, 502
-
-    result = _extract_json(out)
-    if result is None:
-        return {"ok": False, "error": f"unparseable review output: {out[-1500:]}"}, 502
-
-    if result.get("status") != "done":
-        return {"ok": False, "error": result.get("error") or "review failed", "model": model}, 502
-
-    review_text = result.get("review_text") or ""
-    findings = result.get("findings") or []
-    no_issues_found = bool(result.get("no_issues_found"))
-
-    # Combined flow, part 1: partition findings by what the inline (light) stage
-    # did with them. apply_findings processes findings in order and emits one
-    # result each, so result["applied"]["results"][i] lines up with findings[i].
-    # Only "applied" counts as resolved; everything else (not_attemptable,
-    # rejected_gate, needs_review, error -- or no inline run at all) is handed to
-    # the heavy kanban path below. This is "light first, heavy for the rest."
-    applied_block = result.get("applied") or {}
-    applied_results = applied_block.get("results") or []
-    applied_findings, unresolved_findings = [], []
-    for i, f in enumerate(findings):
-        r = applied_results[i] if i < len(applied_results) else None
-        if r and r.get("outcome") == "applied":
-            applied_findings.append({"finding": f, "result": r})
-        else:
-            unresolved_findings.append(f)
-
-    title = f"[Review] {target_file}"
-    body = (
-        f"Automated review by {model} (reviewer role) -- a proposal, not a "
-        f"verified finding. Read it and decide; nothing has been changed.\n\n"
-        f"{review_text}"
-    )
-    # Note what the inline (light) stage already applied, so a human reading the
-    # review card sees the verified patches waiting to land (not merged -- a
-    # branch to `git checkout` / apply or discard), not just the prose.
-    if applied_findings:
-        applied_lines = [
-            "", "",
-            "Auto-applied by the reviewer's implement stage -- each is test-gated "
-            "and closure-checked, NOT merged. Land the branch or discard it:",
-        ]
-        for a in applied_findings:
-            f = a["finding"]
-            r = a["result"]
-            loc = (f"{f.get('file', target_file)}:{f['line']}"
-                   if f.get("line") is not None else f.get("file", target_file))
-            dl = r.get("diff_lines")
-            applied_lines.append(
-                f"- {loc} -- {f.get('summary', '')}  "
-                f"[branch {r.get('branch_name')}, "
-                f"{dl if dl is not None else '?'} line(s)]")
-        body += "\n".join(applied_lines)
-
-    # Embed the structured findings so that when this card is approved (or
-    # Code-the-fix is used on it), the [Fix] card built from this body carries
-    # the block the review-chain gates (check-fix-card/closure-review/Process)
-    # require. Only the UNRESOLVED findings go in -- the applied ones already
-    # have a verified patch, so re-coding them from this card would be
-    # double work. Same fenced shape _fetch_fix_card parses; target_file is
-    # enough, the fix card id is not known here and _fetch_fix_card doesn't need it.
-    if unresolved_findings:
-        body += ("\n\n```json:review-findings\n"
-                 + json.dumps({"target_file": target_file, "findings": unresolved_findings}, indent=2)
-                 + "\n```")
-    kanban_cmd = (
-        "hermes kanban create "
-        f"{shlex.quote(title[:200])} "
-        f"--body {shlex.quote(body)} "
-        "--workspace scratch --triage --created-by looking-glass --json"
-    )
-    try:
-        rc2, out2 = await _kanban_ssh(kanban_cmd)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "review_text": review_text}, 502
-    if rc2 != 0:
-        return {"ok": False, "error": out2[-2000:], "review_text": review_text}, 502
-    try:
-        task_data = json.loads(out2.strip())
-    except json.JSONDecodeError:
-        return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
-
-    review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
-    review_id_ok = bool(_TASK_ID_RE.match(review_task_id))
-
-    # Track each inline-applied fix as its own board card (parented to the
-    # review), so an auto-applied patch is first-class on the kanban board --
-    # visible and auditable -- not just a note in the review body. Filed whether
-    # or not there are also unresolved findings. Best-effort; never fails the review.
-    applied_cards = []
-    if review_id_ok and applied_findings:
-        applied_cards = await _file_applied_fix_cards(
-            target_file, model, review_task_id, applied_findings)
-
-    response = {
-        "ok": True, "task": task_data, "model": model, "review_text": review_text,
-        "findings": findings, "no_issues_found": no_issues_found, "chained": False,
-        # Outcomes from the inline implement stage, when it ran (null when the
-        # toggle is off). Shape: {"status", "results": [{outcome, reason,
-        # branch_name, patch_path, diff_lines, ...}]}. Reviewer never merges --
-        # an "applied" result is a verified patch for a human/HUD to land.
-        "applied": result.get("applied"),
-        "applied_count": len(applied_findings),
-        "unresolved_count": len(unresolved_findings),
-        "applied_cards": applied_cards,   # board cards tracking each applied fix
-    }
-    # Combined flow, part 2: the heavy path (a dispatchable [Fix] kanban card)
-    # runs whenever acting-on-findings is on (the apply toggle) OR a caller
-    # explicitly asked to chain -- and it only handles the findings the inline
-    # stage did NOT resolve. With apply off and no explicit chain, this is the
-    # original findings-only behavior; with apply off and chain:true, the
-    # unresolved set IS every finding (inline never ran), i.e. the legacy
-    # chain-all behavior, unchanged.
-    do_heavy = apply_on or chain
-    if not do_heavy:
-        return response, 200
-    if no_issues_found or not findings:
-        response["chain_skipped_reason"] = "no actionable findings"
-        return response, 200
+async def _file_unresolved_fix_card(response: dict, target_file: str, model: str,
+                                    review_task_id: str, unresolved_findings: list,
+                                    applied_count: int) -> None:
+    """File ONE dispatchable [Fix] kanban card for the findings the apply stage
+    did not resolve, parented to the review card. Mutates `response` with
+    chained/chained_task or chain_error. No-op if there is nothing unresolved."""
     if not unresolved_findings:
-        response["chain_skipped_reason"] = "all findings resolved by the inline implement stage"
-        return response, 200
-
-    if not review_id_ok:
-        response["chain_skipped_reason"] = f"review card id unparseable: {review_task_id!r}"
-        return response, 200
-
+        return
     applied_note = (
-        f" ({len(applied_findings)} other finding(s) were already auto-applied "
-        f"inline and are on their own branches -- see the parent card.)"
-        if applied_findings else ""
+        f" ({applied_count} other finding(s) were already auto-applied inline and "
+        f"are on their own branches -- see the parent card.)" if applied_count else ""
     )
     fix_lines = [
         f"Fix the {len(unresolved_findings)} issue(s) below in `{target_file}`, found by an "
@@ -2942,14 +2799,12 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     fix_lines.append("```")
     fix_title = f"[Fix] {target_file}"
     fix_body = "\n".join(fix_lines)
-    idempotency_key = _submission_key(fix_title, fix_body)
-
     fix_cmd = (
         "hermes kanban create "
         f"{shlex.quote(fix_title[:200])} "
         f"--body {shlex.quote(fix_body)} "
         "--workspace scratch "
-        f"--idempotency-key {shlex.quote(idempotency_key)} "
+        f"--idempotency-key {shlex.quote(_submission_key(fix_title, fix_body))} "
         f"--assignee {shlex.quote(_darkhelix_assignee())} "
         f"--parent {shlex.quote(review_task_id)} "
         "--created-by looking-glass --json"
@@ -2958,18 +2813,260 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         rc3, out3 = await _kanban_ssh(fix_cmd)
     except Exception as exc:
         response["chain_error"] = str(exc)
-        return response, 200
+        return
     if rc3 != 0:
         response["chain_error"] = out3[-2000:]
-        return response, 200
+        return
     try:
-        fix_task_data = json.loads(out3.strip())
+        response["chained_task"] = json.loads(out3.strip())
+        response["chained"] = True
     except json.JSONDecodeError:
         response["chain_error"] = f"unparseable kanban output: {out3[-500:]}"
+
+
+async def _launch_detached_apply(target_file: str, model: str, findings: list) -> tuple[str, str]:
+    """Launch ONE detached dispatch_fix_task on snarf over all findings (it
+    processes them sequentially, so the single GPU seat is never contended). The
+    job is nohup'd with stdout/stderr redirected to a file, so the SSH channel
+    closes immediately and the job survives -- the exact detachment the manual
+    e2e used without orphaning. Returns (result_path, progress_path); the result
+    file appearing is the completion signal the poller watches for."""
+    stamp = f"{int(time.time())}-{os.urandom(3).hex()}"
+    run_dir = f"{APPLY_JOBS_ROOT}/{stamp}"
+    result_path = f"{run_dir}/result.json"
+    progress_path = f"{run_dir}/progress.log"
+    findings_json = json.dumps({"findings": findings})
+    cmd = (
+        f"mkdir -p {shlex.quote(run_dir)} && "
+        f"printf %s {shlex.quote(findings_json)} > {shlex.quote(run_dir + '/findings.json')} && "
+        f"nohup {CODER_ENGINE_VENV_PY} {DISPATCH_FIX_TASK_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--findings-json {shlex.quote(run_dir + '/findings.json')} "
+        f"--model {shlex.quote(model)} "
+        f"--result-out {shlex.quote(result_path)} "
+        f"--progress-out {shlex.quote(progress_path)} "
+        f"> {shlex.quote(run_dir + '/stdout.log')} 2>&1 & echo launched"
+    )
+    rc, out = await _fleet_ssh("snarf", cmd)
+    if rc != 0 or "launched" not in (out or ""):
+        raise RuntimeError(f"apply launch failed (rc={rc}): {out[-400:]}")
+    return result_path, progress_path
+
+
+async def _sweep_tracker_refresh(card_id: str, ttl: int = 1800) -> None:
+    """Re-claim the tracker to extend its TTL so a long apply does not get
+    reclaimed mid-run. Best-effort and purely cosmetic -- the poller files all
+    cards independently of the tracker, so a lost tracker never loses data."""
+    try:
+        await _kanban_ssh(f"hermes kanban claim {shlex.quote(card_id)} --ttl {int(ttl)}")
+    except Exception:
+        pass
+
+
+_APPLY_JOBS: set = set()
+
+
+def _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
+                        result_path, progress_path, findings) -> None:
+    """Background task: tail the detached apply job's progress onto the tracker
+    card, and when its result lands, file [Applied Fix]/[Fix] cards and close the
+    tracker. Owns the tracker's lifecycle from here on."""
+    async def _job():
+        try:
+            await _apply_poll_loop(tracker_id, review_task_id, target_file, model,
+                                   result_path, progress_path, findings)
+        except Exception as exc:  # never die silently; always release the tracker
+            print(f"[apply-poller] {target_file} crashed: {exc!r}", flush=True)
+            if tracker_id:
+                await _sweep_tracker_close(tracker_id)
+    task = asyncio.get_running_loop().create_task(_job())
+    _APPLY_JOBS.add(task)
+    task.add_done_callback(_APPLY_JOBS.discard)
+
+
+async def _apply_poll_loop(tracker_id, review_task_id, target_file, model,
+                           result_path, progress_path, findings) -> None:
+    posted = 0
+    deadline = time.time() + 2 * 3600   # 2h backstop
+    while time.time() < deadline:
+        # Relay any new progress lines onto the tracker card.
+        try:
+            rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(progress_path)} 2>/dev/null || true")
+            lines = [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+        except Exception:
+            lines = []
+        if tracker_id and len(lines) > posted:
+            new = lines[posted:]
+            posted = len(lines)
+            # drop the leading epoch stamp for readability
+            msg = "apply · " + " | ".join(ln.split(" ", 1)[-1] for ln in new[-6:])
+            try:
+                await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} {shlex.quote(msg[:900])}")
+            except Exception:
+                pass
+        if tracker_id:
+            await _sweep_tracker_refresh(tracker_id)
+        # Result ready?
+        try:
+            rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(result_path)} 2>/dev/null || true")
+            applied_result = _extract_json(out) if rc == 0 and out.strip() else None
+        except Exception:
+            applied_result = None
+        if applied_result is not None:
+            await _finalize_apply(tracker_id, review_task_id, target_file, model,
+                                  applied_result, findings)
+            return
+        await asyncio.sleep(20)
+    # Timed out.
+    if tracker_id:
+        try:
+            await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} "
+                              f"{shlex.quote('apply: timed out after 2h; see ' + result_path + ' on snarf')}")
+        except Exception:
+            pass
+        await _sweep_tracker_close(tracker_id)
+
+
+async def _finalize_apply(tracker_id, review_task_id, target_file, model,
+                          applied_result, findings) -> None:
+    """Partition the detached apply's result, file the board cards, post a
+    summary, and close the tracker. results[i] lines up with findings[i]
+    (dispatch_fix_task processes them in order)."""
+    results = applied_result.get("results") or []
+    applied_findings, unresolved = [], []
+    for i, f in enumerate(findings):
+        r = results[i] if i < len(results) else None
+        if r and r.get("outcome") == "applied":
+            applied_findings.append({"finding": f, "result": r})
+        else:
+            unresolved.append(f)
+
+    applied_cards = []
+    if applied_findings:
+        applied_cards = await _file_applied_fix_cards(target_file, model, review_task_id, applied_findings)
+    fix_resp: dict = {}
+    if unresolved:
+        await _file_unresolved_fix_card(fix_resp, target_file, model, review_task_id,
+                                        unresolved, len(applied_findings))
+
+    if tracker_id:
+        summary = (f"apply done: {len(applied_findings)} applied "
+                   f"({len(applied_cards)} [Applied Fix] card(s)), {len(unresolved)} -> [Fix].")
+        try:
+            await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} {shlex.quote(summary[:900])}")
+        except Exception:
+            pass
+        await _sweep_tracker_close(tracker_id)
+
+
+async def _run_review(target_file: str, task_description: str, chain: bool,
+                      mode: str, tracker_id: str | None = None) -> tuple[dict, int]:
+    """Run one reviewer-role review of target_file on snarf and file a [Review]
+    --triage card. Returns (body, http status).
+
+    The review itself is READ-ONLY and runs as ONE bounded SSH call -- the path
+    that already survives long reviews. The implement stage no longer rides
+    inside that call (that coupling let a long apply overrun the connection /
+    tracker and orphan its container). Instead, when the apply toggle is on and
+    the review found something, this launches a single DETACHED apply job on
+    snarf (dispatch_fix_task over all findings, processed sequentially) and hands
+    tracker_id to a background poller (_spawn_apply_poller) that relays progress
+    onto the tracker card, files an [Applied Fix] card per applied finding and a
+    [Fix] card for the rest, and closes the tracker when done. In that case the
+    returned body has tracker_handoff=True and the CALLER MUST NOT close the
+    tracker.
+
+    Toggle off: chain=True files a [Fix] card for all findings (legacy
+    chain-all), chain=False is findings-only -- both synchronous, no handoff."""
+    try:
+        rc0, out0 = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
+        model = json.loads(out0).get("reviewer") if rc0 == 0 else None
+    except Exception:
+        model = None
+    if not model:
+        return {"ok": False, "error": "could not resolve reviewer's assigned model"}, 502
+
+    # Review only -- apply is orchestrated here (detached), never inside this SSH.
+    cmd = (
+        f"{CODER_ENGINE_VENV_PY} {DISPATCH_REVIEW_TASK_PY} "
+        f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
+        f"--target-file {shlex.quote(target_file)} "
+        f"--model {shlex.quote(model)} "
+        f"--mode {shlex.quote(mode)} "
+        "--no-apply-straightforward"
+    )
+    if task_description:
+        cmd += f" --task-description {shlex.quote(task_description)}"
+
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 502
+
+    result = _extract_json(out)
+    if result is None:
+        return {"ok": False, "error": f"unparseable review output: {out[-1500:]}"}, 502
+    if result.get("status") != "done":
+        return {"ok": False, "error": result.get("error") or "review failed", "model": model}, 502
+
+    review_text = result.get("review_text") or ""
+    findings = result.get("findings") or []
+    no_issues_found = bool(result.get("no_issues_found"))
+    apply_on = _review_apply_enabled()
+
+    title = f"[Review] {target_file}"
+    body = (
+        f"Automated review by {model} (reviewer role) -- a proposal, not a "
+        f"verified finding. Read it and decide; nothing has been changed.\n\n"
+        f"{review_text}"
+    )
+    if findings:
+        body += ("\n\n```json:review-findings\n"
+                 + json.dumps({"target_file": target_file, "findings": findings}, indent=2)
+                 + "\n```")
+    try:
+        rc2, out2 = await _kanban_ssh(
+            "hermes kanban create "
+            f"{shlex.quote(title[:200])} --body {shlex.quote(body)} "
+            "--workspace scratch --triage --created-by looking-glass --json")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "review_text": review_text}, 502
+    if rc2 != 0:
+        return {"ok": False, "error": out2[-2000:], "review_text": review_text}, 502
+    try:
+        task_data = json.loads(out2.strip())
+    except json.JSONDecodeError:
+        return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
+
+    review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
+    review_id_ok = bool(_TASK_ID_RE.match(review_task_id))
+
+    response = {
+        "ok": True, "task": task_data, "model": model, "review_text": review_text,
+        "findings": findings, "no_issues_found": no_issues_found, "chained": False,
+    }
+
+    # Apply ON: launch the detached apply job; a poller owns the tracker and
+    # files the [Applied Fix]/[Fix] cards when it finishes.
+    if apply_on and findings and not no_issues_found and review_id_ok:
+        try:
+            result_path, progress_path = await _launch_detached_apply(target_file, model, findings)
+        except Exception as exc:  # launch failed -> fall back so nothing is lost
+            response["apply_error"] = f"could not launch apply: {exc}"
+            await _file_unresolved_fix_card(response, target_file, model, review_task_id, findings, 0)
+            return response, 200
+        _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
+                            result_path, progress_path, findings)
+        response["apply_async"] = True
+        if tracker_id:
+            response["tracker_handoff"] = True   # poller closes the tracker, not the caller
         return response, 200
 
-    response["chained"] = True
-    response["chained_task"] = fix_task_data
+    # Apply OFF: legacy synchronous behavior.
+    if chain and findings and not no_issues_found and review_id_ok:
+        await _file_unresolved_fix_card(response, target_file, model, review_task_id, findings, 0)
+    elif chain:
+        response["chain_skipped_reason"] = "no actionable findings"
     return response, 200
 
 
