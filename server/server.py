@@ -2863,6 +2863,19 @@ async def _sweep_tracker_refresh(card_id: str, ttl: int = 1800) -> None:
         pass
 
 
+async def _tracker_note(tracker_id, msg: str) -> None:
+    """Post one progress comment on the tracker card. These comments ARE the run
+    log for a looking-glass review/apply card -- the work runs on the
+    coder-engine, not as a Hermes worker, so `~/.hermes/kanban/logs/<id>.log` is
+    empty and the run-log pane falls back to these (see kanban_log). Best-effort."""
+    if not tracker_id:
+        return
+    try:
+        await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} {shlex.quote(msg[:900])}")
+    except Exception:
+        pass
+
+
 _APPLY_JOBS: set = set()
 
 
@@ -2986,6 +2999,9 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     if not model:
         return {"ok": False, "error": "could not resolve reviewer's assigned model"}, 502
 
+    await _tracker_note(tracker_id, f"review started ({model}) — reading {target_file}; "
+                                    f"this model call can run many minutes with no sub-progress")
+
     # Review only -- apply is orchestrated here (detached), never inside this SSH.
     cmd = (
         f"{CODER_ENGINE_VENV_PY} {DISPATCH_REVIEW_TASK_PY} "
@@ -3013,6 +3029,10 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     findings = result.get("findings") or []
     no_issues_found = bool(result.get("no_issues_found"))
     apply_on = _review_apply_enabled()
+
+    await _tracker_note(tracker_id, "review complete — "
+                        + ("no issues found" if no_issues_found or not findings
+                           else f"{len(findings)} finding(s); filing the review card"))
 
     title = f"[Review] {target_file}"
     body = (
@@ -3055,6 +3075,8 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
             response["apply_error"] = f"could not launch apply: {exc}"
             await _file_unresolved_fix_card(response, target_file, model, review_task_id, findings, 0)
             return response, 200
+        await _tracker_note(tracker_id, f"apply launched (detached) over {len(findings)} "
+                                        f"finding(s); progress follows")
         _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
                             result_path, progress_path, findings)
         response["apply_async"] = True
@@ -9970,6 +9992,26 @@ async def kanban_log(task_id: str, request: Request) -> JSONResponse:
             f"tail -n {lines} ~/.hermes/kanban/logs/{shlex.quote(task_id)}.log 2>/dev/null || true")
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
+    # Fallback: a card whose work does NOT run as a Hermes worker (a
+    # looking-glass review/apply tracker, worked on the coder-engine) has no
+    # worker transcript, so the file is empty. Its progress lives in the card's
+    # COMMENTS instead -- surface those as the run log so the pane shows the live
+    # review/apply progress rather than "(no run log yet)".
+    if not (out or "").strip():
+        try:
+            detail = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
+            comments = detail.get("comments") or []
+            rows = []
+            for c in comments[-lines:]:
+                ts = c.get("created_at")
+                when = (time.strftime("%H:%M:%S", time.gmtime(ts))
+                        if isinstance(ts, (int, float)) else "")
+                who = c.get("author") or c.get("created_by") or ""
+                rows.append(f"{when} {who}  {c.get('body','')}".strip())
+            if rows:
+                out = "\n".join(rows)
+        except Exception:
+            pass
     return JSONResponse({"id": task_id, "log": out[-60000:]})
 
 
