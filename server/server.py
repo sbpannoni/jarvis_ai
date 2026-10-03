@@ -2724,8 +2724,10 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         cmd += f" --task-description {shlex.quote(task_description)}"
     # The reviewer's inline implement stage, controlled by the CODEBASE MAP
     # toggle. Passed explicitly either way so the toggle -- not the engine's own
-    # default -- is the single source of truth for HUD-triggered reviews.
-    cmd += " --apply-straightforward" if _review_apply_enabled() else " --no-apply-straightforward"
+    # default -- is the single source of truth for HUD-triggered reviews. When
+    # on, it also arms the combined flow below (heavy chain picks up the rest).
+    apply_on = _review_apply_enabled()
+    cmd += " --apply-straightforward" if apply_on else " --no-apply-straightforward"
 
     try:
         rc, out = await _fleet_ssh("snarf", cmd)
@@ -2742,20 +2744,60 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     review_text = result.get("review_text") or ""
     findings = result.get("findings") or []
     no_issues_found = bool(result.get("no_issues_found"))
+
+    # Combined flow, part 1: partition findings by what the inline (light) stage
+    # did with them. apply_findings processes findings in order and emits one
+    # result each, so result["applied"]["results"][i] lines up with findings[i].
+    # Only "applied" counts as resolved; everything else (not_attemptable,
+    # rejected_gate, needs_review, error -- or no inline run at all) is handed to
+    # the heavy kanban path below. This is "light first, heavy for the rest."
+    applied_block = result.get("applied") or {}
+    applied_results = applied_block.get("results") or []
+    applied_findings, unresolved_findings = [], []
+    for i, f in enumerate(findings):
+        r = applied_results[i] if i < len(applied_results) else None
+        if r and r.get("outcome") == "applied":
+            applied_findings.append({"finding": f, "result": r})
+        else:
+            unresolved_findings.append(f)
+
     title = f"[Review] {target_file}"
     body = (
         f"Automated review by {model} (reviewer role) -- a proposal, not a "
         f"verified finding. Read it and decide; nothing has been changed.\n\n"
         f"{review_text}"
     )
+    # Note what the inline (light) stage already applied, so a human reading the
+    # review card sees the verified patches waiting to land (not merged -- a
+    # branch to `git checkout` / apply or discard), not just the prose.
+    if applied_findings:
+        applied_lines = [
+            "", "",
+            "Auto-applied by the reviewer's implement stage -- each is test-gated "
+            "and closure-checked, NOT merged. Land the branch or discard it:",
+        ]
+        for a in applied_findings:
+            f = a["finding"]
+            r = a["result"]
+            loc = (f"{f.get('file', target_file)}:{f['line']}"
+                   if f.get("line") is not None else f.get("file", target_file))
+            dl = r.get("diff_lines")
+            applied_lines.append(
+                f"- {loc} -- {f.get('summary', '')}  "
+                f"[branch {r.get('branch_name')}, "
+                f"{dl if dl is not None else '?'} line(s)]")
+        body += "\n".join(applied_lines)
+
     # Embed the structured findings so that when this card is approved (or
     # Code-the-fix is used on it), the [Fix] card built from this body carries
     # the block the review-chain gates (check-fix-card/closure-review/Process)
-    # require. Same fenced shape _fetch_fix_card parses; target_file is enough,
-    # the fix card id is not known here and _fetch_fix_card doesn't need it.
-    if findings:
+    # require. Only the UNRESOLVED findings go in -- the applied ones already
+    # have a verified patch, so re-coding them from this card would be
+    # double work. Same fenced shape _fetch_fix_card parses; target_file is
+    # enough, the fix card id is not known here and _fetch_fix_card doesn't need it.
+    if unresolved_findings:
         body += ("\n\n```json:review-findings\n"
-                 + json.dumps({"target_file": target_file, "findings": findings}, indent=2)
+                 + json.dumps({"target_file": target_file, "findings": unresolved_findings}, indent=2)
                  + "\n```")
     kanban_cmd = (
         "hermes kanban create "
@@ -2782,11 +2824,24 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         # branch_name, patch_path, diff_lines, ...}]}. Reviewer never merges --
         # an "applied" result is a verified patch for a human/HUD to land.
         "applied": result.get("applied"),
+        "applied_count": len(applied_findings),
+        "unresolved_count": len(unresolved_findings),
     }
-    if not chain:
+    # Combined flow, part 2: the heavy path (a dispatchable [Fix] kanban card)
+    # runs whenever acting-on-findings is on (the apply toggle) OR a caller
+    # explicitly asked to chain -- and it only handles the findings the inline
+    # stage did NOT resolve. With apply off and no explicit chain, this is the
+    # original findings-only behavior; with apply off and chain:true, the
+    # unresolved set IS every finding (inline never ran), i.e. the legacy
+    # chain-all behavior, unchanged.
+    do_heavy = apply_on or chain
+    if not do_heavy:
         return response, 200
     if no_issues_found or not findings:
         response["chain_skipped_reason"] = "no actionable findings"
+        return response, 200
+    if not unresolved_findings:
+        response["chain_skipped_reason"] = "all findings resolved by the inline implement stage"
         return response, 200
 
     review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
@@ -2794,13 +2849,18 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         response["chain_skipped_reason"] = f"review card id unparseable: {review_task_id!r}"
         return response, 200
 
+    applied_note = (
+        f" ({len(applied_findings)} other finding(s) were already auto-applied "
+        f"inline and are on their own branches -- see the parent card.)"
+        if applied_findings else ""
+    )
     fix_lines = [
-        f"Fix the {len(findings)} issue(s) below in `{target_file}`, found by an "
+        f"Fix the {len(unresolved_findings)} issue(s) below in `{target_file}`, found by an "
         f"automated review ({model}, reviewer role). This card was filed "
         f"automatically from that review -- see the linked parent card "
-        f"({review_task_id}) for the full review text.\n",
+        f"({review_task_id}) for the full review text.{applied_note}\n",
     ]
-    for i, f in enumerate(findings, 1):
+    for i, f in enumerate(unresolved_findings, 1):
         loc = f"{f.get('file', target_file)}:{f['line']}" if f.get("line") is not None else f.get("file", target_file)
         fix_lines.append(f"{i}. {loc} -- {f.get('summary', '')}")
         if f.get("failure_scenario"):
@@ -2813,7 +2873,7 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         "later verify the diff actually reaches these lines."
     )
     fix_lines.append("\n```json:review-findings")
-    fix_lines.append(json.dumps({"source_task": review_task_id, "target_file": target_file, "findings": findings}, indent=2))
+    fix_lines.append(json.dumps({"source_task": review_task_id, "target_file": target_file, "findings": unresolved_findings}, indent=2))
     fix_lines.append("```")
     fix_title = f"[Fix] {target_file}"
     fix_body = "\n".join(fix_lines)
