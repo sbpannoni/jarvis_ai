@@ -38,11 +38,11 @@ const SEAT_BACKEND_NAME = {vllm: "vLLM", llamacpp: "llama.cpp"};
 let seatBusy = false;
 
 function seatRowHTML(j){
-  const st = j.status || {};
   const models = j.models || [];
-  const cur = st.model;
-  const label = cur ? `${cur} · ${SEAT_BACKEND_NAME[st.backend] || st.backend || "?"}` : (st.ok ? "empty" : "unreachable");
-  const cls = cur ? (st.ready === false ? "warn" : "ok") : (st.ok ? "" : "err");
+  const s = lgSeat(j.seat);          // one canonical seat view (see app.js)
+  const cur = s.occupant;
+  const label = s.label;
+  const cls = s.cls;
   const groups = {};
   models.forEach(m => { (groups[m.backend || "other"] ||= []).push(m); });
   const opts = Object.keys(groups).map(b => `<optgroup label="${SEAT_BACKEND_NAME[b] || b}">`

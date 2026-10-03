@@ -216,10 +216,9 @@ async function kbRefreshSeat(){
   if(kbSeat.inflight || Date.now() - kbSeat.at < KB_SEAT_TTL_MS) return kbSeat.inflight;
   kbSeat.inflight = (async () => {
     try{
-      const r = await fetch("/api/model-role-assignments");
+      const r = await fetch("/api/seat");
       const j = await r.json();
-      const m = (j.roster || []).find(x => x.loaded);
-      kbSeat.label = m ? `${m.label}${m.backend ? " · " + m.backend : ""}` : "seat empty";
+      kbSeat.label = (typeof lgSeat === "function") ? lgSeat(j.seat).label : (j.seat || {}).occupant;
     }catch{ kbSeat.label = null; }
     kbSeat.at = Date.now();
     kbSeat.inflight = null;

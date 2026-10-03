@@ -54,6 +54,25 @@ function lgIcon(name, cls){
     + `stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${LG_ICONS[name] || ""}</svg>`;
 }
 
+/* ============================== GPU seat ==========================
+   One canonical view of snarf's single model seat, mirroring the server's
+   _seat_descriptor, so the GPU panel, the BACKEND SERVICES row and the
+   running-card chip all show the seat the same way instead of each re-deriving
+   it. Pass the `seat` object from /api/seat or /api/brain; get {state, label,
+   cls, occupant, backend}. state: UNREACHABLE | EMPTY | LOADING | READY. */
+const LG_SEAT_BACKEND = {vllm: "vLLM", llamacpp: "llama.cpp"};
+const LG_SEAT_CLS = {READY: "ok", LOADING: "warn", EMPTY: "", UNREACHABLE: "err"};
+const LG_SEAT_EMPTY_LABEL = {EMPTY: "seat empty", UNREACHABLE: "unreachable"};
+function lgSeat(seat){
+  seat = seat || {};
+  const state = seat.state || "UNREACHABLE";
+  const backend = LG_SEAT_BACKEND[seat.backend] || seat.backend || "";
+  const label = seat.occupant
+    ? `${seat.occupant}${backend ? " · " + backend : ""}${state === "LOADING" ? " · loading…" : ""}`
+    : (LG_SEAT_EMPTY_LABEL[state] || state.toLowerCase());
+  return {state, label, cls: LG_SEAT_CLS[state] || "", occupant: seat.occupant || null, backend};
+}
+
 /* ============================== status indicator ==================== */
 const STATUS_DOT_CLASSES=["standby","listening","thinking","tool","speaking","error"];
 function setState(st,label,hint){

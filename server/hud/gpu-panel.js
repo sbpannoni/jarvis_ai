@@ -173,20 +173,20 @@ async function refreshGpuModel(){
   try{
     const r = await fetch("/api/brain", {credentials: "same-origin"});
     const j = await r.json();
-    const be = {vllm: "vLLM", llamacpp: "llama.cpp"}[j.backend] || j.backend || "";
-    if(!j.model){
+    const s = lgSeat(j.seat);          // one canonical seat view (see app.js)
+    if(!s.occupant){
       host.innerHTML = `<svg viewBox="0 0 24 24" class="gpu-model-ico" style="color:var(--txt-dim)"><circle cx="12" cy="12" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 3"/></svg>
-        <div class="gpu-model-txt"><b class="gpu-model-name dim">${j.seat_empty ? "seat empty" : "seat unreachable"}</b>
-        <span class="gpu-model-sub">${j.seat_empty ? "loads on demand" : ""}</span></div>`;
+        <div class="gpu-model-txt"><b class="gpu-model-name dim">${s.state === "EMPTY" ? "seat empty" : "seat unreachable"}</b>
+        <span class="gpu-model-sub">${s.state === "EMPTY" ? "loads on demand" : ""}</span></div>`;
       host.title = "No model in snarf's GPU seat";
       return;
     }
-    const g = gpuModelGlyph(j.model);
-    const state = j.ready === false ? '<span class="gpu-model-state warn">loading</span>' : '<span class="gpu-model-state ok">ready</span>';
+    const g = gpuModelGlyph(s.occupant);
+    const state = s.state === "LOADING" ? '<span class="gpu-model-state warn">loading</span>' : '<span class="gpu-model-state ok">ready</span>';
     host.innerHTML = `<svg viewBox="0 0 24 24" class="gpu-model-ico" style="color:${g.color}" aria-label="${g.family}">${g.svg}</svg>
-      <div class="gpu-model-txt"><b class="gpu-model-name">${j.model}</b>
-      <span class="gpu-model-sub">${g.family ? g.family + " · " : ""}${be} · ${state}</span></div>`;
-    host.title = `GPU seat: ${j.model} (${be})`;
+      <div class="gpu-model-txt"><b class="gpu-model-name">${s.occupant}</b>
+      <span class="gpu-model-sub">${g.family ? g.family + " · " : ""}${s.backend} · ${state}</span></div>`;
+    host.title = `GPU seat: ${s.occupant} (${s.backend})`;
   }catch{ /* keep the last render */ }
 }
 

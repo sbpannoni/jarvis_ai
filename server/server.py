@@ -1360,7 +1360,8 @@ async def brain() -> JSONResponse:
     seat = await _seat_status()
     data = {"model": seat.get("model"), "backend": seat.get("backend"),
             "ready": seat.get("ready"), "online": bool(seat.get("model")),
-            "seat_empty": seat.get("ok") is True and not seat.get("model")}
+            "seat_empty": seat.get("ok") is True and not seat.get("model"),
+            "seat": _seat_descriptor(seat)}
     if seat.get("error"):
         data["error"] = seat["error"]
     if data["model"]:
@@ -1394,6 +1395,26 @@ async def _seat_status() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+def _seat_descriptor(status: dict) -> dict:
+    """The ONE canonical seat state, so every surface (GPU panel, BACKEND
+    SERVICES row, the running-card chip) reads the same occupant/backend/state
+    instead of each re-deriving it from raw model-seat fields with its own
+    vocabulary. state: UNREACHABLE | EMPTY | LOADING | READY."""
+    status = status or {}
+    occupant = status.get("model")
+    if not status.get("ok"):
+        state = "UNREACHABLE"
+    elif not occupant:
+        state = "EMPTY"
+    elif status.get("ready") is False:
+        state = "LOADING"
+    else:
+        state = "READY"
+    return {"occupant": occupant, "backend": status.get("backend"),
+            "ready": bool(status.get("ready")), "state": state,
+            "error": status.get("error")}
+
+
 @app.get("/api/seat")
 async def seat_get() -> JSONResponse:
     """Seat occupant + the installed catalog (both backends)."""
@@ -1401,6 +1422,7 @@ async def seat_get() -> JSONResponse:
     catalog = await _model_seat_catalog()
     return JSONResponse({
         "status": status,
+        "seat": _seat_descriptor(status),
         "models": sorted(({"model": k, **v} for k, v in (catalog or {}).items()),
                          key=lambda m: (m.get("backend") != "vllm", m["model"])),
     })
