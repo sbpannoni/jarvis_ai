@@ -1014,13 +1014,30 @@ async function kbVerify(panel, btn){
    seat swap, only shared throughput). The human still decides Merge / Fix; this
    just means the verdict is already on the card when they look, instead of a
    gate they must click through. Toggle via kbAutoAssessOn. */
+/* The cards that can actually merge: one per done family (its lead = the merge
+   target) plus standalone done cards, that wrote code. Same grouping the done
+   lane and branch ribbon use, so auto-review covers exactly what's mergeable. */
+function kbMergeTargets(tasks){
+  const done = (tasks || []).filter(t => t.status === "done");
+  const find = kbComponents(kbEdges);
+  const byRoot = new Map();
+  done.forEach(t => { const r = find(t.id); (byRoot.get(r) || byRoot.set(r, []).get(r)).push(t); });
+  const leads = [];
+  byRoot.forEach(members => {
+    const lead = members.length === 1 ? members[0] : kbFamilyLead(members);
+    if((kbDiffstats[lead.id] || 0) > 0) leads.push(lead);
+  });
+  return leads;
+}
+
 function kbAutoAssess(tasks){
   if(!kbAutoAssessOn) return;
-  const cands = (tasks || []).filter(t =>
-    t.status === "done" &&
-    (t.title || "").startsWith("[Integrate]") &&
-    (kbDiffstats[t.id] || 0) > 0 &&
-    !(kbPrs[t.id] && (kbPrs[t.id].state === "MERGED" || kbPrs[t.id].state === "OPEN")));
+  // Every merge target that wrote code and hasn't merged yet -- not just
+  // [Integrate] cards -- so approved work opens up to a real merge. Already-
+  // merged is skipped; an open PR that was never reviewed (e.g. an old straggler)
+  // still gets a verdict.
+  const cands = kbMergeTargets(tasks).filter(t =>
+    !(kbPrs[t.id] && kbPrs[t.id].state === "MERGED"));
   // Static verify: cheap and model-free, so run it for every un-verified card.
   cands.forEach(t => {
     if(kbVerified[t.id] === undefined && kbVerifyInflight.indexOf(t.id) === -1) kbAutoVerify(t.id);
