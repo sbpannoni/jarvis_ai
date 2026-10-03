@@ -6988,8 +6988,17 @@ _DH_LAND_STATUS: dict = {
 _DH_LAND_TASKS: set[asyncio.Task] = set()
 
 
+# PRs that have passed every gate and been handed to the CI-wait->merge step,
+# PERSISTED so a HUD restart during the (up to 30m) wait doesn't orphan them.
+# {task_id: {"pr_number","pr_url","authorized","since"}}. The _dh_finalize
+# reconciler drains this across restarts -- see _dh_finalize_tick. This is the
+# durability fix for the "stuck PR" class: nothing that reached "merge when
+# green" is lost just because the in-process waiter died.
+_DH_FINALIZE_PENDING: dict = {}
+
+
 def _dh_land_load_state() -> None:
-    global _DH_LAND_STATE
+    global _DH_LAND_STATE, _DH_FINALIZE_PENDING
     try:
         data = json.loads(LAND_STATE_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -6999,17 +7008,35 @@ def _dh_land_load_state() -> None:
             "seeded": bool(data.get("seeded")),
             "seen": [str(i) for i in data["seen"]][-_DH_LAND_SEEN_MAX:],
         }
+    if isinstance(data, dict) and isinstance(data.get("pending"), dict):
+        _DH_FINALIZE_PENDING = {k: v for k, v in data["pending"].items()
+                                if isinstance(v, dict) and v.get("pr_number")}
 
 
 def _dh_land_save_state() -> None:
     try:
         LAND_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LAND_STATE_PATH.write_text(json.dumps(_DH_LAND_STATE), encoding="utf-8")
+        LAND_STATE_PATH.write_text(
+            json.dumps({**_DH_LAND_STATE, "pending": _DH_FINALIZE_PENDING}),
+            encoding="utf-8")
     except Exception:
         # Same contract as verify's state file: a sweep that cannot persist
         # still lands correctly this run; it would only re-seed after a
         # restart. Not worth stopping for.
         pass
+
+
+def _dh_finalize_register(task_id: str, pr_number: str, pr_url: str, authorized: str) -> None:
+    """Record that this card's PR is now awaiting CI -> merge, so the reconciler
+    can finish it even if this process dies mid-wait."""
+    _DH_FINALIZE_PENDING[task_id] = {"pr_number": str(pr_number), "pr_url": pr_url,
+                                     "authorized": authorized, "since": time.time()}
+    _dh_land_save_state()
+
+
+def _dh_finalize_clear(task_id: str) -> None:
+    if _DH_FINALIZE_PENDING.pop(task_id, None) is not None:
+        _dh_land_save_state()
 
 
 def _dh_land_mark_seen(task_id: str) -> None:
@@ -7215,6 +7242,128 @@ async def _dh_pr_actually_merged(pr_number: str) -> bool:
         return False
 
 
+# ------------------------------------------------ durable finalize reconciler
+# A PR that reached "merge when CI is green" is recorded in _DH_FINALIZE_PENDING
+# (persisted). The in-process waiter in _darkhelix_autoland_one_locked is the
+# fast path; this reconciler is the NET that drains the set across HUD restarts,
+# so a restart mid-CI-wait can no longer orphan a PR (the "stuck PR" class). It
+# only COMPLETES already-authorized finalizes; it never initiates a merge.
+async def _dh_checks_status(pr_number: str) -> tuple[str, str]:
+    """One-shot CI read using the SAME bucket rules as _dh_wait_for_checks:
+    'green' / 'failed' / 'pending' / 'unknown' (a transient tool error -- leave
+    it, don't act)."""
+    cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+           f"gh pr checks {shlex.quote(pr_number)} --json name,state,bucket")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+    except Exception as exc:
+        return "unknown", str(exc)[:200]
+    no_checks_yet = "no checks reported" in (out or "").lower()
+    if rc != 0 and not no_checks_yet:
+        return "unknown", (out or "")[-200:]
+    checks: list[dict] = []
+    if not no_checks_yet:
+        try:
+            checks = json.loads(out)
+        except Exception:
+            checks = []
+    buckets = {c.get("bucket") for c in checks}
+    if checks and (buckets & {"fail", "cancel"}):
+        failed = [c.get("name") for c in checks if c.get("bucket") in {"fail", "cancel"}]
+        return "failed", f"check(s) failed or cancelled: {', '.join(failed)}"
+    if checks and not (buckets & {"pending", ""}):
+        return "green", f"{len(checks)} check(s) green"
+    return "pending", "checks still running"
+
+
+async def _dh_finalize_one(task_id: str, info: dict) -> None:
+    pr_number = str(info.get("pr_number") or "")
+    pr_url = info.get("pr_url") or ""
+    if not pr_number:
+        _dh_finalize_clear(task_id)
+        return
+    # Landed or closed since it was queued? Done either way.
+    try:
+        rc, out = await _fleet_ssh(
+            "snarf", f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+                     f"gh pr view {shlex.quote(pr_number)} --json state")
+        state = json.loads(out).get("state") if rc == 0 else None
+    except Exception:
+        state = None
+    if state in ("MERGED", "CLOSED"):
+        _dh_finalize_clear(task_id)
+        return
+
+    status, detail = await _dh_checks_status(pr_number)
+    if status in ("unknown", "pending"):
+        return  # leave it; next tick
+    if status == "failed":
+        _dh_finalize_clear(task_id)
+        await _kanban_block(task_id, f"opened {pr_url}, CI did not pass: {detail}", kind="needs_input")
+        return
+
+    cfg = _dh_land_cfg()
+    size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg)
+    if not size_ok:
+        _dh_finalize_clear(task_id)
+        await _kanban_block(task_id, f"opened {pr_url}, CI passed, but {size_reason}", kind="needs_input")
+        return
+
+    cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+           f"gh pr merge {shlex.quote(pr_number)} --squash --delete-branch")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+        merge_failed, merge_error = (rc != 0), (out[-800:] if rc != 0 else "")
+    except Exception as exc:
+        merge_failed, merge_error = True, str(exc)
+    if merge_failed and not await _dh_pr_actually_merged(pr_number):
+        # Transient merge/transport failure retries; a persistent one (e.g. the
+        # branch went un-mergeable) is capped so it reroutes to a human instead
+        # of looping forever.
+        info["merge_fails"] = int(info.get("merge_fails") or 0) + 1
+        if info["merge_fails"] >= 5:
+            _dh_finalize_clear(task_id)
+            await _kanban_block(task_id, f"opened {pr_url}, CI passed, but merge kept failing: "
+                                f"{merge_error}", kind="needs_input")
+        else:
+            _dh_land_save_state()
+        return
+
+    _dh_finalize_clear(task_id)
+    try:
+        await asyncio.to_thread(
+            _kanban_api_call, "POST",
+            f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+            json={"author": "looking-glass",
+                  "body": f"Merged {pr_url} (squash) by the finalize reconciler once CI went green "
+                          "-- completing a land requested earlier. Revert with "
+                          "`scripts/darkhelix-revert.sh <merge-sha>` on snarf if wrong."})
+    except Exception:
+        pass
+    _dh_land_record({"task_id": task_id, "verdict": "finalized", "pr": pr_number})
+
+
+async def _dh_finalize_tick() -> None:
+    for task_id, info in list(_DH_FINALIZE_PENDING.items()):
+        try:
+            await _dh_finalize_one(task_id, info)
+        except Exception as exc:
+            _dh_land_record({"task_id": task_id, "verdict": "finalize-error", "error": str(exc)[:200]})
+
+
+async def _dh_finalize_forever() -> None:
+    """Always on (unlike the autonomous lander): completes finalizes that were
+    already authorized -- a human clicking Merge, or the review-gated poller --
+    so nothing that reached 'merge when green' is lost to a restart."""
+    _dh_land_load_state()
+    while True:
+        try:
+            await _dh_finalize_tick()
+        except Exception:
+            pass
+        await asyncio.sleep(int(_dh_land_cfg().get("finalize_poll_seconds") or 90))
+
+
 async def _darkhelix_autoland_one(task_id: str, skip_review_check: bool = False) -> dict:
     """The whole unattended sequence for one card:
 
@@ -7293,8 +7442,16 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
         return {"ok": False, "stage": "size-cap", "pr_url": pr_url,
                 "reason": size_reason, "block_result": outcome}
 
+    # From here the PR is cleared to merge once CI is green. Persist that intent
+    # BEFORE the (up to 30m) CI wait, so a HUD restart mid-wait doesn't orphan
+    # it -- the finalize reconciler drains _DH_FINALIZE_PENDING across restarts.
+    # The in-process wait below is the fast path; the reconciler is the net.
+    _dh_finalize_register(task_id, pr_number, pr_url,
+                          "human" if skip_review_check else "auto")
+
     checks_ok, checks_reason = await _dh_wait_for_checks(pr_number, cfg)
     if not checks_ok:
+        _dh_finalize_clear(task_id)
         outcome = await _kanban_block(task_id, f"opened {pr_url}, CI did not pass: "
                                        f"{checks_reason}", kind="needs_input")
         return {"ok": False, "stage": "checks", "pr_url": pr_url,
@@ -7307,6 +7464,7 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
     # having re-checked it since.
     size_ok2, size_reason2 = await _dh_pr_diff_within_cap(pr_number, cfg)
     if not size_ok2:
+        _dh_finalize_clear(task_id)
         outcome = await _kanban_block(task_id, f"opened {pr_url}, CI passed, but grew past "
                                        f"the size cap during the wait: {size_reason2}", kind="needs_input")
         return {"ok": False, "stage": "size-cap-recheck", "pr_url": pr_url,
@@ -7331,10 +7489,12 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
         # a human re-landing an already-merged, now-diverged branch.
         merge_failed = False
     if merge_failed:
+        _dh_finalize_clear(task_id)
         outcome = await _kanban_block(task_id, f"opened {pr_url}, CI passed, merge failed: "
                                        f"{merge_error}", kind="needs_input")
         return {"ok": False, "stage": "merge", "pr_url": pr_url,
                 "error": merge_error, "block_result": outcome}
+    _dh_finalize_clear(task_id)
 
     try:
         await asyncio.to_thread(
@@ -9648,6 +9808,7 @@ async def start_activity_feed() -> None:
     asyncio.get_running_loop().create_task(_poll_network_topology_forever())
     asyncio.get_running_loop().create_task(_verify_completions_forever())
     asyncio.get_running_loop().create_task(_land_darkhelix_forever())
+    asyncio.get_running_loop().create_task(_dh_finalize_forever())
     asyncio.get_running_loop().create_task(_archive_merged_forever())
     asyncio.get_running_loop().create_task(_poll_pool_manifest_forever())
     asyncio.get_running_loop().create_task(_poll_enforce_blocks_forever())
