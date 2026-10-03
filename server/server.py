@@ -7060,23 +7060,19 @@ class _DhOutage(Exception):
     negative answer."""
 
 
-async def _dh_reviewed(task_id: str) -> int | None:
-    """The created_at (unix seconds) of the card's latest APPROVED integration
-    review, or None if its latest integration-review verdict is not 'approve'
-    (or it was never reviewed).
+async def _dh_latest_review(task_id: str) -> tuple[str | None, int | None]:
+    """The card's LATEST integration-review verdict and its created_at (unix
+    seconds), or (None, None) if never reviewed.
 
-    This is the merge gate, and DARKHELIX's review is the HUD integration-review
-    (a reviewer model that posts an 'Integration review (<model>) -> <verdict>'
-    comment), NOT the Hermes review lane -- that lane's review_requested event is
-    never emitted on this fleet (0 ever), so gating on it meant nothing ever
-    merged. We read the same comment the board's review chips are parsed from
-    (/api/kanban/links) and take the LATEST verdict, so a later request_changes
-    overrides an earlier approve. A timestamp, not a bool, so
-    _dh_review_still_fresh can reject an approval from before later commits.
+    DARKHELIX's review is the HUD integration-review (a reviewer model that posts
+    an 'Integration review (<model>) -> <verdict>' comment), NOT the Hermes review
+    lane -- that lane's review_requested event is never emitted on this fleet (0
+    ever), so gating on it meant nothing ever merged. Same comment the board's
+    review chips are parsed from (/api/kanban/links); the LATEST wins, so a later
+    request_changes overrides an earlier approve.
 
-    Raises _DhOutage on a failed lookup rather than swallowing to a bare
-    False/None -- an outage and a genuine "not approved" must stay
-    distinguishable to the caller."""
+    Raises _DhOutage on a failed lookup -- an outage and a genuine 'not reviewed'
+    must stay distinguishable to callers (see _land_darkhelix_tick)."""
     q = (
         "import sqlite3,re,json\n"
         "c=sqlite3.connect('file:/root/.hermes/kanban.db?mode=ro',uri=True)\n"
@@ -7099,8 +7095,15 @@ async def _dh_reviewed(task_id: str) -> int | None:
     except Exception as exc:
         raise _DhOutage(f"unparseable review lookup: {exc}")
     if not latest:
-        return None
-    verdict, ts = latest[0], int(latest[1])
+        return None, None
+    return latest[0], int(latest[1])
+
+
+async def _dh_reviewed(task_id: str) -> int | None:
+    """The created_at of the card's latest APPROVED integration review, else None.
+    The timestamp (not a bool) so _dh_review_still_fresh can reject an approval
+    from before later commits. Thin over _dh_latest_review."""
+    verdict, ts = await _dh_latest_review(task_id)
     return ts if verdict == "approve" else None
 
 
@@ -7127,6 +7130,42 @@ async def _dh_review_still_fresh(task_id: str, review_ts: int, repo_path: str, b
         return False, (f"branch has a commit ({commit_ts}) after the review "
                        f"({review_ts}) -- review is stale, more work happened since")
     return True, ""
+
+
+# Canonical review-gate stages. One place names where a card sits relative to
+# "cleared to merge", so the poller, the land endpoint and the autolander all
+# speak the same language and give the same reason instead of each collapsing
+# everything to "review_ts is None".
+DH_MERGE_STAGES = ("NEEDS_REVIEW", "REVIEW_CHANGES", "REVIEW_STALE", "READY")
+
+
+async def _dh_merge_eligibility(task_id: str, branch: str | None = None,
+                                require_fresh: bool = True) -> dict:
+    """Single source of truth for the REVIEW gate: is this card cleared to merge,
+    and if not, why. Returns {stage, eligible, reason, review_ts}:
+
+      NEEDS_REVIEW    no integration-review verdict yet
+      REVIEW_CHANGES  latest verdict is request_changes / escalate
+      REVIEW_STALE    approved, but a commit landed after the approval
+      READY           approved (and fresh, when require_fresh) -> eligible
+
+    `eligible` is True only for READY. The human Merge button overrides this by
+    passing skip_review_check at its own call site, not here. Raises _DhOutage on
+    a lookup failure so a transient outage never looks like 'not approved' (which
+    would permanently skip a card in the poller)."""
+    verdict, ts = await _dh_latest_review(task_id)
+    if verdict is None:
+        return {"stage": "NEEDS_REVIEW", "eligible": False, "review_ts": None,
+                "reason": "no integration-review verdict yet"}
+    if verdict != "approve":
+        return {"stage": "REVIEW_CHANGES", "eligible": False, "review_ts": None,
+                "reason": f"latest integration review is '{verdict}', not approve"}
+    if require_fresh:
+        fresh, why = await _dh_review_still_fresh(
+            task_id, ts, DARKHELIX_REPO_PATH, branch or _dh_branch(task_id))
+        if not fresh:
+            return {"stage": "REVIEW_STALE", "eligible": False, "review_ts": ts, "reason": why}
+    return {"stage": "READY", "eligible": True, "review_ts": ts, "reason": "approved"}
 
 
 def _dh_pr_number(pr_url: str) -> str:
@@ -7412,28 +7451,19 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
     # this is the earliest point the true final commit timestamp is known.
     # Skipped entirely when the caller already vouches for review currency
     # (see the skip_review_check docstring above).
-    if skip_review_check:
-        review_ts, fresh, fresh_reason = None, True, ""
-    else:
+    if not skip_review_check:
         try:
-            review_ts = await _dh_reviewed(task_id)
+            elig = await _dh_merge_eligibility(task_id, branch, require_fresh=True)
         except _DhOutage as exc:
             outcome = await _kanban_block(task_id, f"opened {pr_url} but could not "
                                            f"re-confirm review: {exc}", kind="needs_input")
             return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
                     "reason": str(exc), "block_result": outcome}
-        if review_ts is None:
-            outcome = await _kanban_block(task_id, f"opened {pr_url} but its integration review is no "
-                                           "longer 'approve' (verdict changed between the gate check and landing)",
-                                           kind="needs_input")
-            return {"ok": False, "stage": "review-recheck", "pr_url": pr_url,
-                    "reason": "latest integration-review verdict is not approve", "block_result": outcome}
-        fresh, fresh_reason = await _dh_review_still_fresh(task_id, review_ts, DARKHELIX_REPO_PATH, branch)
-    if not fresh:
-        outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
-                                       f"{fresh_reason}", kind="needs_input")
-        return {"ok": False, "stage": "stale-review", "pr_url": pr_url,
-                "reason": fresh_reason, "block_result": outcome}
+        if not elig["eligible"]:
+            outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
+                                           f"{elig['reason']}", kind="needs_input")
+            return {"ok": False, "stage": elig["stage"].lower(), "pr_url": pr_url,
+                    "reason": elig["reason"], "block_result": outcome}
 
     size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg)
     if not size_ok:
@@ -7540,15 +7570,18 @@ async def _land_darkhelix_tick() -> None:
         # check, so a transient API blip permanently excluded an eligible
         # card from every future tick.
         try:
-            review_ts = await _dh_reviewed(task_id)
+            # Presence gate here; _darkhelix_autoland_one re-checks freshness at
+            # the authoritative moment (just after it commits). Same stage
+            # vocabulary as every other path.
+            elig = await _dh_merge_eligibility(task_id, require_fresh=False)
         except _DhOutage as exc:
             _dh_land_record({"task_id": task_id, "verdict": "outage",
                              "error": str(exc)[:300]})
             continue  # not marked seen -- retried next tick
         _dh_land_mark_seen(task_id)
-        if review_ts is None:
+        if not elig["eligible"]:
             _dh_land_record({"task_id": task_id, "verdict": "skipped",
-                             "reason": "latest integration-review verdict is not approve"})
+                             "stage": elig["stage"], "reason": elig["reason"]})
             continue
         _dh_land_record({"task_id": task_id, "verdict": "landing"})
 
@@ -7623,17 +7656,16 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
     if task_id in _DH_LANDING_IN_FLIGHT:
         return JSONResponse({"ok": False, "error": "already landing this card"}, status_code=409)
+    skip_review_check = bool(payload.get("skip_review_check"))
     try:
-        review_ts = await _dh_reviewed(task_id)
+        elig = await _dh_merge_eligibility(task_id, require_fresh=False)
     except _DhOutage as exc:
         return JSONResponse({"ok": False, "error": f"could not check review status: {exc}"}, status_code=502)
-    skip_review_check = bool(payload.get("skip_review_check"))
-    if review_ts is None and not skip_review_check:
+    if not elig["eligible"] and not skip_review_check:
         return JSONResponse({
-            "ok": False,
-            "error": ("this card's latest integration review is not 'approve' -- run the "
-                      "review (or address its requested changes) first. Pass "
-                      "skip_review_check:true to land it anyway."),
+            "ok": False, "stage": elig["stage"],
+            "error": (elig["reason"] + " — run the review (or address its requested "
+                      "changes) first. Pass skip_review_check:true to land it anyway."),
         }, status_code=409)
 
     async def _run() -> None:
