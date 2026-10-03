@@ -280,6 +280,7 @@ async function renderCodebaseMap(panel){
           <option value="sweep">sweep</option><option value="deep">deep (on clean)</option>
         </select>
         <button type="button" class="btn cbg-run">RUN REVIEW</button>
+        <label title="when on, a review also applies each straightforward fix for you (test-gated + closure-verified, never merged); off = findings only"><input type="checkbox" class="cbg-apply" checked> apply fixes</label>
         <label title="hide modules that reviewed clean"><input type="checkbox" class="cbg-pending"> pending only</label>
         <label title="hide standalone modules with no internal dependencies"><input type="checkbox" class="cbg-iso"> hide unconnected</label>
         <label title="show only modules that an open GitHub issue names"><input type="checkbox" class="cbg-issuesonly"> issues only</label>
@@ -312,6 +313,32 @@ async function renderCodebaseMap(panel){
   if (groupBox0) groupBox0.checked = group;
   const canvas = panel.querySelector(".cbg-canvas");
   panel.querySelector(".cbg-run").addEventListener("click", () => _cbgRunReview(panel));
+
+  // "apply fixes" toggle: reflect the server setting, then write back on change.
+  // Server-side (not localStorage) because it governs what the engine does, and
+  // must be the same for every viewer and for the next review. Takes effect on
+  // the next review; never merges -- an applied fix is a verified patch to approve.
+  const applyBox = panel.querySelector(".cbg-apply");
+  if (applyBox){
+    fetch("/api/review-apply-setting").then(r => r.ok ? r.json() : null).then(j => {
+      if (j && typeof j.apply_straightforward === "boolean") applyBox.checked = j.apply_straightforward;
+    }).catch(() => { /* leave at default-on */ });
+    applyBox.addEventListener("change", async () => {
+      const statusEl = panel.querySelector(".cbg-status");
+      try{
+        const r = await fetch("/api/review-apply-setting", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({apply_straightforward: applyBox.checked}),
+        });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) throw new Error(j.error || `HTTP ${r.status}`);
+        if (statusEl){ statusEl.textContent = `apply fixes ${applyBox.checked ? "ON" : "OFF"}`; statusEl.className = "cbg-status saved"; }
+      }catch(err){
+        applyBox.checked = !applyBox.checked;   // revert the box if the write failed
+        if (statusEl){ statusEl.textContent = `toggle failed: ${err.message}`; statusEl.className = "cbg-status err"; }
+      }
+    });
+  }
 
   let data, status = {}, issues = [];
   try{

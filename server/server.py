@@ -56,7 +56,29 @@ CONFIG_PATH = ROOT / "config" / "server.yaml"
 LOG_PATH = ROOT / "logs" / "latency.jsonl"
 STATE_PATH = ROOT / "logs" / "hermes_sessions.json"
 USAGE_PATH = ROOT / "logs" / "usage_stats.json"
+# Live on/off for the reviewer's inline implement stage (dispatch_fix_task.py,
+# driven by dispatch_review_task.py --apply-straightforward). A per-viewer-
+# independent server setting, toggled from the CODEBASE MAP panel; stored here
+# so the switch takes effect on the next review with no restart. Default ON.
+APPLY_SETTING_PATH = ROOT / "logs" / "review_apply.json"
 _USAGE_LOCK = threading.Lock()
+
+
+def _review_apply_enabled() -> bool:
+    """Whether a HUD-triggered review also runs the gated implement stage.
+    ON by default; a missing or garbled setting file means the default, never
+    an error."""
+    try:
+        data = json.loads(APPLY_SETTING_PATH.read_text(encoding="utf-8"))
+        return bool(data.get("apply_straightforward", True))
+    except Exception:
+        return True
+
+
+def _set_review_apply_enabled(on: bool) -> None:
+    APPLY_SETTING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    APPLY_SETTING_PATH.write_text(
+        json.dumps({"apply_straightforward": bool(on)}), encoding="utf-8")
 
 
 def _today() -> str:
@@ -2362,6 +2384,34 @@ async def set_model_tuning(request: Request) -> JSONResponse:
                          "tuning": {k: v for k, v in tuning.items() if k != "_comment"}})
 
 
+@app.get("/api/review-apply-setting")
+async def review_apply_setting() -> JSONResponse:
+    """Current state of the reviewer's inline implement stage (the CODEBASE MAP
+    'apply straightforward fixes' toggle). {apply_straightforward: bool}."""
+    return JSONResponse({"apply_straightforward": _review_apply_enabled()})
+
+
+@app.post("/api/review-apply-setting")
+async def set_review_apply_setting(request: Request) -> JSONResponse:
+    """Turn the reviewer's inline implement stage on or off. Body:
+    {"apply_straightforward": bool}. Takes effect on the next review -- no
+    restart. When on, a HUD review hands each actionable finding to the gated
+    implement link (test gate + closure review) and reports outcomes; when off,
+    reviews are findings-only, exactly as before this feature existed. Either
+    way the reviewer never merges -- it only ever proposes a patch for a human."""
+    payload = await request.json()
+    val = payload.get("apply_straightforward")
+    if not isinstance(val, bool):
+        return JSONResponse(
+            {"ok": False, "error": "apply_straightforward must be a boolean"},
+            status_code=400)
+    try:
+        _set_review_apply_enabled(val)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "apply_straightforward": val})
+
+
 CODER_ENGINE_VENV_PY = "/ssdpool/coder-engine/.venv/bin/python3"
 DISPATCH_REVIEW_TASK_PY = "/ssdpool/coder-engine/pipeline/dispatch_review_task.py"
 CHECK_FIX_CARD_PY = "/ssdpool/coder-engine/pipeline/check_fix_card.py"
@@ -2672,6 +2722,10 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     )
     if task_description:
         cmd += f" --task-description {shlex.quote(task_description)}"
+    # The reviewer's inline implement stage, controlled by the CODEBASE MAP
+    # toggle. Passed explicitly either way so the toggle -- not the engine's own
+    # default -- is the single source of truth for HUD-triggered reviews.
+    cmd += " --apply-straightforward" if _review_apply_enabled() else " --no-apply-straightforward"
 
     try:
         rc, out = await _fleet_ssh("snarf", cmd)
@@ -2723,6 +2777,11 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     response = {
         "ok": True, "task": task_data, "model": model, "review_text": review_text,
         "findings": findings, "no_issues_found": no_issues_found, "chained": False,
+        # Outcomes from the inline implement stage, when it ran (null when the
+        # toggle is off). Shape: {"status", "results": [{outcome, reason,
+        # branch_name, patch_path, diff_lines, ...}]}. Reviewer never merges --
+        # an "applied" result is a verified patch for a human/HUD to land.
+        "applied": result.get("applied"),
     }
     if not chain:
         return response, 200
