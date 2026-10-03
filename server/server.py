@@ -56,10 +56,10 @@ CONFIG_PATH = ROOT / "config" / "server.yaml"
 LOG_PATH = ROOT / "logs" / "latency.jsonl"
 STATE_PATH = ROOT / "logs" / "hermes_sessions.json"
 USAGE_PATH = ROOT / "logs" / "usage_stats.json"
-# Live on/off for the reviewer's inline implement stage (dispatch_fix_task.py,
-# driven by dispatch_review_task.py --apply-straightforward). A per-viewer-
-# independent server setting, toggled from the CODEBASE MAP panel; stored here
-# so the switch takes effect on the next review with no restart. Default ON.
+# Live on/off for the apply stage that follows a review (dispatch_fix_task.py,
+# launched detached by _run_review). A server-wide setting, toggled from the
+# CODEBASE MAP panel; stored here so it takes effect on the next review with no
+# restart. Default ON.
 APPLY_SETTING_PATH = ROOT / "logs" / "review_apply.json"
 _USAGE_LOCK = threading.Lock()
 
@@ -2876,68 +2876,38 @@ async def _tracker_note(tracker_id, msg: str) -> None:
         pass
 
 
-_APPLY_JOBS: set = set()
-
-
 def _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
                         result_path, progress_path, findings) -> None:
-    """Background task: tail the detached apply job's progress onto the tracker
-    card, and when its result lands, file [Applied Fix]/[Fix] cards and close the
-    tracker. Owns the tracker's lifecycle from here on."""
+    """Background task owning the tracker from here on: relay the detached apply
+    job's progress onto the card, keep the tracker claim fresh, and when the
+    result file lands, file the cards and close the tracker."""
     async def _job():
+        posted = 0
+        deadline = time.time() + 2 * 3600   # backstop
         try:
-            await _apply_poll_loop(tracker_id, review_task_id, target_file, model,
-                                   result_path, progress_path, findings)
+            while time.time() < deadline:
+                rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(progress_path)} 2>/dev/null || true")
+                lines = [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
+                if len(lines) > posted:
+                    await _tracker_note(tracker_id, "apply: " + " | ".join(
+                        ln.split(" ", 1)[-1] for ln in lines[posted:][-6:]))
+                    posted = len(lines)
+                if tracker_id:
+                    await _sweep_tracker_refresh(tracker_id)
+                rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(result_path)} 2>/dev/null || true")
+                result = _extract_json(out) if rc == 0 and out.strip() else None
+                if result is not None:
+                    await _finalize_apply(tracker_id, review_task_id, target_file, model, result, findings)
+                    return
+                await asyncio.sleep(20)
+            await _tracker_note(tracker_id, f"apply timed out after 2h; see {result_path} on snarf")
         except Exception as exc:  # never die silently; always release the tracker
             print(f"[apply-poller] {target_file} crashed: {exc!r}", flush=True)
-            if tracker_id:
-                await _sweep_tracker_close(tracker_id)
-    task = asyncio.get_running_loop().create_task(_job())
-    _APPLY_JOBS.add(task)
-    task.add_done_callback(_APPLY_JOBS.discard)
-
-
-async def _apply_poll_loop(tracker_id, review_task_id, target_file, model,
-                           result_path, progress_path, findings) -> None:
-    posted = 0
-    deadline = time.time() + 2 * 3600   # 2h backstop
-    while time.time() < deadline:
-        # Relay any new progress lines onto the tracker card.
-        try:
-            rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(progress_path)} 2>/dev/null || true")
-            lines = [ln for ln in out.splitlines() if ln.strip()] if rc == 0 else []
-        except Exception:
-            lines = []
-        if tracker_id and len(lines) > posted:
-            new = lines[posted:]
-            posted = len(lines)
-            # drop the leading epoch stamp for readability
-            msg = "apply · " + " | ".join(ln.split(" ", 1)[-1] for ln in new[-6:])
-            try:
-                await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} {shlex.quote(msg[:900])}")
-            except Exception:
-                pass
         if tracker_id:
-            await _sweep_tracker_refresh(tracker_id)
-        # Result ready?
-        try:
-            rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(result_path)} 2>/dev/null || true")
-            applied_result = _extract_json(out) if rc == 0 and out.strip() else None
-        except Exception:
-            applied_result = None
-        if applied_result is not None:
-            await _finalize_apply(tracker_id, review_task_id, target_file, model,
-                                  applied_result, findings)
-            return
-        await asyncio.sleep(20)
-    # Timed out.
-    if tracker_id:
-        try:
-            await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} "
-                              f"{shlex.quote('apply: timed out after 2h; see ' + result_path + ' on snarf')}")
-        except Exception:
-            pass
-        await _sweep_tracker_close(tracker_id)
+            await _sweep_tracker_close(tracker_id)
+    task = asyncio.get_running_loop().create_task(_job())
+    _REVIEW_JOBS.add(task)
+    task.add_done_callback(_REVIEW_JOBS.discard)
 
 
 async def _finalize_apply(tracker_id, review_task_id, target_file, model,
@@ -2965,10 +2935,7 @@ async def _finalize_apply(tracker_id, review_task_id, target_file, model,
     if tracker_id:
         summary = (f"apply done: {len(applied_findings)} applied "
                    f"({len(applied_cards)} [Applied Fix] card(s)), {len(unresolved)} -> [Fix].")
-        try:
-            await _kanban_ssh(f"hermes kanban comment {shlex.quote(tracker_id)} {shlex.quote(summary[:900])}")
-        except Exception:
-            pass
+        await _tracker_note(tracker_id, summary)
         await _sweep_tracker_close(tracker_id)
 
 
@@ -3008,8 +2975,7 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
         f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
         f"--target-file {shlex.quote(target_file)} "
         f"--model {shlex.quote(model)} "
-        f"--mode {shlex.quote(mode)} "
-        "--no-apply-straightforward"
+        f"--mode {shlex.quote(mode)}"
     )
     if task_description:
         cmd += f" --task-description {shlex.quote(task_description)}"
