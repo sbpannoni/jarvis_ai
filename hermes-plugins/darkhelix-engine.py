@@ -70,6 +70,21 @@ SSH_TIMEOUT = 12600
 # the answer is not another run.
 MAX_ATTEMPTS = 3
 
+# The third exit from a red gate. Without it a worker that has verified its own
+# fix can only retry or block, and a block strands a correct change behind a gate
+# it can explain (t_9ecb82b0: suite green in the worktree, container gate red on
+# tests that needed tools the container lacked).
+_REVIEW_HANDOFF = (
+    "If YOU have verified the change (for example the full suite is green in "
+    "the card's worktree) and the remaining gate failures are in tests you can "
+    "show are environmental or not caused by the change, do NOT block: call "
+    "kanban_request_review with reviewer=\"darkhelix\" and a summary stating the "
+    "branch, exactly what you ran and saw, and for each remaining gate failure "
+    "why the change did not cause it. An independent reviewer re-checks it and "
+    "approves, sends it back, or escalates. If you cannot explain a failure, "
+    "this is not that case."
+)
+
 _TASK_ID_RE = re.compile(r"^t_[0-9a-f]{6,}$")
 _DT_RE = re.compile(r"\[dispatch-target\](?P<inner>.*?)\[/dispatch-target\]", re.S)
 _DT_NOTES_SEP = "--- notes ---"
@@ -148,8 +163,10 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
     if prior >= MAX_ATTEMPTS:
         return _err(
             f"{prior} engine attempts already made on this card (limit "
-            f"{MAX_ATTEMPTS}). Another identical run will not help. Block the "
-            "card and say what is actually unresolved.",
+            f"{MAX_ATTEMPTS}). Another identical run will not help; do not run "
+            f"it again. Latest branch: hermes/{task_id}-engine-{prior}. "
+            + _REVIEW_HANDOFF + " Otherwise block the card and say what is "
+            "actually unresolved.",
             attempts=prior)
 
     n = prior + 1
@@ -221,7 +238,8 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
                 "that the edit was wrong. If so, call dispatch_to_engine again "
                 "with amended_description covering what was missing. If the "
                 "spec was right and the code is genuinely hard, block the card "
-                "with the specific reason. Do NOT edit files yourself."
+                "with the specific reason. " + _REVIEW_HANDOFF +
+                " Do NOT edit files yourself."
             ),
         })
 

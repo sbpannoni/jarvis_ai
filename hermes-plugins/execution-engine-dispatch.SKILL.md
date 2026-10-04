@@ -27,9 +27,27 @@ that needs a mind: deciding what a failed attempt actually means.
    worktree, mints a fresh branch, runs the engine, and on success attaches
    the patch and completes the card. Nothing is left for you to assemble.
 
-2. **If it returns `success: true` — you are done.** The card is complete and
-   the branch holds a reviewable commit. Do not merge; a human does that.
-   Report briefly and stop.
+2. **If it returns `success: true` — the card is already DONE.** The tool
+   completed it and attached the patch, so the board reads `done` the moment
+   `dispatch_to_engine` returns. The branch holds a reviewable commit; do not
+   merge, a human does that.
+
+   **Closing without circling — this is where whole hours are lost.** Because
+   the *tool* completed the card, you never called a terminal board tool
+   yourself, so the harness fires one reminder:
+   `⚠️ Kanban worker tried to exit without kanban_complete/kanban_block`.
+   That nudge is EXPECTED on an engine-dispatched card and signals nothing
+   wrong. Answer it in a single move: call `kanban_complete(summary=<one
+   line>)` exactly **once**. It will be refused —
+   `could not complete <id> (unknown id or already terminal)` — and that
+   refusal is the confirmation that the card is done, not a problem to solve.
+   Do not re-check the board, do not reconcile "done vs the nudge", do not
+   retry, do not call it again. Give a two-line report and stop.
+
+   Real cost of getting this wrong: on 2026-10-02 card t_f6005c4a finished its
+   actual work early, then burned 3h37m re-reading the board and re-issuing
+   `kanban_complete` against the same "already terminal" refusal. One expected
+   refusal, then stop.
 
 3. **If it returns `success: false` — diagnose before doing anything else.**
    This is the actual work. Read `error` and decide which of these it is:
@@ -53,6 +71,18 @@ that needs a mind: deciding what a failed attempt actually means.
      → `hermes kanban block` with the specific reason, quoting the error. Do
      not retry.
 
+   - **The change is right, but the gate disagrees.** You checked it yourself
+     (for example the full suite is green in the card's worktree) and the gate
+     keeps failing on tests you can show are environmental or not caused by the
+     change: a tool missing from the container, a test that reaches the network.
+     Blocking here strands a correct fix.
+
+     → `kanban_request_review` with `reviewer="darkhelix"`. In the summary give
+     the branch, exactly what you ran and saw, and for each remaining gate
+     failure why the change did not cause it. A reviewer re-checks it
+     independently and approves, sends it back, or escalates. If you cannot say
+     why the gate is wrong, this is not that case: it is the "hard" case above.
+
    - **The card was never isolated** (`no usable worktree`).
 
      → `hermes kanban block` with that reason. Never fall back to working in
@@ -61,8 +91,10 @@ that needs a mind: deciding what a failed attempt actually means.
      every other card's view of the tree.
 
 4. **Attempts are capped at 3, enforced by the tool.** When it says no
-   attempts remain, that is not a prompt to try something else — block the
-   card and say precisely what is unresolved.
+   attempts remain, that is not a prompt to try something else. Do not run it
+   again: if you have verified the change and can explain the red gate, request
+   review as above; otherwise block the card and say precisely what is
+   unresolved.
 
 ## Reviewing someone else's work: read the branch, not the patch
 
@@ -149,6 +181,11 @@ gate usually means the spec was short, not that the edit was wrong.
 something that would have saved you time at the start. If so, record it.**
 One or two lines. A fact, not a narrative. Skip it when the answer is no;
 a log of "worked on card X" is worse than nothing.
+
+If a `memory` write ever stalls waiting for approval (you are a worker; no
+human is watching to approve it), drop it — put the fact in your final
+report instead. Never re-issue a stalled memory write; three mangled retries is
+how one run turned a finished card into a 3h log.
 
 Which store depends on who else needs it:
 
