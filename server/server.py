@@ -4501,6 +4501,9 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
     for p in ("[Integrate]", "[Fix]", "[Review]"):
         if base.startswith(p):
             base = base[len(p):].strip()
+    # A fix of a fix would stack the suffix ("... — review changes — review changes").
+    while base.endswith(" — review changes"):
+        base = base[: -len(" — review changes")].strip()
     fix_title = (f"[Fix] {base} — review changes" if base else f"[Fix] {task_id} — review changes")[:200]
     # If the reviewed card already MERGED, its fix must branch from current master
     # (which has the merged work) and correct the errors there -- NOT continue the
@@ -4547,8 +4550,12 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
             "(`--kind needs_input`) with why -- do not complete it unaddressed.\n\n"
             f"Reviewed card: {task_id} ({title})\n\n--- review feedback ---\n{feedback}"
         )
-    assignee = ((payload.get("assignee") or "").strip() or (task.get("assignee") or "").strip()
-                or _darkhelix_assignee())
+    # The follow-up is engine work, so it goes to the engine-capable profile unless
+    # the caller names one. It must NOT inherit the reviewed card's current
+    # assignee: a review hands the card to the reviewer's profile (darkhelix),
+    # which has no dispatch_to_engine, so a fix card that inherited it sat
+    # searching its toolbox for a tool it could not have (t_99b21b83).
+    assignee = (payload.get("assignee") or "").strip() or _darkhelix_assignee()
     create = (
         "hermes kanban create "
         f"{shlex.quote(fix_title)} "
