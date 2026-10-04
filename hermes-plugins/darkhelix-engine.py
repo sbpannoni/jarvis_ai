@@ -77,7 +77,9 @@ MAX_ATTEMPTS = 3
 _REVIEW_HANDOFF = (
     "If YOU have verified the change (for example the full suite is green in "
     "the card's worktree) and the remaining gate failures are in tests you can "
-    "show are environmental or not caused by the change, do NOT block: call "
+    "show are environmental or not caused by the change, do NOT block: first "
+    "call promote_attempt(task_id, attempt) so the card branch carries the work, "
+    "then call "
     "kanban_request_review with reviewer=\"darkhelix\" and a summary stating the "
     "branch, exactly what you ran and saw, and for each remaining gate failure "
     "why the change did not cause it. An independent reviewer re-checks it and "
@@ -127,6 +129,29 @@ def _card(task_id: str):
     from hermes_cli.kanban_db_connect import connect_closing
     with connect_closing() as conn:
         return kb.get_task(conn, task_id)
+
+
+def _advance_card_branch(task_id: str, worktree: str, attempt_branch: str):
+    """Fast-forward the card's own branch (hermes/<task_id>) to an attempt branch.
+    Returns (ok, detail).
+
+    ff-only on purpose: the engine cuts every attempt from the card branch's HEAD,
+    so a fast-forward is the only correct outcome; if it is not one, something
+    moved underneath us and the right answer is to say so, not to merge. Works
+    whether the card branch is the worktree's checked-out branch (merge there) or
+    not (move the ref), because a worker that inspected an attempt may have left
+    the worktree on the attempt branch."""
+    card = f"hermes/{task_id}"
+    q = shlex.quote
+    anc = _ssh(f"cd {q(worktree)} && git merge-base --is-ancestor {q(card)} {q(attempt_branch)}", timeout=60)
+    if anc.returncode != 0:
+        return False, f"{attempt_branch} is not a fast-forward of {card}"
+    head = _ssh(f"cd {q(worktree)} && git rev-parse --abbrev-ref HEAD", timeout=60)
+    if (head.stdout or "").strip() == card:
+        r = _ssh(f"cd {q(worktree)} && git merge --ff-only {q(attempt_branch)} 2>&1", timeout=120)
+    else:
+        r = _ssh(f"cd {q(worktree)} && git branch -f {q(card)} {q(attempt_branch)} 2>&1", timeout=60)
+    return r.returncode == 0, (r.stdout or "").strip()[-300:]
 
 
 def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
@@ -287,9 +312,7 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
     # so a fast-forward is the only correct outcome. If it is not a
     # fast-forward something moved underneath us and the right answer is to
     # say so, not to merge.
-    ff = _ssh(f"cd {shlex.quote(worktree)} && "
-              f"git merge --ff-only {shlex.quote(branch)} 2>&1", timeout=120)
-    card_branch_advanced = ff.returncode == 0
+    card_branch_advanced, ff_detail = _advance_card_branch(task_id, worktree, branch)
 
     # The commit this attempt actually produced. Used to NAME the patch, so an
     # artifact can never misrepresent which code it is.
@@ -342,7 +365,7 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
         "patch": attached,
         "patch_attached": patch_ok,
         "card_branch_advanced": card_branch_advanced,
-        "card_branch_error": None if card_branch_advanced else (ff.stdout or ff.stderr or "")[-300:],
+        "card_branch_error": None if card_branch_advanced else ff_detail,
         "card_completed": comp.returncode == 0,
         "complete_error": None if comp.returncode == 0 else comp.stderr[-300:],
         "next": ("Nothing further. The card is complete and the branch holds a "
@@ -399,7 +422,63 @@ DISPATCH_TO_ENGINE_SCHEMA: Dict[str, Any] = {
 
 
 # ---------------------------------------------------------------- registration
+PROMOTE_ATTEMPT_SCHEMA: Dict[str, Any] = {
+    "name": "promote_attempt",
+    "description": (
+        "Fast-forward a card's own branch (hermes/<task_id>) to one of its engine "
+        "attempt branches (hermes/<task_id>-engine-<n>). Call this BEFORE "
+        "kanban_request_review when you are handing over an attempt whose gate "
+        "failed: the Merge flow and every child card are cut from the card branch, "
+        "so work left only on the attempt branch is invisible to them and gets "
+        "re-done. Refuses anything that is not a pure fast-forward."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "The kanban task id."},
+            "attempt": {"type": "integer", "description": "Engine attempt number to promote (1-3)."},
+        },
+        "required": ["task_id", "attempt"],
+    },
+}
+
+
+def handle_promote_attempt(args: Dict[str, Any], **_kw) -> str:
+    task_id = (args.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return _err("bad task id")
+    try:
+        n = int(args.get("attempt"))
+    except (TypeError, ValueError):
+        return _err("attempt must be an integer")
+    task = _card(task_id)
+    if task is None:
+        return _err(f"unknown task {task_id}")
+    worktree = _dispatch_target(task.body or "").get("worktree", "")
+    if not worktree or "ISOLATION FAILED" in worktree or worktree == "NONE":
+        return _err("this card has no usable worktree")
+    attempt_branch = f"hermes/{task_id}-engine-{n}"
+    have = _ssh(f"cd {shlex.quote(worktree)} && git rev-parse --verify --quiet {shlex.quote(attempt_branch)}", timeout=60)
+    if have.returncode != 0:
+        return _err(f"no such attempt branch {attempt_branch}")
+    ok, detail = _advance_card_branch(task_id, worktree, attempt_branch)
+    if not ok:
+        return _err(f"could not promote {attempt_branch}: {detail}")
+    tip = _ssh(f"cd {shlex.quote(worktree)} && git rev-parse --short hermes/{task_id}", timeout=60)
+    return _json({"success": True, "card_branch": f"hermes/{task_id}",
+                  "tip": (tip.stdout or "").strip(), "promoted": attempt_branch,
+                  "next": "Now call kanban_request_review naming this branch and commit."})
+
+
 def register(ctx) -> None:
+    ctx.register_tool(
+        name="promote_attempt",
+        toolset="darkhelix",
+        schema=PROMOTE_ATTEMPT_SCHEMA,
+        handler=handle_promote_attempt,
+        description="Fast-forward a card's branch to an engine attempt before requesting review.",
+        emoji="⏩",
+    )
     ctx.register_tool(
         name="dispatch_to_engine",
         toolset="darkhelix",

@@ -77,7 +77,10 @@ that needs a mind: deciding what a failed attempt actually means.
      change: a tool missing from the container, a test that reaches the network.
      Blocking here strands a correct fix.
 
-     → `kanban_request_review` with `reviewer="darkhelix"`. In the summary give
+     → First `promote_attempt(task_id, attempt)`: it fast-forwards the card's own
+     branch to that attempt. The Merge button and every child card are cut from
+     the card branch, so work left only on `hermes/<id>-engine-N` is invisible to
+     them and gets redone. Then `kanban_request_review` with `reviewer="darkhelix"`. In the summary give
      the branch, exactly what you ran and saw, and for each remaining gate
      failure why the change did not cause it. A reviewer re-checks it
      independently and approves, sends it back, or escalates. If you cannot say
