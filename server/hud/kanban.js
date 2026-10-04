@@ -101,6 +101,8 @@ let kbReviewing = [];
    button on the next re-render (the verdict stays request_changes until the fix
    completes and re-reviews). Computed from tasks + kbEdges each refresh. */
 let kbFixInFlight = {};
+let kbFixedBy = {};        // reviewed card id -> its finished [Fix] child
+let kbIntegratedBy = {};   // source card id -> the live [Integrate] card that wove it
 /* Auto-assessment (client-side): a done code card is Verified (static, instant,
    no model) and Reviewed (agentic) automatically, so the human never clicks
    through a gate pipeline -- they only decide Merge / Fix. kbVerified holds the
@@ -274,6 +276,8 @@ function kbCardSignature(t){
           t.status === "done" ? (kbLanding.indexOf(t.id) !== -1) : "",
           t.status === "done" ? (kbFinalizing.indexOf(t.id) !== -1) : "",
           t.status === "done" ? (!!kbFixInFlight[t.id]) : "",
+          t.status === "done" ? (kbFixedBy[t.id] || "") : "",
+          t.status === "done" ? (kbIntegratedBy[t.id] || "") : "",
           // Review state drives the review chip / Fix-issues button.
           t.status === "done" ? (kbReviews[t.id] || "") : "",
           t.status === "done" ? (kbReviewing.indexOf(t.id) !== -1) : "",
@@ -390,6 +394,14 @@ function kbCardStage(t, opts){
   // review flagged problems -> Fix, BEFORE Integrate/Merge: known-bad work is
   // fixed first, even if a stale PR is still open for it (this is why #8/#9 read
   // "merging" before -- the open PR masked their requested changes).
+  if((review === "request_changes" || review === "escalate") && kbFixedBy[id]){
+    // The fix already finished; it carries its own review and its own Merge. Offering
+    // "Fix issues" here is what forked the work.
+    const chips = [chip("kb-st-done", "fixed by " + kbFixedBy[id].slice(2, 8),
+      "This card's review asked for changes and " + kbFixedBy[id] + " already made them. That card is reviewed on its own; land or fix it there, not from this stale verdict.")];
+    if(stalledPr) chips.push(stalledPr);
+    return S("FIXED", {chips});
+  }
   if(review === "request_changes" || review === "escalate"){
     // A fix was already dispatched and is still running -> show that, don't keep
     // offering (and re-arming) the Fix button on every re-render.
@@ -401,6 +413,9 @@ function kbCardStage(t, opts){
   }
 
   // a family of loose code branches nothing has woven yet -> Integrate
+  if(kbIntegratedBy[id] && !(t.title || "").startsWith("[Integrate]"))
+    return S("INTEGRATED", {chips: [chip("kb-st-done", "integrated in " + kbIntegratedBy[id].slice(2, 8),
+      "These branches were already woven by " + kbIntegratedBy[id] + ". Review or land that card instead of integrating again.")]});
   if(fam && (fam.codeIds || []).length >= 2 && commits > 0 && !(t.title || "").startsWith("[Integrate]"))
     return S("INTEGRATE", {primary: act("integrate", "Integrate " + fam.codeIds.length,
       "Agentic merge: weave these " + fam.codeIds.length + " code branches into ONE coherent change WITH tests, then land it CI-gated. For loose feature branches no integration card has woven yet.",
@@ -1360,6 +1375,25 @@ function kbComputeFixInFlight(tasks){
   return inflight;
 }
 
+/* A reviewed card whose [Fix] already FINISHED keeps its old request_changes
+   verdict, which used to make the board offer "Fix issues" again and fork a
+   sibling from the unmerged root (three competing genome_discovery refactors).
+   Likewise a source set that already has a live [Integrate] must not offer
+   Integrate again. Both are read off the same edges the in-flight map uses. */
+function kbComputeLinkedWork(tasks){
+  const byId = {};
+  (tasks || []).forEach(t => { byId[t.id] = t; });
+  const fixedBy = {}, integratedBy = {};
+  (kbEdges || []).forEach(([p, c]) => {
+    const ch = byId[c];
+    if(!ch || ch.status === "archived") return;
+    const title = ch.title || "";
+    if(title.startsWith("[Fix]") && ch.status === "done") fixedBy[p] = c;
+    if(title.startsWith("[Integrate]")) integratedBy[p] = c;
+  });
+  return {fixedBy, integratedBy};
+}
+
 async function refreshKanbanPanel(panel){
   refreshKanbanPause(panel);
   try{
@@ -1378,6 +1412,7 @@ async function refreshKanbanPanel(panel){
     }
     if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
     kbFixInFlight = kbComputeFixInFlight(j.tasks || []);   // needs kbEdges (just set)
+    { const lw = kbComputeLinkedWork(j.tasks || []); kbFixedBy = lw.fixedBy; kbIntegratedBy = lw.integratedBy; }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();
     renderKanban(panel, j, j.error);
     // Fire-and-forget: verify + review the done code cards so their verdicts are

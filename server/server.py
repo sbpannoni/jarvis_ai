@@ -4291,6 +4291,16 @@ async def darkhelix_agentic_integrate(request: Request) -> JSONResponse:
     if len(ids) < 2:
         return JSONResponse({"ok": False, "error": "need at least two source cards to integrate"},
                             status_code=400)
+    # Do not weave the same source set twice. Integrating Rickettsia and
+    # collab_refs again after they had merged produced byte-identical branches and
+    # a 74 min worker run to conclude "already complete".
+    want = set(ids)
+    for k in await _linked_cards((await _card_links(ids[0]))["children"]):
+        if k["title"].startswith("[Integrate]") and k["status"] != "archived" and set(k["parents"]) >= want:
+            return JSONResponse({"ok": False, "existing": k["id"],
+                                 "error": f"these cards are already integrated by {k['id']} "
+                                          f"({k['status']}); review or land that card instead"},
+                                status_code=409)
     title = (payload.get("title") or "").strip() or ids[0]
     int_title = f"[Integrate] {title}"[:200]
     body = _integrate_card_body(ids)
@@ -4471,6 +4481,30 @@ async def darkhelix_request_review(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "started": True, "task_id": task_id, "model": model})
 
 
+async def _card_links(task_id: str) -> dict:
+    """{"task": {...}, "parents": [...], "children": [...]} for one card, via the
+    board API. Empty lists on any failure: callers use this to AVOID duplicate work,
+    and failing open (do the work) is the safe direction."""
+    try:
+        d = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
+    except Exception:
+        return {"task": {}, "parents": [], "children": []}
+    links = d.get("links") or {}
+    return {"task": d.get("task") or {}, "parents": links.get("parents") or [],
+            "children": links.get("children") or []}
+
+
+async def _linked_cards(ids: list, limit: int = 25) -> list:
+    """[{id, status, title, parents}] for the given card ids."""
+    out = []
+    for cid in list(ids)[:limit]:
+        d = await _card_links(cid)
+        t = d["task"]
+        out.append({"id": cid, "status": t.get("status"), "title": t.get("title") or "",
+                    "parents": d["parents"]})
+    return out
+
+
 @app.post("/api/darkhelix/fix-review")
 async def darkhelix_fix_review(request: Request) -> JSONResponse:
     """Close the loop when a review (or Verify) finds issues: file a [Fix] card
@@ -4496,6 +4530,26 @@ async def darkhelix_fix_review(request: Request) -> JSONResponse:
                 break
     if not feedback:
         feedback = "(no review comment found; address any outstanding Verify/review issues on this card)"
+    # One fix per reviewed card. Each click used to fork a NEW sibling from the
+    # unmerged root, so one review produced three competing refactors of
+    # genome_discovery.py (t_aa6f270f, t_1127976f, t_0650e209) and two different
+    # fixes for the same seqid defect. If a fix is already running, hand back that
+    # one; if one already finished, the right move is to review IT, not to file
+    # another from the root's now-stale verdict (pass force to override).
+    fixes = [k for k in await _linked_cards((await _card_links(task_id))["children"])
+             if k["title"].startswith("[Fix]") and k["status"] != "archived"]
+    live = next((k for k in fixes if k["status"] != "done"), None)
+    if live:
+        return JSONResponse({"ok": True, "fix_id": live["id"], "existing": True,
+                             "assignee": (await _card_links(live["id"]))["task"].get("assignee"),
+                             "note": f"{live['id']} is already fixing this card"})
+    finished = next((k for k in fixes if k["status"] == "done"), None)
+    if finished and not payload.get("force"):
+        return JSONResponse({"ok": False, "fixed_by": finished["id"],
+                             "error": f"{task_id} was already fixed by {finished['id']}. That card "
+                                      "carries its own review; filing another fix from this one forks "
+                                      "the work. Pass force to file one anyway."}, status_code=409)
+
     title = (task.get("title") or "").strip()
     base = title
     for p in ("[Integrate]", "[Fix]", "[Review]"):
@@ -7651,6 +7705,47 @@ async def _dh_checks_status(pr_number: str) -> tuple[str, str]:
     return "pending", "checks still running"
 
 
+async def _dh_supersede_siblings(task_id: str) -> None:
+    """After a card's PR merges, archive finished SIBLINGS (cards sharing a parent)
+    whose change is already contained in master (merging them would be a no-op): they are redundant, and left
+    on the board each one offers its own Merge for work that is already in.
+    Siblings that DIFFER from master are competing versions and are left alone with
+    a note -- that is a human decision, not a cleanup. Merges delete the head branch,
+    so this compares each sibling to master, not to the merged branch. Best-effort."""
+    try:
+        me = await _card_links(task_id)
+        sibs = set()
+        for p in me["parents"][:12]:
+            sibs |= set((await _card_links(p))["children"])
+        sibs.discard(task_id)
+        for sib in await _linked_cards(sorted(sibs)):
+            if sib["status"] != "done":
+                continue
+            br = _dh_branch(sib["id"])
+            # "Would merging this change master?" -- an in-memory three-way merge whose
+            # result tree equals master's tree is a no-op, i.e. already landed. Comparing
+            # end states instead misreads any file master has since moved on.
+            base = f"origin/{DARKHELIX_BASE_BRANCH}"
+            cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+                   f"git rev-parse --verify -q {shlex.quote(br)} >/dev/null && "
+                   f"git fetch -q origin {DARKHELIX_BASE_BRANCH} && "
+                   f"[ \"$(git merge-tree --write-tree --no-messages {base} {shlex.quote(br)} 2>/dev/null | head -1)\" "
+                   f"= \"$(git rev-parse {base}^{{tree}})\" ] && echo SAME || echo DIFF")
+            rc, out = await _fleet_ssh("snarf", cmd)
+            same = "SAME" in (out or "")
+            note = (f"Superseded: merging this card would change nothing, its work is already on "
+                    f"{DARKHELIX_BASE_BRANCH} after {task_id} merged." if same else
+                    f"Sibling {task_id} merged, and this card DIFFERS from the result. It is a "
+                    "competing version: compare before landing it, do not merge it blindly.")
+            await asyncio.to_thread(_kanban_api_call, "POST",
+                f"/api/plugins/kanban/tasks/{quote(sib['id'])}/comments",
+                json={"author": "looking-glass", "body": note})
+            if same:
+                await _kanban_ssh(f"hermes kanban archive {shlex.quote(sib['id'])}")
+    except Exception as exc:  # never let cleanup disturb a landing
+        print(f"[supersede] {task_id}: {exc!r}", flush=True)
+
+
 async def _dh_finalize_one(task_id: str, info: dict) -> None:
     pr_number = str(info.get("pr_number") or "")
     pr_url = info.get("pr_url") or ""
@@ -7705,6 +7800,7 @@ async def _dh_finalize_one(task_id: str, info: dict) -> None:
         return
 
     _dh_finalize_clear(task_id)
+    await _dh_supersede_siblings(task_id)
     try:
         await asyncio.to_thread(
             _kanban_api_call, "POST",
@@ -7861,6 +7957,7 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
         return {"ok": False, "stage": "merge", "pr_url": pr_url,
                 "error": merge_error, "block_result": outcome}
     _dh_finalize_clear(task_id)
+    await _dh_supersede_siblings(task_id)
 
     try:
         await asyncio.to_thread(
