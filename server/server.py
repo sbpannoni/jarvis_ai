@@ -2736,6 +2736,9 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
             f"closure review. NOT merged -- land the branch or discard it.",
             "",
             f"Branch: {branch}  ({dl if dl is not None else '?'} line(s) changed)",
+            f"Review:  git -C {DARKHELIX_REPO_PATH} diff master...{branch}",
+            f"Discard: git -C {DARKHELIX_REPO_PATH} branch -D {branch}",
+            "Land: push the branch and open a PR, like any other card.",
             f"File: {loc}",
             f"Defect: {f.get('summary', '')}",
         ]

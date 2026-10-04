@@ -239,6 +239,7 @@ async function kbRefreshSeat(){
 function kbChainKind(t){
   const title = t.title || "";
   if(title.startsWith("[Review] ")) return {kind: "review", rest: title.slice(9)};
+  if(title.startsWith("[Applied Fix] ")) return {kind: "applied", rest: title.slice(14)};
   if(title.startsWith("[Fix] ")){
     const rest = title.slice(6);
     const m = rest.match(/^(.*) \(attempt (\d+)\)$/);
@@ -249,6 +250,8 @@ function kbChainKind(t){
 
 function kbChainChip(c){
   if(!c) return "";
+  if(c.kind === "applied")
+    return `<span class="kb-chip kb-chain applied" title="The reviewer already applied this fix on its own branch: it passed the engine test gate and closure review. Not merged. Read the diff, then land the branch or discard it (commands are on the card).">APPLIED</span>`;
   return c.kind === "review"
     ? `<span class="kb-chip kb-chain review" title="Review-chain review card: findings only, filed to triage. Never edits code">REVIEW</span>`
     : `<span class="kb-chip kb-chain fix" title="Review-chain fix card: dispatchable, the editor works it unsupervised once it is ready. Process it after it finishes to run the gates + closure review">FIX${c.attempt > 1 ? " #" + c.attempt : ""}</span>`;
