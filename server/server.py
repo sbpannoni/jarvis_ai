@@ -2603,13 +2603,37 @@ _REVIEW_JOBS: set = set()
 _REVIEW_JOBS_ACTIVE: set = set()
 
 
+_SWEEP_TRACKER_TTL_S = 3 * 3600
+
+
+async def _sweep_trackers_reap_stale() -> None:
+    """On startup, archive any '[Sweep] IN PROGRESS' tracker still running. Their
+    jobs lived in the previous process and died with it, and a long claim would
+    otherwise hold the single in-progress slot for hours. Best-effort."""
+    try:
+        rc, out = await _kanban_ssh("hermes kanban ls --status running 2>/dev/null")
+        for line in (out or "").splitlines():
+            m = re.search(r"\b(t_[0-9a-f]{6,})\s+running\s+\S+\s+\[Sweep\] IN PROGRESS", line)
+            if m:
+                await _kanban_ssh(f"hermes kanban archive {shlex.quote(m.group(1))}")
+                print(f"[sweep-tracker] reaped stale tracker {m.group(1)}", flush=True)
+    except Exception as exc:
+        print(f"[sweep-tracker] stale reap failed: {exc!r}", flush=True)
+
+
 async def _sweep_tracker_open(target_file: str, mode: str) -> str | None:
     """Create a per-file review tracker card. Delegates to _kanban_tracker_create."""
     title = f"[Sweep] IN PROGRESS · {target_file}"
     body = (f"Live tracker: automated {mode} review of {target_file} is running on the "
             f"coder-engine (looking-glass). This card auto-clears when the sweep ends; "
             f"findings, if any, are filed separately as their own card.")
-    return await _kanban_tracker_create(title, body)
+    # A claim CANNOT be extended once taken: re-claiming a running card is refused
+    # ("cannot claim: status=running") and a heartbeat does not move claim_expires
+    # (both checked). The old 30 min TTL was shorter than a review (26-47 min) plus an
+    # apply, so the reclaim timer archived the tracker mid-run and the run log vanished
+    # from the board. So take ONE claim sized for review + apply; the job closes it
+    # explicitly, and _sweep_trackers_reap_stale bounds how long a crash can strand it.
+    return await _kanban_tracker_create(title, body, ttl=_SWEEP_TRACKER_TTL_S)
 
 
 async def _kanban_tracker_create(title: str, body: str, ttl: int = 1800) -> str | None:
@@ -2729,11 +2753,18 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
                if f.get("line") is not None else f.get("file", target_file))
         branch = r.get("branch_name") or "?"
         dl = r.get("diff_lines")
-        title = f"[Applied Fix] {loc} -- {(f.get('summary') or '')[:80]}"
+        unverified = r.get("outcome") == "unverified"
+        title = (f"[Applied Fix] {'(unverified) ' if unverified else ''}{loc} -- "
+                 f"{(f.get('summary') or '')[:80]}")
         body_lines = [
-            f"Auto-applied by the reviewer's implement stage ({model}). A VERIFIED "
-            f"patch: it passed the engine's no-new-failures test gate and the "
-            f"closure review. NOT merged -- land the branch or discard it.",
+            (f"UNVERIFIED fix from the reviewer's implement stage ({model}). It passed the "
+             f"engine's no-new-failures test gate, but the closure review returned no usable "
+             f"verdict (tried twice), so nothing has confirmed it addresses the finding. Read "
+             f"the diff before trusting it. NOT merged -- land the branch or discard it."
+             if unverified else
+             f"Auto-applied by the reviewer's implement stage ({model}). A VERIFIED "
+             f"patch: it passed the engine's no-new-failures test gate and the "
+             f"closure review. NOT merged -- land the branch or discard it."),
             "",
             f"Branch: {branch}  ({dl if dl is not None else '?'} line(s) changed)",
             f"Review:  git -C {DARKHELIX_REPO_PATH} diff master...{branch}",
@@ -2769,7 +2800,7 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
 
 async def _file_unresolved_fix_card(response: dict, target_file: str, model: str,
                                     review_task_id: str, unresolved_findings: list,
-                                    applied_count: int) -> None:
+                                    applied_count: int, attempts: list | None = None) -> None:
     """File ONE dispatchable [Fix] kanban card for the findings the apply stage
     did not resolve, parented to the review card. Mutates `response` with
     chained/chained_task or chain_error. No-op if there is nothing unresolved."""
@@ -2797,6 +2828,15 @@ async def _file_unresolved_fix_card(response: dict, target_file: str, model: str
         "location named, don't just touch the file. A closure check will "
         "later verify the diff actually reaches these lines."
     )
+    if attempts:
+        # The light stage already tried these. Say what, and where it is kept, so this
+        # card starts from that work instead of re-deriving it.
+        fix_lines.append("\nA faster first attempt already exists for some of these and is KEPT on "
+                         f"a branch in {DARKHELIX_REPO_PATH}. Read it (`git diff master...<branch>`) "
+                         "before redoing the work; reuse it if it is sound:")
+        for a in attempts:
+            fix_lines.append(f"- {a['summary'][:90]}\n    branch: {a['branch']}\n"
+                             f"    stopped because ({a['outcome']}): {a['reason']}")
     fix_lines.append("\n```json:review-findings")
     fix_lines.append(json.dumps({"source_task": review_task_id, "target_file": target_file, "findings": unresolved_findings}, indent=2))
     fix_lines.append("```")
@@ -2839,31 +2879,27 @@ async def _launch_detached_apply(target_file: str, model: str, findings: list) -
     result_path = f"{run_dir}/result.json"
     progress_path = f"{run_dir}/progress.log"
     findings_json = json.dumps({"findings": findings})
+    # Setup runs in the foreground; ONLY the job is backgrounded, in its own session
+    # with stdin closed. `a && b && nohup c > log 2>&1 &` backgrounds the WHOLE chain
+    # in a subshell and the redirect covers only c, so the subshell kept the SSH
+    # channel's stdout open and this call blocked for the entire apply (26 min in the
+    # first live run) -- reproduced with asyncssh: 12.1 s for a 12 s job, 0.0 s once
+    # fixed. That also meant the progress poller never started until the job ended.
     cmd = (
         f"mkdir -p {shlex.quote(run_dir)} && "
         f"printf %s {shlex.quote(findings_json)} > {shlex.quote(run_dir + '/findings.json')} && "
-        f"nohup {CODER_ENGINE_VENV_PY} {DISPATCH_FIX_TASK_PY} "
+        f"{{ setsid nohup {CODER_ENGINE_VENV_PY} {DISPATCH_FIX_TASK_PY} "
         f"--repo-path {shlex.quote(DARKHELIX_REPO_PATH)} "
         f"--findings-json {shlex.quote(run_dir + '/findings.json')} "
         f"--model {shlex.quote(model)} "
         f"--result-out {shlex.quote(result_path)} "
         f"--progress-out {shlex.quote(progress_path)} "
-        f"> {shlex.quote(run_dir + '/stdout.log')} 2>&1 & echo launched"
+        f"< /dev/null > {shlex.quote(run_dir + '/stdout.log')} 2>&1 & }} && echo launched"
     )
     rc, out = await _fleet_ssh("snarf", cmd)
     if rc != 0 or "launched" not in (out or ""):
         raise RuntimeError(f"apply launch failed (rc={rc}): {out[-400:]}")
     return result_path, progress_path
-
-
-async def _sweep_tracker_refresh(card_id: str, ttl: int = 1800) -> None:
-    """Re-claim the tracker to extend its TTL so a long apply does not get
-    reclaimed mid-run. Best-effort and purely cosmetic -- the poller files all
-    cards independently of the tracker, so a lost tracker never loses data."""
-    try:
-        await _kanban_ssh(f"hermes kanban claim {shlex.quote(card_id)} --ttl {int(ttl)}")
-    except Exception:
-        pass
 
 
 async def _tracker_note(tracker_id, msg: str) -> None:
@@ -2895,8 +2931,6 @@ def _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
                     await _tracker_note(tracker_id, "apply: " + " | ".join(
                         ln.split(" ", 1)[-1] for ln in lines[posted:][-6:]))
                     posted = len(lines)
-                if tracker_id:
-                    await _sweep_tracker_refresh(tracker_id)
                 rc, out = await _fleet_ssh("snarf", f"cat {shlex.quote(result_path)} 2>/dev/null || true")
                 result = _extract_json(out) if rc == 0 and out.strip() else None
                 if result is not None:
@@ -2913,31 +2947,45 @@ def _spawn_apply_poller(tracker_id, review_task_id, target_file, model,
     task.add_done_callback(_REVIEW_JOBS.discard)
 
 
+def _partition_apply(findings: list, results: list) -> dict:
+    """Split a detached apply's per-finding results (results[i] lines up with
+    findings[i]) into:
+      keep       -- applied (verified) and unverified (gate passed, no closure verdict):
+                    both get a tracked [Applied Fix] card for a human to land or reject
+      unresolved -- everything else; goes to ONE heavy [Fix] card
+      attempts   -- for unresolved findings that left a kept branch, what was tried and
+                    why it stopped, so the heavy path does not start blind"""
+    keep, unresolved, attempts = [], [], []
+    for i, f in enumerate(findings):
+        r = results[i] if i < len(results) else None
+        if r and r.get("outcome") in ("applied", "unverified"):
+            keep.append({"finding": f, "result": r})
+            continue
+        unresolved.append(f)
+        if r and r.get("branch_name"):
+            attempts.append({"summary": f.get("summary", ""), "branch": r["branch_name"],
+                             "outcome": r.get("outcome"), "reason": (r.get("reason") or "")[:400]})
+    return {"keep": keep, "unresolved": unresolved, "attempts": attempts}
+
+
 async def _finalize_apply(tracker_id, review_task_id, target_file, model,
                           applied_result, findings) -> None:
     """Partition the detached apply's result, file the board cards, post a
-    summary, and close the tracker. results[i] lines up with findings[i]
-    (dispatch_fix_task processes them in order)."""
-    results = applied_result.get("results") or []
-    applied_findings, unresolved = [], []
-    for i, f in enumerate(findings):
-        r = results[i] if i < len(results) else None
-        if r and r.get("outcome") == "applied":
-            applied_findings.append({"finding": f, "result": r})
-        else:
-            unresolved.append(f)
-
-    applied_cards = []
-    if applied_findings:
-        applied_cards = await _file_applied_fix_cards(target_file, model, review_task_id, applied_findings)
+    summary, and close the tracker."""
+    part = _partition_apply(findings, applied_result.get("results") or [])
+    keep, unresolved = part["keep"], part["unresolved"]
+    kept_cards = []
+    if keep:
+        kept_cards = await _file_applied_fix_cards(target_file, model, review_task_id, keep)
     fix_resp: dict = {}
     if unresolved:
         await _file_unresolved_fix_card(fix_resp, target_file, model, review_task_id,
-                                        unresolved, len(applied_findings))
+                                        unresolved, len(keep), part["attempts"])
 
+    n_unv = sum(1 for k in keep if k["result"].get("outcome") == "unverified")
     if tracker_id:
-        summary = (f"apply done: {len(applied_findings)} applied "
-                   f"({len(applied_cards)} [Applied Fix] card(s)), {len(unresolved)} -> [Fix].")
+        summary = (f"apply done: {len(keep) - n_unv} applied, {n_unv} unverified "
+                   f"({len(kept_cards)} [Applied Fix] card(s)), {len(unresolved)} -> [Fix].")
         await _tracker_note(tracker_id, summary)
         await _sweep_tracker_close(tracker_id)
 
@@ -10309,6 +10357,7 @@ async def start_activity_feed() -> None:
     asyncio.get_running_loop().create_task(_archive_merged_forever())
     asyncio.get_running_loop().create_task(_poll_pool_manifest_forever())
     asyncio.get_running_loop().create_task(_poll_enforce_blocks_forever())
+    asyncio.get_running_loop().create_task(_sweep_trackers_reap_stale())
 
 
 async def _poll_rack_hosts_forever() -> None:
