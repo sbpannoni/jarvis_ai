@@ -137,6 +137,15 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
     task = _card(task_id)
     if task is None:
         return _err(f"unknown task {task_id}")
+    # A finished card must not be dispatched again. t_0650e209 completed at 16:51,
+    # but its worker kept going and ran a third engine attempt on the done card at
+    # 18:01 -- about 1.5h of the single GPU seat for nothing. A card sent back for
+    # changes is no longer terminal, so legitimate re-runs are unaffected.
+    if getattr(task, "status", None) in ("done", "archived"):
+        return _err(
+            f"{task_id} is already {task.status}. Do not dispatch again: the work "
+            "is finished and another run only occupies the GPU. Stop here.",
+            status=task.status)
 
     body = task.body or ""
     dt = _dispatch_target(body)

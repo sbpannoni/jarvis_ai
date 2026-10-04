@@ -7231,13 +7231,20 @@ async def _darkhelix_land(task_id: str, check: str = "tests", open_pr: bool = Tr
         result["pr_skipped"] = "pr not requested"
         return result
 
-    title = f"[hermes] {task_id}: kanban work"
+    title = f"[hermes] {task_id}: kanban work"   # fallback if the card cannot be read
     fixes = ""
     try:   # the card title carries "#N" when it was filed from an issue
         _card = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
-        _m = _ISSUE_TITLE_RE.match(((_card.get("task") or _card).get("title") or "").strip())
+        _ct = ((_card.get("task") or _card).get("title") or "").strip()
+        _m = _ISSUE_TITLE_RE.match(_ct)
+        _subj = _pr_subject(_ct)
+        if _subj:
+            # What the change IS, not just which card made it: this becomes the
+            # squash-commit subject on master, so "kanban work" told nobody anything.
+            title = f"[hermes] {_subj} ({task_id})"
         if _m:
-            title = f"[hermes] {_m.group(0)} {task_id}: kanban work"
+            if _m.group(0) not in title:
+                title = f"[hermes] {_m.group(0)} {_subj or task_id} ({task_id})"
             fixes = f"Fixes {_m.group(0)}\n\n"
     except Exception:
         pass
@@ -8615,6 +8622,18 @@ _AREA_SECTION = {
 }
 _ISSUE_ITEMS_CACHE: dict = {"ts": 0.0, "items": None}
 _ISSUE_TITLE_RE = re.compile(r"^#(\d+)\b")
+
+
+def _pr_subject(card_title: str) -> str:
+    """A readable PR/squash-commit subject from a card title: drop the leading
+    [Fix]/[Integrate]/[Review] tag and any stacked ' — review changes' suffix,
+    collapse whitespace, cap the length. Empty when nothing usable is left, so
+    the caller keeps its fallback."""
+    t = re.sub(r"^(\[[^\]]+\]\s*)+", "", (card_title or "").strip())
+    while t.endswith(" — review changes"):
+        t = t[: -len(" — review changes")].strip()
+    t = re.sub(r"\s+", " ", t)
+    return (t[:69] + "…") if len(t) > 70 else t
 
 
 async def _darkhelix_items(max_age: float = 30.0) -> list[dict]:
