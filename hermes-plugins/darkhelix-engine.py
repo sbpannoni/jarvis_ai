@@ -109,7 +109,8 @@ def _dispatch_target(body: str) -> Dict[str, str]:
 
 def _card(task_id: str):
     from hermes_cli import kanban_db as kb
-    with kb.connect_closing() as conn:
+    from hermes_cli.kanban_db_connect import connect_closing
+    with connect_closing() as conn:
         return kb.get_task(conn, task_id)
 
 

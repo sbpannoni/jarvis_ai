@@ -116,12 +116,13 @@ def _on_task_blocked(task_id: str, board: str | None = None,
                      reason: str | None = None, **_fields) -> None:
     try:
         from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
     except Exception as exc:  # pragma: no cover
         logger.debug("darkhelix-triage-guard: kanban_db unavailable (%s)", exc)
         return
 
     try:
-        with kb.connect_closing(board=board) as conn:
+        with connect_closing(board=board) as conn:
             task = kb.get_task(conn, task_id)
             # block_task lands a card in `triage` from exactly one branch: the
             # loop-breaker. Any other status means an ordinary block, which is

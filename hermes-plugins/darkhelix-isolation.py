@@ -136,8 +136,8 @@ def _apply_default_runtime_cap(task_id: str) -> None:
     if cap <= 0:
         return
     try:
-        from hermes_cli import kanban_db as kb
-        with kb.connect_closing() as conn:
+        from hermes_cli.kanban_db_connect import connect_closing
+        with connect_closing() as conn:
             row = conn.execute(
                 "SELECT max_runtime_seconds FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
