@@ -2789,6 +2789,9 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
                            + ("FAILS without the fix, so it proves it." if rt.get("fails_on_base")
                               else "PASSES WITHOUT THE FIX, so it does not prove it (the fix may still be right)."
                               if rt.get("fails_on_base") is False else (rt.get("detail") or "not checked"))]
+            if rt.get("uncovered"):   # a test can prove only part of a fix
+                body_lines.append("Not covered by that test: " + ", ".join(f"'{v}'" for v in rt["uncovered"])
+                                  + " (the fix changes these too but the test never mentions them).")
         else:
             body_lines += ["", "Regression test: none was added. Worth adding one before landing."]
         if r.get("lint"):
