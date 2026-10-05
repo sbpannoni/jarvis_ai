@@ -272,7 +272,11 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
                 "that the edit was wrong. If so, call dispatch_to_engine again "
                 "with amended_description covering what was missing. If the "
                 "spec was right and the code is genuinely hard, block the card "
-                "with the specific reason. " + _REVIEW_HANDOFF +
+                "with the specific reason. If the error says \"lint gate\", the tests PASSED "
+                "and the repo's linter did not: fix exactly what ruff reports and dispatch "
+                "again with amended_description saying so. An import ruff calls unused is a "
+                "deliberate re-export when tests import it from that module: keep it and add "
+                "`# noqa: F401` instead of deleting it. " + _REVIEW_HANDOFF +
                 " Do NOT edit files yourself."
             ),
         })

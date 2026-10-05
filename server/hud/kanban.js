@@ -536,9 +536,13 @@ function kbCardInner(t, opts){
     // Unblock retries the work. A blocked card can also be waiting on a DECISION (a
     // [Decision] card) or on land-or-discard ([Applied Fix]); for those there was no way
     // to say "no", so the card could only be unblocked into work nobody wanted.
-    ? `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>
-       <button class="btn kb-card-btn" data-action="dismiss" data-id="${kanbanEsc(t.id)}"
-         title="Dismiss this card without working it: archives it. Use for a decision you have answered, or a fix you are discarding (its branch is kept).">Dismiss</button>`
+    ? ((chain && chain.kind === "applied")
+        // Unblock would dispatch a worker to redo finished work; an applied fix is landed or discarded.
+        ? `<button class="btn kb-card-btn kb-primary kb-land" data-action="land-applied" data-id="${kanbanEsc(t.id)}"
+             title="Cherry-pick this fix onto current master, open a PR, wait for CI and squash-merge if green. The push runs the full test suite and lint first.">Land</button>`
+        : `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>`)
+       + `<button class="btn kb-card-btn" data-action="dismiss" data-id="${kanbanEsc(t.id)}"
+         title="Dismiss this card without working it: archives it. Use for a decision you have answered, or a fix you are discarding (its branch is kept).">${(chain && chain.kind === "applied") ? "Discard" : "Dismiss"}</button>`
     : t.status === "done"
       // One source of truth for the done-card lifecycle: kbCardStage decides the
       // single primary action + chips (Merge / Fix / Submit / Process /
@@ -974,6 +978,25 @@ async function kbProcessFix(panel, btn){
 
    This merges to master, so it asks once first -- the one guard on the one
    action here that changes the shared repo. */
+/* Land an [Applied Fix]: the reviewer's attempt branch -> a clean commit on current master -> PR
+   -> CI -> squash-merge. The card body lists the regression-test evidence and any
+   "Check before landing" notes from the impact scan, so read them first. */
+async function kbLandApplied(panel, btn){
+  if(!confirm("Land this fix on DARKHELIX master?\n\nCherry-picks it onto current master, opens a PR, and squash-merges once CI is green (the push runs the full test suite and lint first; background, up to ~30m). Read the card first: it lists whether the regression test proves the fix and any other code that may care about the change.")) return;
+  btn.disabled = true;
+  btn.textContent = "landing…";
+  try{
+    const r = await fetch("/api/darkhelix/land-applied", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "land failed — retry"; btn.title = j.error || ""; return; }
+    btn.textContent = "landing → PR + CI…";
+    btn.title = "Pushing (runs tests + lint), then PR, then CI, then squash-merge. A comment on the card shows each step; the card archives itself when it merges.";
+  }catch(err){ btn.disabled = false; btn.textContent = "land failed — retry"; btn.title = err.message; }
+}
+
 async function kbLandCard(panel, btn){
   // Guardrail: if the agentic review asked for changes/escalated, don't let a
   // merge slip past it silently -- make the operator acknowledge it.
@@ -981,13 +1004,13 @@ async function kbLandCard(panel, btn){
   let warn = "";
   if(v === "request_changes" || v === "escalate")
     warn = `⚠ The agentic review returned "${v}" on this card — merging will land it over that objection.\nConsider "Fix issues" first.\n\n`;
-  if(!confirm(warn + "Merge this card's work to DARKHELIX master?\n\nOpens a PR, waits for CI, and squash-merges if green (runs in the background, up to ~30m). If CI fails or the diff is over the size cap, the card is blocked with the reason instead of merging.")) return;
+  if(!confirm(warn + "Merge this card's work to DARKHELIX master?\n\nOpens a PR, waits for CI, and squash-merges if green (runs in the background, up to ~30m). A big diff (over 15 files / 400 lines) is merged too, since you are the one asking: look at the PR first. If CI fails, the card is blocked with the reason instead of merging.")) return;
   btn.disabled = true;
   btn.textContent = "landing…";
   try{
     const r = await fetch("/api/darkhelix/land-auto", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({task_id: btn.dataset.id, skip_review_check: true}),
+      body: JSON.stringify({task_id: btn.dataset.id, skip_review_check: true, human_override: true}),
     });
     const j = await r.json();
     if(!j.ok){ btn.disabled = false; btn.textContent = "merge failed — retry"; btn.title = j.error || ""; return; }
@@ -1464,6 +1487,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "output"){ openTaskOutput(btn.dataset.id); return; }
         if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
         if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
+        if(btn.dataset.action === "land-applied"){ kbLandApplied(panel, btn); return; }
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
         if(btn.dataset.action === "archive-family"){ kbArchiveFamily(panel, btn); return; }

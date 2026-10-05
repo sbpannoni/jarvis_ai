@@ -2768,8 +2768,10 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
             "",
             f"Branch: {branch}  ({dl if dl is not None else '?'} line(s) changed)",
             f"Review:  git -C {DARKHELIX_REPO_PATH} diff master...{branch}",
-            f"Discard: git -C {DARKHELIX_REPO_PATH} branch -D {branch}",
-            "Land: push the branch and open a PR, like any other card.",
+            f"Discard: Dismiss this card (the branch is kept; delete it with git -C "
+            f"{DARKHELIX_REPO_PATH} branch -D {branch}).",
+            "Land: the Land button on this card cherry-picks the fix onto current master, opens a "
+            "PR, waits for CI and squash-merges if green.",
             f"File: {loc}",
             f"Defect: {f.get('summary', '')}",
         ]
@@ -2780,6 +2782,20 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
         verdicts = (r.get("closure") or {}).get("verdicts") or []
         if verdicts:
             body_lines += ["", "Closure verdict: " + json.dumps(verdicts)]
+        # Evidence gathered by the engine, so whoever lands this does not redo the checks.
+        rt = r.get("regression_test") or {}
+        if rt.get("files"):
+            body_lines += ["", "Regression test: " + ", ".join(rt["files"]) + " -- "
+                           + ("FAILS without the fix, so it proves it." if rt.get("fails_on_base")
+                              else "PASSES WITHOUT THE FIX, so it does not prove it (the fix may still be right)."
+                              if rt.get("fails_on_base") is False else (rt.get("detail") or "not checked"))]
+        else:
+            body_lines += ["", "Regression test: none was added. Worth adding one before landing."]
+        if r.get("lint"):
+            body_lines.append(f"Lint (the repo's pre-push ruff): {r['lint']}.")
+        if r.get("impact"):
+            body_lines += ["", "Check before landing (other code that may care about this change):"]
+            body_lines += [f"- {n}" for n in r["impact"]]
         body = "\n".join(body_lines)
         try:
             rc, out = await _kanban_ssh(
@@ -4341,6 +4357,21 @@ async def _archive_merged_tick() -> None:
         await _dh_supersede_inputs(tid, merged[tid])
 
 
+async def _sweep_noop_reviewfix_branches() -> None:
+    """Delete reviewfix/* branches whose merge into master would now change nothing: the fix
+    already landed (by the Land button, by hand, or inside another PR), so the branch is just
+    clutter that outlives its card. Branches checked out in a worktree are skipped by git."""
+    try:
+        await _fleet_ssh(
+            "snarf", f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && git fetch -q origin {DARKHELIX_BASE_BRANCH} && "
+                     f"M=$(git rev-parse origin/{DARKHELIX_BASE_BRANCH}^{{tree}}) && "
+                     "for b in $(git branch --list 'reviewfix/*' | sed 's/[* +]//g'); do "
+                     f"t=$(git merge-tree --write-tree --no-messages origin/{DARKHELIX_BASE_BRANCH} $b 2>/dev/null | head -1); "
+                     "[ \"$t\" = \"$M\" ] && git branch -D $b >/dev/null 2>&1; done; true")
+    except Exception as exc:
+        print(f"[reviewfix-sweep] {exc!r}", flush=True)
+
+
 async def _archive_merged_forever() -> None:
     """Off unless kanban.auto_archive_merged (default on). Polls done cards for a
     merged PR and archives them -- the board's declutter for landed work."""
@@ -4350,6 +4381,7 @@ async def _archive_merged_forever() -> None:
     while True:
         try:
             await _archive_merged_tick()
+            await _sweep_noop_reviewfix_branches()
             _ARCHIVE_MERGED_STATUS["last_error"] = None
         except Exception as exc:
             _ARCHIVE_MERGED_STATUS["last_error"] = str(exc)[:300]
@@ -7526,11 +7558,14 @@ def _dh_land_save_state() -> None:
         pass
 
 
-def _dh_finalize_register(task_id: str, pr_number: str, pr_url: str, authorized: str) -> None:
+def _dh_finalize_register(task_id: str, pr_number: str, pr_url: str, authorized: str,
+                          human_override: bool = False, **extra) -> None:
     """Record that this card's PR is now awaiting CI -> merge, so the reconciler
-    can finish it even if this process dies mid-wait."""
+    can finish it even if this process dies mid-wait. human_override lifts the size cap
+    (an explicit Merge click only); extra carries what the post-merge step needs."""
     _DH_FINALIZE_PENDING[task_id] = {"pr_number": str(pr_number), "pr_url": pr_url,
-                                     "authorized": authorized, "since": time.time()}
+                                     "authorized": authorized, "since": time.time(),
+                                     "human_override": bool(human_override), **extra}
     _dh_land_save_state()
 
 
@@ -7672,10 +7707,15 @@ def _dh_pr_number(pr_url: str) -> str:
     return pr_url.rstrip("/").rsplit("/", 1)[-1]
 
 
-async def _dh_pr_diff_within_cap(pr_number: str, cfg: dict) -> tuple[bool, str]:
+async def _dh_pr_diff_within_cap(pr_number: str, cfg: dict, human: bool = False) -> tuple[bool, str]:
     """A cheap circuit breaker: refuse to auto-merge a diff past a size that
     stops being "small enough to trust unattended" -- autonomous pipeline or
-    not, a human should look at a big change before it reaches master."""
+    not, a human should look at a big change before it reaches master.
+
+    `human` is set ONLY by an explicit Merge click (human_override), never by the unattended
+    paths. That click IS the human looking, so over the cap it proceeds and returns
+    (True, note) instead of refusing; otherwise a merge you had asked for ("left for a
+    human to merge") stalled on the very person who had clicked it (the 2043-line Integrate)."""
     max_files = int(cfg.get("auto_merge_max_files") or 15)
     max_lines = int(cfg.get("auto_merge_max_lines") or 400)
     cmd = (f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
@@ -7693,6 +7733,9 @@ async def _dh_pr_diff_within_cap(pr_number: str, cfg: dict) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"could not parse PR size: {exc}"
     if files > max_files or lines > max_lines:
+        if human:
+            return True, (f"{files} files / {lines} lines is over the autonomous cap "
+                          f"({max_files}/{max_lines}); merging anyway because a human clicked Merge")
         return False, (f"diff too large for autonomous merge ({files} files / "
                        f"{lines} lines, cap is {max_files}/{max_lines}) -- "
                        "left for a human to merge")
@@ -7920,7 +7963,7 @@ async def _dh_finalize_one(task_id: str, info: dict) -> None:
         return
 
     cfg = _dh_land_cfg()
-    size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg)
+    size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg, human=bool(info.get("human_override")))
     if not size_ok:
         _dh_finalize_clear(task_id)
         await _kanban_block(task_id, f"opened {pr_url}, CI passed, but {size_reason}", kind="needs_input")
@@ -7947,6 +7990,7 @@ async def _dh_finalize_one(task_id: str, info: dict) -> None:
         return
 
     _dh_finalize_clear(task_id)
+    await _dh_after_applied_merge(task_id, info)
     await _dh_supersede_siblings(task_id)
     try:
         await asyncio.to_thread(
@@ -7982,7 +8026,8 @@ async def _dh_finalize_forever() -> None:
         await asyncio.sleep(int(_dh_land_cfg().get("finalize_poll_seconds") or 90))
 
 
-async def _darkhelix_autoland_one(task_id: str, skip_review_check: bool = False) -> dict:
+async def _darkhelix_autoland_one(task_id: str, skip_review_check: bool = False,
+                                  human_override: bool = False) -> dict:
     """The whole unattended sequence for one card:
 
         verify -> commit -> push -> PR -> wait for CI -> merge
@@ -8007,12 +8052,13 @@ async def _darkhelix_autoland_one(task_id: str, skip_review_check: bool = False)
         return {"ok": False, "stage": "in-flight", "error": "already landing this card"}
     _DH_LANDING_IN_FLIGHT.add(task_id)
     try:
-        return await _darkhelix_autoland_one_locked(task_id, skip_review_check)
+        return await _darkhelix_autoland_one_locked(task_id, skip_review_check, human_override)
     finally:
         _DH_LANDING_IN_FLIGHT.discard(task_id)
 
 
-async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool = False) -> dict:
+async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool = False,
+                                         human_override: bool = False) -> dict:
     cfg = _dh_land_cfg()
     land = await _darkhelix_land(task_id)
     if not land.get("pr_url"):
@@ -8044,19 +8090,26 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
             return {"ok": False, "stage": elig["stage"].lower(), "pr_url": pr_url,
                     "reason": elig["reason"], "block_result": outcome}
 
-    size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg)
+    size_ok, size_reason = await _dh_pr_diff_within_cap(pr_number, cfg, human=human_override)
     if not size_ok:
         outcome = await _kanban_block(task_id, f"opened {pr_url} but left it for a human: "
                                        f"{size_reason}", kind="needs_input")
         return {"ok": False, "stage": "size-cap", "pr_url": pr_url,
                 "reason": size_reason, "block_result": outcome}
+    if size_reason:   # over the cap, allowed because a human asked: leave the record on the card
+        try:
+            await asyncio.to_thread(
+                _kanban_api_call, "POST", f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+                json={"author": "looking-glass", "body": f"Size note: {size_reason}."})
+        except Exception:
+            pass
 
     # From here the PR is cleared to merge once CI is green. Persist that intent
     # BEFORE the (up to 30m) CI wait, so a HUD restart mid-wait doesn't orphan
     # it -- the finalize reconciler drains _DH_FINALIZE_PENDING across restarts.
     # The in-process wait below is the fast path; the reconciler is the net.
     _dh_finalize_register(task_id, pr_number, pr_url,
-                          "human" if skip_review_check else "auto")
+                          "human" if skip_review_check else "auto", human_override=human_override)
 
     checks_ok, checks_reason = await _dh_wait_for_checks(pr_number, cfg)
     if not checks_ok:
@@ -8071,7 +8124,7 @@ async def _darkhelix_autoland_one_locked(task_id: str, skip_review_check: bool =
     # long enough for another commit (a bot, an accepted suggestion, a human
     # amending the open PR) to push the diff past the cap with nothing
     # having re-checked it since.
-    size_ok2, size_reason2 = await _dh_pr_diff_within_cap(pr_number, cfg)
+    size_ok2, size_reason2 = await _dh_pr_diff_within_cap(pr_number, cfg, human=human_override)
     if not size_ok2:
         _dh_finalize_clear(task_id)
         outcome = await _kanban_block(task_id, f"opened {pr_url}, CI passed, but grew past "
@@ -8222,6 +8275,184 @@ async def kanban_land_darkhelix_status() -> JSONResponse:
     })
 
 
+_APPLIED_LANDING: set = set()
+_APPLIED_BRANCH_RE = re.compile(r"^Branch:\s+(reviewfix/\S+)", re.MULTILINE)
+
+
+def _applied_text(body: str, label: str) -> str:
+    m = re.search(rf"^{re.escape(label)}:\s+(.+)$", body or "", re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _applied_subject(defect: str) -> str:
+    """A commit/PR subject from the finding: its first sentence, at most 72 chars, cut at a
+    word boundary. The engine's own subject was the apply prompt's first line ("Apply the
+    single, minimal fix for ONE already-identified defect..."), which is what ended up in
+    git history until a human rewrote it."""
+    first = re.split(r"(?<=[.!?])\s", defect.strip(), 1)[0].rstrip(".")
+    if len(first) <= 72:
+        return first
+    return first[:72].rsplit(" ", 1)[0].rstrip(",;:-") + "..."
+
+
+async def _applied_card_spec(task_id: str) -> dict:
+    """Validate an [Applied Fix] card and extract what landing needs, or {'error': ...}."""
+    d = await _card_links(task_id)
+    t = d["task"]
+    if not t:
+        return {"error": "card not found"}
+    body = t.get("body") or ""
+    if not (t.get("title") or "").startswith("[Applied Fix]"):
+        return {"error": "not an [Applied Fix] card"}
+    if t.get("status") != "blocked":
+        return {"error": f"card is {t.get('status')}, expected blocked"}
+    m = _APPLIED_BRANCH_RE.search(body)
+    if not m:
+        return {"error": "no reviewfix branch recorded on the card"}
+    defect = _applied_text(body, "Defect")
+    return {"branch": m.group(1), "defect": defect, "subject": _applied_subject(defect or t.get("title", "")),
+            "scenario": _applied_text(body, "Failure scenario"),
+            "regression": _applied_text(body, "Regression test"),
+            "notes": re.findall(r"^- (.+)$", body.split("Check before landing", 1)[1], re.MULTILINE)
+                     if "Check before landing" in body else []}
+
+
+async def _land_applied_fix(task_id: str, spec: dict, open_only: bool = False) -> dict:
+    """Land an [Applied Fix]: its reviewfix branch -> a clean commit on current master -> PR ->
+    CI -> squash-merge. HUD landing keys off hermes/<card-id> branches, so these cards, whose
+    branch is reviewfix/..., had no way to land except by hand. The pre-push hook (full
+    tests + ruff) runs on the push, and the existing finalize reconciler does CI and merge."""
+    branch, repo = spec["branch"], shlex.quote(DARKHELIX_REPO_PATH)
+    land = f"land/{re.sub(r'[^a-z0-9]+', '-', spec['subject'].lower())[:40].strip('-')}-{task_id[2:8]}"
+    wt = f"/ssdpool/agent-work/_land/{task_id}"
+    q = shlex.quote
+
+    async def note(text: str) -> None:
+        try:
+            await asyncio.to_thread(_kanban_api_call, "POST",
+                                    f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+                                    json={"author": "looking-glass", "body": text})
+        except Exception:
+            pass
+
+    async def cleanup() -> None:
+        await _fleet_ssh("snarf", f"cd {repo} && git worktree remove --force {q(wt)} 2>/dev/null; "
+                                  f"git worktree prune; git branch -D {q(land)} >/dev/null 2>&1; true")
+
+    async def fail(stage: str, detail: str) -> dict:
+        await cleanup()
+        await note(f"Land failed at {stage}: {detail[-1200:]}")
+        return {"ok": False, "stage": stage, "error": detail[-1200:]}
+
+    rc, out = await _fleet_ssh(
+        "snarf", f"cd {repo} && git fetch -q origin {DARKHELIX_BASE_BRANCH} && "
+                 f"git rev-parse --verify -q {q(branch)} >/dev/null && echo HAVE || echo GONE")
+    if "HAVE" not in (out or ""):
+        return await fail("branch", f"{branch} no longer exists; the change may already be on {DARKHELIX_BASE_BRANCH}")
+    # Already in master? Then there is nothing to land.
+    rc, out = await _fleet_ssh(
+        "snarf", f"cd {repo} && [ \"$(git merge-tree --write-tree --no-messages origin/{DARKHELIX_BASE_BRANCH} {q(branch)} "
+                 f"2>/dev/null | head -1)\" = \"$(git rev-parse origin/{DARKHELIX_BASE_BRANCH}^{{tree}})\" ] && echo SAME || echo DIFF")
+    if "SAME" in (out or ""):
+        await note(f"Nothing to land: merging {branch} would change nothing, it is already on {DARKHELIX_BASE_BRANCH}.")
+        await _kanban_ssh(f"hermes kanban archive {q(task_id)}")
+        return {"ok": True, "stage": "already-landed"}
+
+    msg_parts = [spec["subject"]]
+    if spec["defect"] and spec["defect"].rstrip(".") != spec["subject"].rstrip("."):
+        msg_parts += ["", spec["defect"]]   # only when the subject is not already the whole defect
+    if spec["scenario"]:
+        msg_parts += ["", "Failure scenario: " + spec["scenario"]]
+    if spec["regression"]:
+        msg_parts += ["", "Regression test: " + spec["regression"]]
+    if spec["notes"]:
+        msg_parts += ["", "Downstream (flagged by the impact scan):"] + [f"- {n}" for n in spec["notes"]]
+    msg_parts += ["", f"Found by the automated reviewer, applied after the engine test gate and closure review, "
+                      f"landed from the Looking Glass board (card {task_id})."]
+    message = "\n".join(msg_parts)
+
+    steps = [
+        ("worktree", f"mkdir -p /ssdpool/agent-work/_land && cd {repo} && git worktree add -q -b {q(land)} {q(wt)} origin/{DARKHELIX_BASE_BRANCH}"),
+        ("cherry-pick", f"cd {q(wt)} && git cherry-pick $(git rev-list --reverse $(git merge-base origin/{DARKHELIX_BASE_BRANCH} {q(branch)})..{q(branch)}) 2>&1"),
+        ("commit", f"cd {q(wt)} && git reset -q --soft origin/{DARKHELIX_BASE_BRANCH} && printf %s {q(message)} | git commit -q -F - 2>&1"),
+        ("push", f"cd {q(wt)} && git push -q -u origin {q(land)} 2>&1"),
+    ]
+    for stage, cmd in steps:
+        rc, out = await _fleet_ssh("snarf", cmd)
+        if rc != 0:
+            if stage == "cherry-pick":
+                await _fleet_ssh("snarf", f"cd {q(wt)} && git cherry-pick --abort 2>/dev/null; true")
+                return await fail(stage, "does not apply cleanly onto current master (it conflicts): " + (out or ""))
+            return await fail(stage, out or f"{stage} failed")
+    pr_body = message.split("\n", 2)[2] if message.count("\n") >= 2 else message
+    rc, out = await _fleet_ssh(
+        "snarf", f"cd {q(wt)} && printf %s {q(pr_body)} | gh pr create --base {DARKHELIX_BASE_BRANCH} "
+                 f"--head {q(land)} --title {q(spec['subject'])} --body-file - 2>&1")
+    m = re.search(r"https://github.com/\S+/pull/(\d+)", out or "")
+    if rc != 0 or not m:
+        return await fail("pr", out or "gh pr create failed")
+    pr_url, pr_number = m.group(0), m.group(1)
+    await cleanup()
+    if open_only:
+        await note(f"Opened {pr_url} (open_only: not registered for merge).")
+        return {"ok": True, "stage": "opened", "pr_url": pr_url, "pr_number": pr_number}
+    _dh_finalize_register(task_id, pr_number, pr_url, "human", human_override=True,
+                          applied_branch=branch)
+    await note(f"Landing: {pr_url} opened. Waiting for CI, then it squash-merges if green.")
+    return {"ok": True, "stage": "landing", "pr_url": pr_url, "pr_number": pr_number}
+
+
+async def _dh_after_applied_merge(task_id: str, info: dict) -> None:
+    """After an [Applied Fix] PR merges: retire the card and drop the reviewer's attempt
+    branch (only if merging it would now change nothing). Best-effort."""
+    branch = info.get("applied_branch")
+    if not branch:
+        return
+    try:
+        await asyncio.to_thread(
+            _kanban_api_call, "POST", f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+            json={"author": "looking-glass", "body": f"Landed as #{info.get('pr_number')} (squash). "
+                                                     "The reviewer's attempt branch is removed."})
+        await _kanban_ssh(f"hermes kanban archive {shlex.quote(task_id)}")
+        await _fleet_ssh(
+            "snarf", f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && git fetch -q origin {DARKHELIX_BASE_BRANCH} && "
+                     f"[ \"$(git merge-tree --write-tree --no-messages origin/{DARKHELIX_BASE_BRANCH} {shlex.quote(branch)} "
+                     f"2>/dev/null | head -1)\" = \"$(git rev-parse origin/{DARKHELIX_BASE_BRANCH}^{{tree}})\" ] "
+                     f"&& git branch -D {shlex.quote(branch)}; true")
+    except Exception as exc:
+        print(f"[applied-merge] {task_id}: {exc!r}", flush=True)
+
+
+@app.post("/api/darkhelix/land-applied")
+async def darkhelix_land_applied(request: Request) -> JSONResponse:
+    """The Land button on an [Applied Fix] card. Validates now, lands in the background (the
+    push runs the full test suite and CI can take minutes). `open_only` stops after the PR is
+    opened, without registering it for merge."""
+    payload = await request.json()
+    task_id = (payload.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    if task_id in _APPLIED_LANDING:
+        return JSONResponse({"ok": False, "error": "already landing this card"}, status_code=409)
+    spec = await _applied_card_spec(task_id)
+    if spec.get("error"):
+        return JSONResponse({"ok": False, "error": spec["error"]}, status_code=409)
+    open_only = bool(payload.get("open_only"))
+
+    async def _run() -> None:
+        _APPLIED_LANDING.add(task_id)
+        try:
+            await _land_applied_fix(task_id, spec, open_only=open_only)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[land-applied] {task_id}: {exc!r}", flush=True)
+        finally:
+            _APPLIED_LANDING.discard(task_id)
+    task = asyncio.get_running_loop().create_task(_run())
+    _REVIEW_JOBS.add(task)
+    task.add_done_callback(_REVIEW_JOBS.discard)
+    return JSONResponse({"ok": True, "started": True, "task_id": task_id, "branch": spec["branch"]})
+
+
 @app.post("/api/darkhelix/land-auto")
 async def darkhelix_land_auto(request: Request) -> JSONResponse:
     """The manual trigger: land THIS card the same way the background poller
@@ -8237,6 +8468,9 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
     if task_id in _DH_LANDING_IN_FLIGHT:
         return JSONResponse({"ok": False, "error": "already landing this card"}, status_code=409)
     skip_review_check = bool(payload.get("skip_review_check"))
+    # Sent only by the Merge button: the click is the human looking at a big diff.
+    # Never inferred from skip_review_check, which the unattended auto-land also uses.
+    human_override = bool(payload.get("human_override"))
     try:
         elig = await _dh_merge_eligibility(task_id, require_fresh=False)
     except _DhOutage as exc:
@@ -8254,7 +8488,8 @@ async def darkhelix_land_auto(request: Request) -> JSONResponse:
             # re-checks review currency internally too (freshness, not just
             # presence), and without this the human's explicit skip request
             # here would be silently overridden by that internal check.
-            result = await _darkhelix_autoland_one(task_id, skip_review_check=skip_review_check)
+            result = await _darkhelix_autoland_one(task_id, skip_review_check=skip_review_check,
+                                                   human_override=human_override)
             if result.get("ok"):
                 _DH_LAND_STATUS["landed"] += 1
             _dh_land_record({"task_id": task_id,
