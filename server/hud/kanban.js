@@ -533,7 +533,12 @@ function kbCardInner(t, opts){
        <button class="btn kb-card-btn" data-action="dismiss" data-id="${kanbanEsc(t.id)}"
          title="Dismiss this finding without working it — archives the card. Use for a false positive or a won't-fix.">Dismiss</button>`
     : t.status === "blocked"
-    ? `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>`
+    // Unblock retries the work. A blocked card can also be waiting on a DECISION (a
+    // [Decision] card) or on land-or-discard ([Applied Fix]); for those there was no way
+    // to say "no", so the card could only be unblocked into work nobody wanted.
+    ? `<button class="btn kb-card-btn" data-action="unblock" data-id="${kanbanEsc(t.id)}">Unblock</button>
+       <button class="btn kb-card-btn" data-action="dismiss" data-id="${kanbanEsc(t.id)}"
+         title="Dismiss this card without working it: archives it. Use for a decision you have answered, or a fix you are discarding (its branch is kept).">Dismiss</button>`
     : t.status === "done"
       // One source of truth for the done-card lifecycle: kbCardStage decides the
       // single primary action + chips (Merge / Fix / Submit / Process /
