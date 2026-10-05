@@ -2800,7 +2800,8 @@ async def _file_applied_fix_cards(target_file: str, model: str, review_task_id: 
 
 async def _file_unresolved_fix_card(response: dict, target_file: str, model: str,
                                     review_task_id: str, unresolved_findings: list,
-                                    applied_count: int, attempts: list | None = None) -> None:
+                                    applied_count: int, attempts: list | None = None,
+                                    gated: bool = False) -> None:
     """File ONE dispatchable [Fix] kanban card for the findings the apply stage
     did not resolve, parented to the review card. Mutates `response` with
     chained/chained_task or chain_error. No-op if there is nothing unresolved."""
@@ -2850,7 +2851,11 @@ async def _file_unresolved_fix_card(response: dict, target_file: str, model: str
         f"--idempotency-key {shlex.quote(_submission_key(fix_title, fix_body))} "
         f"--assignee {shlex.quote(_darkhelix_assignee())} "
         f"--parent {shlex.quote(review_task_id)} "
-        "--created-by looking-glass --json"
+        # gated: parked in triage, where the board offers Approve / Dismiss, because an
+        # editor run on the unresolved findings costs GPU time and nobody asked for it.
+        # An explicit chain:true request stays ungated ("runs unsupervised once filed").
+        + ("--triage " if gated else "")
+        + "--created-by looking-glass --json"
     )
     try:
         rc3, out3 = await _kanban_ssh(fix_cmd)
@@ -2980,7 +2985,7 @@ async def _finalize_apply(tracker_id, review_task_id, target_file, model,
     fix_resp: dict = {}
     if unresolved:
         await _file_unresolved_fix_card(fix_resp, target_file, model, review_task_id,
-                                        unresolved, len(keep), part["attempts"])
+                                        unresolved, len(keep), part["attempts"], gated=True)
 
     n_unv = sum(1 for k in keep if k["result"].get("outcome") == "unverified")
     if tracker_id:
@@ -2988,6 +2993,40 @@ async def _finalize_apply(tracker_id, review_task_id, target_file, model,
                    f"({len(kept_cards)} [Applied Fix] card(s)), {len(unresolved)} -> [Fix].")
         await _tracker_note(tracker_id, summary)
         await _sweep_tracker_close(tracker_id)
+
+
+async def _file_review_record(title: str, body: str, summary: str) -> str | None:
+    """File a [Review] card that is already DONE, and return its id (None on failure).
+
+    A review that has run is a REPORT. Filing it in triage made it a pending work item:
+    the board offers Approve there, which sends a worker to implement findings the apply
+    stage had already handled, and a [Fix] child of a triage parent sat dormant until
+    someone approved. The board only reaches done through running (a direct
+    triage->done is refused, 409), so: create, claim, complete in ONE command, with the
+    card id printed as soon as it exists so a half-finished sequence can be cleaned up."""
+    cmd = (
+        "id=$(hermes kanban create "
+        f"{shlex.quote(title[:200])} --body {shlex.quote(body)} "
+        "--workspace scratch --initial-status running --created-by looking-glass --json "
+        "| /usr/local/lib/hermes-agent/venv/bin/python3 -c "
+        "'import sys,json;print(json.load(sys.stdin)[\"id\"])') "
+        "&& echo \"ID:$id\" "
+        "&& hermes kanban claim \"$id\" --ttl 300 >/dev/null "
+        f"&& hermes kanban complete \"$id\" --summary {shlex.quote(summary)} >/dev/null "
+        "&& echo OK"
+    )
+    rc, out = await _kanban_ssh(cmd)
+    m = re.search(r"^ID:(t_[0-9a-f]{6,})$", out or "", re.MULTILINE)
+    cid = m.group(1) if m else None
+    if rc == 0 and cid and "OK" in (out or ""):
+        return cid
+    if cid:   # created but not finished: do not leave a stray ready/running card behind
+        try:
+            await _kanban_ssh(f"hermes kanban reclaim {shlex.quote(cid)} >/dev/null 2>&1; "
+                              f"hermes kanban archive {shlex.quote(cid)} >/dev/null 2>&1")
+        except Exception:
+            pass
+    return None
 
 
 async def _run_review(target_file: str, task_description: str, chain: bool,
@@ -3052,28 +3091,48 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
                            else f"{len(findings)} finding(s); filing the review card"))
 
     title = f"[Review] {target_file}"
+    # Apply ON: the review is a finished REPORT, and what happened to each finding lives on
+    # the cards filed under it. Apply OFF: the original behaviour, a proposal in triage
+    # that a human approves (nothing else will act on it).
+    as_record = apply_on
     body = (
-        f"Automated review by {model} (reviewer role) -- a proposal, not a "
-        f"verified finding. Read it and decide; nothing has been changed.\n\n"
-        f"{review_text}"
+        (f"Automated review by {model} (reviewer role). This card is the report; the "
+         f"cards filed under it show what happened to each finding.\n\n" if as_record else
+         f"Automated review by {model} (reviewer role) -- a proposal, not a "
+         f"verified finding. Read it and decide; nothing has been changed.\n\n")
+        + f"{review_text}"
     )
     if findings:
         body += ("\n\n```json:review-findings\n"
                  + json.dumps({"target_file": target_file, "findings": findings}, indent=2)
                  + "\n```")
-    try:
-        rc2, out2 = await _kanban_ssh(
-            "hermes kanban create "
-            f"{shlex.quote(title[:200])} --body {shlex.quote(body)} "
-            "--workspace scratch --triage --created-by looking-glass --json")
-    except Exception as exc:
-        return {"ok": False, "error": str(exc), "review_text": review_text}, 502
-    if rc2 != 0:
-        return {"ok": False, "error": out2[-2000:], "review_text": review_text}, 502
-    try:
-        task_data = json.loads(out2.strip())
-    except json.JSONDecodeError:
-        return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
+    task_data = None
+    if as_record:
+        try:
+            rid = await _file_review_record(
+                title, body,
+                "Review finished: " + ("no issues found." if no_issues_found or not findings
+                                       else f"{len(findings)} finding(s); handled by the apply stage, "
+                                            "see the cards filed under this one."))
+        except Exception as exc:
+            print(f"[review-record] {exc!r}", flush=True)
+            rid = None
+        if rid:
+            task_data = {"id": rid}
+    if task_data is None:   # apply off, or the record could not be filed: the legacy triage card
+        try:
+            rc2, out2 = await _kanban_ssh(
+                "hermes kanban create "
+                f"{shlex.quote(title[:200])} --body {shlex.quote(body)} "
+                "--workspace scratch --triage --created-by looking-glass --json")
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "review_text": review_text}, 502
+        if rc2 != 0:
+            return {"ok": False, "error": out2[-2000:], "review_text": review_text}, 502
+        try:
+            task_data = json.loads(out2.strip())
+        except json.JSONDecodeError:
+            return {"ok": False, "error": f"unparseable kanban output: {out2[-500:]}", "review_text": review_text}, 502
 
     review_task_id = str(task_data.get("id") or task_data.get("task_id") or "")
     review_id_ok = bool(_TASK_ID_RE.match(review_task_id))
@@ -3090,7 +3149,8 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
             result_path, progress_path = await _launch_detached_apply(target_file, model, findings)
         except Exception as exc:  # launch failed -> fall back so nothing is lost
             response["apply_error"] = f"could not launch apply: {exc}"
-            await _file_unresolved_fix_card(response, target_file, model, review_task_id, findings, 0)
+            await _file_unresolved_fix_card(response, target_file, model, review_task_id, findings, 0,
+                                            gated=True)
             return response, 200
         await _tracker_note(tracker_id, f"apply launched (detached) over {len(findings)} "
                                         f"finding(s); progress follows")
