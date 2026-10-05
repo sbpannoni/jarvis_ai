@@ -4336,7 +4336,9 @@ async def _archive_merged_tick() -> None:
                               f"{shlex.quote(f'auto-archived: PR #{merged[tid]} merged')}")
             _ARCHIVE_MERGED_STATUS["archived"] += 1
         except Exception:
-            pass
+            continue
+        # The inputs it absorbed go with it (also covers a merge done by hand).
+        await _dh_supersede_inputs(tid, merged[tid])
 
 
 async def _archive_merged_forever() -> None:
@@ -7811,6 +7813,43 @@ async def _dh_checks_status(pr_number: str) -> tuple[str, str]:
     if checks and not (buckets & {"pending", ""}):
         return "green", f"{len(checks)} check(s) green"
     return "pending", "checks still running"
+
+
+async def _dh_supersede_inputs(task_id: str, pr_number) -> None:
+    """After a card's PR merges, retire the INPUTS it absorbed: parents whose branch is an
+    ANCESTOR of the landed card's branch, so everything they did is part of what landed.
+    An [Integrate] lands its sources, a fix lands the root it was cut from. Without this
+    the sources sat in `done` offering their own Merge (and their PRs stayed open) after
+    the work was already in master. Ancestry, not file comparison: a squash merge keeps no
+    history, and the landed card usually edited the same files further. Runs for ANY merge,
+    including one done by hand, because it hangs off the merged-PR poll. Parents whose
+    branch is not an ancestor (competing versions) are left alone. Best-effort."""
+    try:
+        me = await _card_links(task_id)
+        mine = _dh_branch(task_id)
+        for p in await _linked_cards(me["parents"][:12]):
+            if p["status"] != "done":
+                continue
+            theirs = _dh_branch(p["id"])
+            rc, out = await _fleet_ssh(
+                "snarf",
+                f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && "
+                f"git rev-parse --verify -q {shlex.quote(theirs)} >/dev/null && "
+                f"git rev-parse --verify -q {shlex.quote(mine)} >/dev/null && "
+                f"git merge-base --is-ancestor {shlex.quote(theirs)} {shlex.quote(mine)} "
+                "&& echo ANCESTOR || echo NO")
+            if "ANCESTOR" not in (out or ""):
+                continue
+            await asyncio.to_thread(
+                _kanban_api_call, "POST", f"/api/plugins/kanban/tasks/{quote(p['id'])}/comments",
+                json={"author": "looking-glass",
+                      "body": f"Superseded: this branch is an ancestor of the branch that landed as "
+                              f"#{pr_number} ({task_id}), so everything it did is in "
+                              f"{DARKHELIX_BASE_BRANCH}."})
+            await _kanban_ssh(f"hermes kanban archive {shlex.quote(p['id'])}")
+            print(f"[supersede] {p['id']} archived: ancestor of #{pr_number} ({task_id})", flush=True)
+    except Exception as exc:  # never let cleanup disturb the archive loop
+        print(f"[supersede-inputs] {task_id}: {exc!r}", flush=True)
 
 
 async def _dh_supersede_siblings(task_id: str) -> None:
