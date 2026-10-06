@@ -177,6 +177,27 @@ function kbRunningMinutes(task){
    It changes presentation only — Reclaim is offered on every running card. */
 const KB_STUCK_MINUTES = 30;
 
+/* Dismiss, optionally REMEMBERED. A reason makes the finding "known and accepted": future
+   reviews are told to leave it out (and a backstop drops a re-report), so a decision you have made is
+   not re-found, re-applied and re-reviewed every sweep. Blank = just archive. Cancel = nothing. */
+async function kbDismiss(panel, btn){
+  const reason = prompt("Dismiss this card.\n\nTo ALSO stop future reviews re-reporting this finding, give a short reason (e.g. \"placeholder, nothing reads it\"). Leave it blank to just archive.", "");
+  if(reason === null) return;
+  btn.disabled = true;
+  btn.textContent = "Dismissing…";
+  try{
+    const r = await fetch("/api/kanban/archive", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id, remember_reason: reason.trim()}),
+    });
+    const j = await r.json();
+    if(!j.ok){ btn.disabled = false; btn.textContent = "Dismiss failed — retry"; return; }
+    if(j.asked_to_remember && !(j.remembered || []).length)
+      alert("Dismissed, but nothing was remembered: this card has no structured finding to record (it has no findings block or Defect/File lines).");
+    refreshKanbanPanel(panel);
+  }catch(err){ btn.disabled = false; btn.textContent = "Dismiss failed — retry"; }
+}
+
 async function kanbanCardAction(panel, endpoint, verb, id, btn){
   btn.disabled = true;
   btn.textContent = verb + "ing…";
@@ -1499,6 +1520,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "request-review"){ kbRequestReview(panel, btn); return; }
         if(btn.dataset.action === "fix-review"){ kbFixReview(panel, btn); return; }
         if(btn.dataset.action === "capture-research"){ kbCaptureResearch(panel, btn); return; }
+        if(btn.dataset.action === "dismiss"){ kbDismiss(panel, btn); return; }
         const act = KB_CARD_ACTIONS[btn.dataset.action];
         if(act) kanbanCardAction(panel, act.endpoint, act.verb, btn.dataset.id, btn);
         return;

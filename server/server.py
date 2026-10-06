@@ -3103,7 +3103,11 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
     review_text = result.get("review_text") or ""
     findings = result.get("findings") or []
     no_issues_found = bool(result.get("no_issues_found"))
+    suppressed = result.get("suppressed") or []   # matched a dismissed-with-reason finding
     apply_on = _review_apply_enabled()
+    if suppressed:
+        await _tracker_note(tracker_id, f"{len(suppressed)} finding(s) matched a known-accepted decision and were "
+                                        "not re-reported (listed on the review card)")
 
     await _tracker_note(tracker_id, "review complete — "
                         + ("no issues found" if no_issues_found or not findings
@@ -3121,6 +3125,12 @@ async def _run_review(target_file: str, task_description: str, chain: bool,
          f"verified finding. Read it and decide; nothing has been changed.\n\n")
         + f"{review_text}"
     )
+    if suppressed:
+        body += ("\n\nNot re-reported (a maintainer already examined and accepted these; remove an entry "
+                 "with POST /api/accepted-findings/remove to let reviews report it again):\n"
+                 + "\n".join(f"- {x.get('summary', '')[:160]} [{x.get('entry')}"
+                              f"{', card ' + x['card'] if x.get('card') else ''}"
+                              f"{', reason: ' + x['reason'][:120] if x.get('reason') else ''}]" for x in suppressed))
     if findings:
         body += ("\n\n```json:review-findings\n"
                  + json.dumps({"target_file": target_file, "findings": findings}, indent=2)
@@ -5127,6 +5137,83 @@ async def kanban_comment(task_id: str, request: Request) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+ACCEPTED_FINDINGS_PY = "/ssdpool/coder-engine/pipeline/accepted_findings.py"
+
+
+def _findings_from_card(task: dict) -> list[dict]:
+    """The findings a card is about, as [{file, summary}], so dismissing it can be remembered.
+    A review/fix card carries a ```json:review-findings block; an [Applied Fix] carries Defect:
+    and File: lines. A card with neither (a hand-made one) yields [] and nothing is remembered."""
+    body = task.get("body") or ""
+    out: list[dict] = []
+    m = _FENCED_FINDINGS_RE.search(body)
+    if m:
+        try:
+            blob = json.loads(m.group(1))
+            for f in blob.get("findings") or []:
+                summary = (f.get("summary") or "").strip()
+                file = (f.get("file") or blob.get("target_file") or "").strip()
+                if summary and file:
+                    out.append({"file": file, "summary": summary})
+        except ValueError:
+            pass
+    if not out:
+        defect = _applied_text(body, "Defect")
+        file = re.sub(r":\d+$", "", _applied_text(body, "File"))
+        if defect and file:
+            out.append({"file": file, "summary": defect})
+    return out
+
+
+async def _remember_findings(entries: list[dict], reason: str, card: str) -> list[str]:
+    """Write accepted findings to the ledger the reviewer reads (on snarf, via the engine's own
+    module so the matching terms are computed in exactly one place). Returns the entry ids."""
+    ids: list[str] = []
+    for e in entries:
+        rc, out = await _fleet_ssh(
+            "snarf", f"{CODER_ENGINE_VENV_PY} {ACCEPTED_FINDINGS_PY} add --file {shlex.quote(e['file'])} "
+                     f"--summary {shlex.quote(e['summary'])} --reason {shlex.quote(reason)} --card {shlex.quote(card)}")
+        j = _extract_json(out) if rc == 0 else None
+        if j and j.get("id"):
+            ids.append(j["id"])
+    return ids
+
+
+async def _ledger_ids_for_card(card: str) -> list[str]:
+    """Entries already recorded against this card (a decision recorded by hand, e.g. a [Decision]
+    card, which has no structured finding to parse)."""
+    try:
+        rc, out = await _fleet_ssh("snarf", f"{CODER_ENGINE_VENV_PY} {ACCEPTED_FINDINGS_PY} list")
+        return [e["id"] for e in (json.loads(out[out.index("["):]) if rc == 0 and "[" in out else [])
+                if e.get("card") == card]
+    except Exception:
+        return []
+
+
+@app.get("/api/accepted-findings")
+async def accepted_findings_list(request: Request) -> JSONResponse:
+    """What reviews have been told to leave alone: [{id, file, summary, reason, card, ts}]."""
+    f = (request.query_params.get("file") or "").strip()
+    cmd = f"{CODER_ENGINE_VENV_PY} {ACCEPTED_FINDINGS_PY} list" + (f" --file {shlex.quote(f)}" if f else "")
+    try:
+        rc, out = await _fleet_ssh("snarf", cmd)
+        entries = json.loads(out[out.index("["):]) if rc == 0 and "[" in out else []
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+    return JSONResponse({"ok": True, "entries": [{k: e.get(k) for k in ("id", "file", "summary", "reason", "card", "ts")}
+                                                 for e in entries]})
+
+
+@app.post("/api/accepted-findings/remove")
+async def accepted_findings_remove(request: Request) -> JSONResponse:
+    """Forget an accepted finding, so reviews may report it again."""
+    eid = ((await request.json()).get("id") or "").strip()
+    if not re.match(r"^af_[0-9a-f]{8}$", eid):
+        return JSONResponse({"ok": False, "error": "bad id"}, status_code=400)
+    rc, out = await _fleet_ssh("snarf", f"{CODER_ENGINE_VENV_PY} {ACCEPTED_FINDINGS_PY} remove {shlex.quote(eid)}")
+    return JSONResponse({"ok": rc == 0, "removed": rc == 0})
+
+
 @app.post("/api/kanban/archive")
 async def kanban_archive(request: Request) -> JSONResponse:
     """The review-then-deemphasize mechanism for a done card: archives it
@@ -5138,13 +5225,27 @@ async def kanban_archive(request: Request) -> JSONResponse:
     task_id = (payload.get("task_id") or "").strip()
     if not _TASK_ID_RE.match(task_id):
         return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    # Dismissing WITH a reason also tells future reviews not to report this finding again.
+    # Done BEFORE the archive so the card can still be read; a failure here never blocks the dismiss.
+    remembered: list[str] = []
+    reason = (payload.get("remember_reason") or "").strip()
+    if reason:
+        try:
+            entries = _findings_from_card((await _card_links(task_id))["task"])
+            remembered = (await _remember_findings(entries, reason, task_id)
+                          or await _ledger_ids_for_card(task_id))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[remember] {task_id}: {exc!r}", flush=True)
     try:
         rc, out = await _kanban_ssh(f"hermes kanban archive {shlex.quote(task_id)}")
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
     if rc != 0:
         return JSONResponse({"ok": False, "error": out[-1000:]}, status_code=502)
-    return JSONResponse({"ok": True})
+    if remembered:
+        await _kanban_ssh(f"hermes kanban comment {shlex.quote(task_id)} " + shlex.quote(
+            f"Remembered: future reviews will not re-report this finding ({', '.join(remembered)}). Reason: {reason[:300]}"))
+    return JSONResponse({"ok": True, "remembered": remembered, "asked_to_remember": bool(reason)})
 
 
 @app.post("/api/kanban/unarchive")
