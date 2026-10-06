@@ -148,6 +148,14 @@ def _advance_card_branch(task_id: str, worktree: str, attempt_branch: str):
         return False, f"{attempt_branch} is not a fast-forward of {card}"
     head = _ssh(f"cd {q(worktree)} && git rev-parse --abbrev-ref HEAD", timeout=60)
     if (head.stdout or "").strip() == card:
+        # Discard leftover tracked/staged edits first. Earlier failed attempts and
+        # worker edits leave the index dirty, and `merge --ff-only` then aborts
+        # ("local changes would be overwritten") -- t_dc481f50, 2026-10-06: work
+        # stranded on -engine-3 while the card went `done`. The attempt branch is
+        # authoritative, so nothing in the tracked tree is worth keeping. No
+        # `git clean`: the worktree's untracked symlinks (database/, bin/, ...) are
+        # load-bearing.
+        _ssh(f"cd {q(worktree)} && git reset --hard -q", timeout=60)
         r = _ssh(f"cd {q(worktree)} && git merge --ff-only {q(attempt_branch)} 2>&1", timeout=120)
     else:
         r = _ssh(f"cd {q(worktree)} && git branch -f {q(card)} {q(attempt_branch)} 2>&1", timeout=60)
@@ -317,6 +325,16 @@ def handle_dispatch_to_engine(args: Dict[str, Any], **_kw) -> str:
     # fast-forward something moved underneath us and the right answer is to
     # say so, not to merge.
     card_branch_advanced, ff_detail = _advance_card_branch(task_id, worktree, branch)
+    if not card_branch_advanced:
+        # Do NOT complete the card: `done` with the work stranded on an attempt
+        # branch is silent loss -- children are cut from the card branch and would
+        # inherit nothing.
+        return _err(
+            f"engine attempt {n} passed its gate on {branch}, but the card branch "
+            f"hermes/{task_id} could not be advanced to it: {ff_detail}. The card has "
+            "NOT been completed. Call promote_attempt for this attempt; if that also "
+            "fails, block the card with the error text.",
+            engine_status="done_unpromoted", attempt=n, branch=branch)
 
     # The commit this attempt actually produced. Used to NAME the patch, so an
     # artifact can never misrepresent which code it is.
