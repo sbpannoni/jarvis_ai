@@ -3,10 +3,10 @@
    One-click work submission: pick a real DARKHELIX work item (a GitHub
    issue since 2026-09-27; TODO.md is generated from them), add
    optional instructions, submit -- files a real kanban card via
-   /api/kanban/create, always to --triage (Hermes's specifier still fleshes
-   it out and decomposes it before anything executes; see server.py's
-   module note on /api/kanban/create for why this is a deliberate,
-   reviewed choice, not a default left unconsidered).
+   /api/kanban/create, always to --triage. auto_decompose is OFF on
+   hermes, so the card WAITS there as one atomic card until you click
+   Approve on the board (triage -> ready, title and body untouched); nothing
+   fans it out or rewrites it first. See server.py's triage review gate.
 
    TWO PANES, one scroller each. The old single column stacked a picker, the
    selected item, a notes box, a button and three submission groups down a
@@ -41,16 +41,16 @@
    /api/kanban/create's --idempotency-key): filing the same item twice
    returns the card already on the board instead of a second copy.
 
-   TWO SHAPES, one picker. `single card` files to triage and lets Hermes's
-   auto-decomposer build the chain -- one card in, an ordered graph out.
+   TWO SHAPES, one picker. `single card` files to triage and waits for your
+   Approve -- one card in, one card worked.
    `swarm` names the workers itself: N parallel angles on the same goal, a
    verifier that waits on all of them, a synthesizer that waits on the
    verifier. The swarm shape was proven by hand over ssh on 2026-09-02 and
    then had no button, so recreating it meant composing the CLI invocation
    from memory; this is that run, as a form.
 
-   The difference that matters at the button: a triage card QUEUES (the
-   specifier still has to flesh it out), a swarm DISPATCHES -- its workers
+   The difference that matters at the button: a triage card QUEUES (it waits for your
+   Approve), a swarm DISPATCHES -- its workers
    are created `ready`. Same dedup key for both, so an item filed either way
    shows as filed and cannot quietly be opened twice.
 ================================================================= */
@@ -912,7 +912,7 @@ function openSubmitWork(){
           <div class="sw-bar">FILE AS
             <span class="sw-mode">
               <button class="sw-mode-btn on" type="button" data-mode="single"
-                title="One card to triage. Hermes's specifier fleshes it out and the auto-decomposer builds an ordered chain from it.">single card → triage</button>
+                title="One card to triage, worked as a single card. It waits there until you Approve it on the board; auto-decompose is off, so nothing splits or rewrites it.">single card → triage</button>
               <button class="sw-mode-btn" type="button" data-mode="swarm"
                 title="Parallel workers on one goal, then a verifier, then a synthesizer. Skips triage — the workers are filed ready and dispatch on the next tick.">swarm → fan out</button>
             </span>

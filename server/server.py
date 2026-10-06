@@ -5283,13 +5283,13 @@ async def kanban_unarchive(request: Request) -> JSONResponse:
 # to read TODO.md) and a write instead of a read (hermes kanban create).
 #
 # Deliberate safety choice, reviewed with Sam before building: every card
-# created here files to --triage, never straight to ready/running. Hermes's
-# own specifier still has to flesh out and decompose it before anything
-# executes -- single-click submission, not single-click unattended dispatch.
+# created here files to --triage, never straight to ready/running. With
+# kanban.auto_decompose OFF (the current setting) it then waits for a human
+# Approve on the board -- single-click submission, not single-click dispatch.
 #
-# No `hermes project` is registered for DARKHELIX yet (confirmed live,
-# `hermes project list` -> "No projects yet"), so this anchors the task
-# directly via --workspace worktree:<path> rather than --project.
+# Workspace: `--workspace scratch`; the dispatch-target block in the body
+# names the real worktree on snarf (see /api/kanban/create). The `darkhelix`
+# hermes project exists now but this path does not use --project.
 
 DARKHELIX_TODO_PATH = "/ssdpool/DARKHELIX/TODO.md"
 DARKHELIX_REPO_PATH = "/ssdpool/DARKHELIX"
