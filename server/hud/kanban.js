@@ -95,6 +95,7 @@ let kbEdges = [];
    state the board shows so a running/finished review is visible, not silent. */
 let kbReviews = {};
 let kbReviewing = [];
+let kbReviewingAge = {};   // card id -> seconds its review has been running (a stuck one shows)
 /* card_ids that have an in-flight [Fix] child (a fix was dispatched for their
    review changes and hasn't finished). Drives the FIXING stage so a flagged
    card reads "↻ fixing…" after you click Fix, instead of reverting to the Fix
@@ -878,7 +879,10 @@ function renderKanban(panel, board, err){
         const merging = list.filter(t => (kbPrs[t.id] || {}).state === "OPEN"
           && (kbLanding.indexOf(t.id) !== -1 || kbFinalizing.indexOf(t.id) !== -1)).length;
         const bits = [];
-        if(kbReviewing.length) bits.push(kbReviewing.length + " assessing");
+        if(kbReviewing.length){
+          const oldest = Math.max(0, ...kbReviewing.map(id => kbReviewingAge[id] || 0));
+          bits.push(kbReviewing.length + " assessing" + (oldest >= 60 ? " (oldest " + Math.round(oldest / 60) + "m)" : ""));
+        }
         if(merging) bits.push(merging + " merging");
         if(bits.length){ actEl.hidden = false; actEl.textContent = "⟳ " + bits.join(" · ");
           actEl.title = "Background processes on done cards — not kanban workers, so they don't show in the running lane"; }
@@ -1164,7 +1168,7 @@ function kbAutoReview(id){
   kbAutoReviewInflight.push(id);
   fetch("/api/darkhelix/request-review", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({task_id: id}),
+    body: JSON.stringify({task_id: id, auto: true}),   // auto: the server pauses a card whose reviews keep failing
   }).then(r => r.json()).then(j => {
     // The server owns the 'reviewing' state (kbReviewing, refreshed from
     // /api/kanban/links); nudge it locally so the chip shows until the next poll.
@@ -1225,7 +1229,7 @@ async function kbActivityPoll(){
     ]);
     let tasks = [];
     if(tr && tr.ok){ try{ tasks = (await tr.json()).tasks || []; }catch{ /* keep */ } }
-    if(lr && lr.ok){ try{ const lj = await lr.json(); kbReviewing = lj.reviewing || kbReviewing; kbReviews = lj.reviews || kbReviews; }catch{ /* keep */ } }
+    if(lr && lr.ok){ try{ const lj = await lr.json(); kbReviewing = lj.reviewing || kbReviewing; kbReviewingAge = lj.reviewing_age || {}; kbReviews = lj.reviews || kbReviews; }catch{ /* keep */ } }
     kbTrackActivity(tasks);
   }catch{ /* leave the feed as-is */ }
 }
@@ -1438,7 +1442,7 @@ async function refreshKanbanPanel(panel){
     if(dr && dr.ok){
       try{ const dj = await dr.json(); kbDiffstats = dj.diffstats || {}; kbStaged = dj.staged || {}; kbPrs = dj.prs || {}; kbLanding = dj.landing || []; kbFinalizing = dj.finalizing || []; }catch{ /* keep last */ }
     }
-    if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; }catch{ /* keep last */ } }
+    if(lr && lr.ok){ try{ const lj = await lr.json(); kbEdges = lj.edges || []; kbReviews = lj.reviews || {}; kbReviewing = lj.reviewing || []; kbReviewingAge = lj.reviewing_age || {}; }catch{ /* keep last */ } }
     kbFixInFlight = kbComputeFixInFlight(j.tasks || []);   // needs kbEdges (just set)
     { const lw = kbComputeLinkedWork(j.tasks || []); kbFixedBy = lw.fixedBy; kbIntegratedBy = lw.integratedBy; }
     if((j.tasks || []).some(t => t.status === "running")) await kbRefreshSeat();

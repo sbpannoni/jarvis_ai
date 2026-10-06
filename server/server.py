@@ -4292,11 +4292,11 @@ async def kanban_links() -> JSONResponse:
     reviewing = sorted(_REVIEWING)
     if now - _LINKS_CACHE["ts"] < _LINKS_TTL:
         return JSONResponse({"edges": _LINKS_CACHE["edges"], "reviews": _LINKS_CACHE["reviews"],
-                             "reviewing": reviewing, "cached": True})
+                             "reviewing": reviewing, "reviewing_age": _review_ages(), "cached": True})
     try:
         rc, out = await _kanban_ssh(f"{HERMES_VENV_PY} -c {shlex.quote(_LINKS_QUERY)}")
     except Exception as exc:
-        return JSONResponse({"edges": [], "reviews": {}, "reviewing": reviewing, "error": str(exc)},
+        return JSONResponse({"edges": [], "reviews": {}, "reviewing": reviewing, "reviewing_age": _review_ages(), "error": str(exc)},
                             status_code=502)
     edges = []
     reviews: dict = {}
@@ -4307,7 +4307,8 @@ async def kanban_links() -> JSONResponse:
         elif len(parts) == 3 and parts[0] == "R" and _TASK_ID_RE.match(parts[1]):
             reviews[parts[1]] = parts[2]
     _LINKS_CACHE.update(ts=now, edges=edges, reviews=reviews)
-    return JSONResponse({"edges": edges, "reviews": reviews, "reviewing": reviewing})
+    return JSONResponse({"edges": edges, "reviews": reviews, "reviewing": reviewing,
+                         "reviewing_age": _review_ages()})
 
 
 # ---------------------------------------------------- auto-archive merged
@@ -4551,6 +4552,129 @@ _REVIEW_TASKS: set = set()
 _REVIEWING: set = set()  # task_ids with a review in flight, for the board's live state
 
 
+REVIEW_JOBS_ROOT = "/ssdpool/agent-work/review-jobs"
+_REVIEW_STARTED: dict = {}          # task_id -> epoch the in-flight review started (for the board's age)
+_REVIEW_MAX_RUNTIME_S = 90 * 60     # a review normally takes 3-10 min; past this it is stuck
+_REVIEW_COOLDOWN_FAILS, _REVIEW_COOLDOWN_S = 2, 6 * 3600
+_REVIEW_FAIL_PREFIXES = ("Integration review could not produce a verdict", "Integration review timed out",
+                         "Integration review failed to run")
+
+
+async def _review_cooling_down(task_id: str) -> bool:
+    """True when auto-review should leave this card alone: its recent reviews keep failing to
+    produce a verdict. Without this the board, which asks again for any card with no verdict,
+    re-ran the same failing review forever."""
+    try:
+        d = await _kanban_api_get(f"/api/plugins/kanban/tasks/{quote(task_id)}")
+    except Exception:
+        return False
+    cutoff = time.time() - _REVIEW_COOLDOWN_S
+    fails = [c for c in (d.get("comments") or [])
+             if (c.get("body") or "").startswith(_REVIEW_FAIL_PREFIXES)
+             and isinstance(c.get("created_at"), (int, float)) and c["created_at"] >= cutoff]
+    return len(fails) >= _REVIEW_COOLDOWN_FAILS
+
+
+def _review_comment(model: str, result: dict | None, out: str) -> str:
+    if result and result.get("status") == "done":
+        regr = result.get("regressions") or []
+        return (f"Integration review ({model}) \u2192 {result.get('verdict')}\n\n"
+                f"Spec adherence: {result.get('spec_adherence', '')}\n"
+                f"Tests meaningful: {result.get('tests_meaningful')}\n"
+                + (("Regressions:\n" + "\n".join(f"- {r}" for r in regr) + "\n") if regr else "")
+                + f"\n{result.get('rationale', '')}")
+    return ("Integration review could not produce a verdict: "
+            + ((result or {}).get("error") or (out or "")[-800:] or "no output"))
+
+
+async def _launch_detached_review(task_id: str, review_cmd: str) -> str:
+    """Start the review on snarf in its own session with its streams in a job dir:
+    result.json (written last, atomically), exit, stderr.log, meta.json. Returns the job dir.
+    Only the job is backgrounded; setup is foreground (see _launch_detached_apply for why)."""
+    stamp = f"{int(time.time())}-{os.urandom(3).hex()}"
+    jd = f"{REVIEW_JOBS_ROOT}/{task_id}-{stamp}"
+    meta = json.dumps({"task_id": task_id, "started": int(time.time())})
+    inner = (f"{review_cmd} > {shlex.quote(jd)}/result.tmp 2> {shlex.quote(jd)}/stderr.log; "
+             f"echo $? > {shlex.quote(jd)}/exit; mv {shlex.quote(jd)}/result.tmp {shlex.quote(jd)}/result.json")
+    cmd = (f"mkdir -p {shlex.quote(jd)} && printf %s {shlex.quote(meta)} > {shlex.quote(jd)}/meta.json && "
+           f"{{ setsid nohup sh -c {shlex.quote(inner)} < /dev/null > /dev/null 2>&1 & }} && echo launched")
+    rc, out = await _fleet_ssh("snarf", cmd)
+    if rc != 0 or "launched" not in (out or ""):
+        raise RuntimeError(f"launch failed (rc={rc}): {(out or '')[-300:]}")
+    return jd
+
+
+def _spawn_review_poller(task_id: str, model: str, job_dir: str, started: float) -> None:
+    """Own the review from here: poll the job dir, post the verdict comment exactly once, and
+    clear the board's 'assessing' state. A job past _REVIEW_MAX_RUNTIME_S is killed and
+    reported, so nothing can sit 'in progress' indefinitely."""
+    _REVIEWING.add(task_id)
+    _REVIEW_STARTED[task_id] = started
+
+    async def _job() -> None:
+        q = shlex.quote
+        try:
+            while True:
+                rc, out = await _fleet_ssh(
+                    "snarf", f"cd {q(job_dir)} 2>/dev/null && [ -f posted ] && echo POSTED; "
+                             f"cd {q(job_dir)} 2>/dev/null && [ -f exit ] && echo EXIT=$(cat exit) && cat result.json 2>/dev/null; true")
+                if "POSTED" in (out or ""):
+                    return
+                if "EXIT=" in (out or ""):
+                    body = out.split("EXIT=", 1)[1].split("\n", 1)
+                    result = _extract_json(body[1]) if len(body) > 1 else None
+                    comment = _review_comment(model, result, body[1] if len(body) > 1 else "")
+                    await _kanban_ssh(f"hermes kanban comment {q(task_id)} {q(comment[:4000])}")
+                    await _fleet_ssh("snarf", f"touch {q(job_dir)}/posted")
+                    return
+                if time.time() - started > _REVIEW_MAX_RUNTIME_S:
+                    await _fleet_ssh("snarf", f"pkill -f '[d]ispatch_integration_review_task.*--branch-name hermes/{task_id}' ; true")
+                    await _kanban_ssh(f"hermes kanban comment {q(task_id)} " + q(
+                        f"Integration review timed out after {int(_REVIEW_MAX_RUNTIME_S / 60)} min and was stopped."))
+                    await _fleet_ssh("snarf", f"touch {q(job_dir)}/posted")
+                    return
+                await asyncio.sleep(20)
+        except Exception as exc:  # noqa: BLE001 -- leave the job unposted; the next start adopts it
+            print(f"[review-poller] {task_id}: {exc!r}", flush=True)
+        finally:
+            _REVIEWING.discard(task_id)
+            _REVIEW_STARTED.pop(task_id, None)
+    t = asyncio.get_running_loop().create_task(_job())
+    _REVIEW_TASKS.add(t)
+    t.add_done_callback(_REVIEW_TASKS.discard)
+
+
+async def _adopt_review_jobs() -> None:
+    """On startup, pick up reviews launched before a restart: the job kept running on snarf and its
+    verdict is still unposted. Jobs older than the runtime cap are closed out, not resumed."""
+    try:
+        rc, out = await _fleet_ssh(
+            "snarf", f"for d in {REVIEW_JOBS_ROOT}/*/; do [ -f \"$d/posted\" ] || echo \"$d$(cat $d/meta.json 2>/dev/null)\"; done; true")
+        for line in (out or "").splitlines():
+            m = re.match(r"(\S+/)(\{.*\})$", line.strip())
+            if not m:
+                continue
+            jd, meta = m.group(1).rstrip("/"), json.loads(m.group(2))
+            tid, started = meta.get("task_id", ""), float(meta.get("started") or 0)
+            if not _TASK_ID_RE.match(tid):
+                continue
+            if time.time() - started > 6 * 3600:
+                await _fleet_ssh("snarf", f"touch {shlex.quote(jd)}/posted")   # stale: close it out
+                continue
+            rc2, model_out = await _fleet_ssh("snarf", f"cat {shlex.quote(MODEL_ROLE_ASSIGNMENTS_PATH)}")
+            model = (json.loads(model_out).get("reviewer") if rc2 == 0 else None) or "reviewer"
+            _spawn_review_poller(tid, model, jd, started)
+            print(f"[review-adopt] resumed {tid} from {jd}", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[review-adopt] {exc!r}", flush=True)
+
+
+def _review_ages() -> dict:
+    """Seconds each in-flight review has been running, so a stuck one is visible on the board."""
+    now = time.time()
+    return {t: int(now - _REVIEW_STARTED[t]) for t in _REVIEWING if t in _REVIEW_STARTED}
+
+
 @app.post("/api/darkhelix/request-review")
 async def darkhelix_request_review(request: Request) -> JSONResponse:
     """The semantic gate: an agentic review of a DONE card's whole diff against
@@ -4588,41 +4712,24 @@ async def darkhelix_request_review(request: Request) -> JSONResponse:
         f"--base-ref origin/master --model {shlex.quote(model)} "
         f"--spec {shlex.quote(spec[:8000])}"
     )
-    # The reviewer model is a multi-minute llama.cpp generation (plus a possible
-    # seat swap), well past any HTTP window -- and a blocking call would orphan
-    # the run on client disconnect. So fire it in the background (same shape as
-    # land-auto) and land the verdict as a card comment; the button only reports
-    # that review STARTED.
-    async def _run() -> None:
-        try:
-            rc, out = await _fleet_ssh("snarf", cmd)
-            result = _extract_json(out)
-            if result and result.get("status") == "done":
-                regr = result.get("regressions") or []
-                comment = (
-                    f"Integration review ({model}) → {result.get('verdict')}\n\n"
-                    f"Spec adherence: {result.get('spec_adherence', '')}\n"
-                    f"Tests meaningful: {result.get('tests_meaningful')}\n"
-                    + (("Regressions:\n" + "\n".join(f"- {r}" for r in regr) + "\n") if regr else "")
-                    + f"\n{result.get('rationale', '')}"
-                )
-            else:
-                comment = ("Integration review could not produce a verdict: "
-                           + ((result or {}).get("error") or out[-800:]))
-            await _kanban_ssh(f"hermes kanban comment {shlex.quote(task_id)} {shlex.quote(comment[:4000])}")
-        except Exception as exc:
-            try:
-                await _kanban_ssh(f"hermes kanban comment {shlex.quote(task_id)} "
-                                  f"{shlex.quote('Integration review failed to run: ' + str(exc)[:500])}")
-            except Exception:
-                pass
-        finally:
-            _REVIEW_TASKS.discard(asyncio.current_task())
-            _REVIEWING.discard(task_id)
-
-    _REVIEWING.add(task_id)
-    t = asyncio.get_running_loop().create_task(_run())
-    _REVIEW_TASKS.add(t)
+    # A review is a multi-minute model call. It runs DETACHED on snarf (result written to a job
+    # dir) and a poller posts the verdict, so a HUD restart cannot lose it and a hang is bounded.
+    # Before: one long SSH call from a task inside this process. A restart killed the task, so
+    # the verdict was never posted, the card stayed un-reviewed, and the board asked again.
+    auto = bool(payload.get("auto"))
+    if task_id in _REVIEWING:   # also stops two clients starting two reviews of one card
+        return JSONResponse({"ok": True, "started": False, "already_running": True,
+                             "task_id": task_id, "model": model})
+    if auto and await _review_cooling_down(task_id):
+        return JSONResponse({"ok": False, "cooldown": True, "task_id": task_id,
+                             "error": f"{_REVIEW_COOLDOWN_FAILS} reviews of this card failed to produce a verdict "
+                                      f"in the last {_REVIEW_COOLDOWN_S // 3600}h; auto-review is paused for it. "
+                                      "Click Review to retry."})
+    try:
+        job_dir = await _launch_detached_review(task_id, cmd)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"could not launch review: {exc}"}, status_code=502)
+    _spawn_review_poller(task_id, model, job_dir, time.time())
     return JSONResponse({"ok": True, "started": True, "task_id": task_id, "model": model})
 
 
@@ -10695,6 +10802,7 @@ async def start_activity_feed() -> None:
     asyncio.get_running_loop().create_task(_poll_pool_manifest_forever())
     asyncio.get_running_loop().create_task(_poll_enforce_blocks_forever())
     asyncio.get_running_loop().create_task(_sweep_trackers_reap_stale())
+    asyncio.get_running_loop().create_task(_adopt_review_jobs())
 
 
 async def _poll_rack_hosts_forever() -> None:
