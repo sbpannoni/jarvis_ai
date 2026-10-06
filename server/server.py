@@ -8664,6 +8664,208 @@ async def darkhelix_land_applied(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "started": True, "task_id": task_id, "branch": spec["branch"]})
 
 
+# ------------------------------------------------------------ [Dependency] --
+# Work that needs a package or a database the project does not have yet. The engine gate runs
+# the project's own .venv-dev (a read-only mount, so a worker cannot pip install), and the
+# databases under database/ are downloads. Neither is something an unattended card may change,
+# so this is a human-gated card type, never auto-approved and never auto-landed:
+#   request  -> dry-runs the pip resolve on snarf and files a [Dependency] card in `blocked`
+#               (nothing drains it), listing exactly what would be installed or changed
+#   install  -> the Install button: freeze backup, pip install into .venv-dev, pip check,
+#               comment the result, archive. A resolve that would CHANGE a package already
+#               present is refused unless the click says allow_change.
+#   done     -> for a database-only card: you did the download, retire the card.
+# The venv is .venv-dev (--system-site-packages over the conda env), never the conda env itself:
+# that one is exported to end users, so a package belongs there only by a reviewed environment.yml
+# change. The card says which of the two a package still needs.
+_DEP_SPEC_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,_-]+\])?"
+    r"((==|>=|<=|~=|!=|<|>)[A-Za-z0-9.*+!-]+(,(==|>=|<=|~=|!=|<|>)[A-Za-z0-9.*+!-]+)*)?$")
+_DEP_PY = f"{DARKHELIX_REPO_PATH}/.venv-dev/bin/python"
+_DEP_BACKUPS = "/ssdpool/agent-work/venv-backups"
+_DEP_INSTALLING: set[str] = set()
+
+
+async def _dep_resolve(specs: list[str]) -> dict:
+    """Dry-run the install: {'new': [name==ver], 'changed': [name old->new], 'error': str|None}."""
+    q = " ".join(shlex.quote(s) for s in specs)
+    rc, out = await _fleet_ssh(
+        "snarf", f"cd {shlex.quote(DARKHELIX_REPO_PATH)} && {_DEP_PY} -m pip install --dry-run --quiet "
+                 f"--disable-pip-version-check --report - {q} 2>/tmp/dep-resolve.err; echo \"rc=$?\"; "
+                 f"tail -c 600 /tmp/dep-resolve.err")
+    m = re.search(r"\nrc=(\d+)\n", "\n" + out)
+    start = out.find("{")
+    if not m or m.group(1) != "0" or start < 0:
+        return {"new": [], "changed": [], "error": out[-600:] or "pip could not resolve these packages"}
+    try:
+        report, _ = json.JSONDecoder().raw_decode(out[start:])
+    except ValueError:
+        return {"new": [], "changed": [], "error": "unparseable pip report"}
+    rc, listing = await _fleet_ssh("snarf", f"{_DEP_PY} -m pip list --format=json --disable-pip-version-check")
+    try:
+        have = {p["name"].lower().replace("_", "-"): p["version"] for p in json.loads(listing[listing.find("["):])}
+    except ValueError:
+        have = {}
+    new, changed = [], []
+    for it in report.get("install") or []:
+        md = it.get("metadata") or {}
+        name, ver = md.get("name", "?"), md.get("version", "?")
+        old = have.get(name.lower().replace("_", "-"))
+        if old is None:
+            new.append(f"{name}=={ver}")
+        elif old != ver:
+            changed.append(f"{name} {old} -> {ver}")
+    return {"new": new, "changed": changed, "error": None}
+
+
+def _dep_card_fields(body: str) -> dict:
+    g = lambda k: (re.search(rf"^{k}: (.+)$", body, re.MULTILINE) or [None, ""])[1].strip()  # noqa: E731
+    return {"packages": [p.strip() for p in g("Packages").split(",") if p.strip()],
+            "databases": g("Databases")}
+
+
+@app.post("/api/dependency/request")
+async def dependency_request(request: Request) -> JSONResponse:
+    """File a [Dependency] card. Body: {packages: ["pkg>=1"], databases: ["name: how to get it"],
+    reason, needed_by (card id, optional)}. The pip resolve is dry-run here so the card shows what
+    Install would do before anyone clicks it."""
+    p = await request.json()
+    specs = [s.strip() for s in (p.get("packages") or []) if str(s).strip()]
+    dbs = [str(d).strip() for d in (p.get("databases") or []) if str(d).strip()]
+    reason = (p.get("reason") or "").strip()
+    needed_by = (p.get("needed_by") or "").strip()
+    if not specs and not dbs:
+        return JSONResponse({"ok": False, "error": "name at least one package or database"}, status_code=400)
+    bad = [s for s in specs if not _DEP_SPEC_RE.match(s)]
+    if bad:
+        return JSONResponse({"ok": False, "error": f"not a plain pip requirement (name and optional version only): {bad}"},
+                            status_code=400)
+    if needed_by and not _TASK_ID_RE.match(needed_by):
+        return JSONResponse({"ok": False, "error": "bad needed_by task id"}, status_code=400)
+    res = await _dep_resolve(specs) if specs else {"new": [], "changed": [], "error": None}
+    lines = [f"Needed: {reason or '(no reason given)'}"]
+    if needed_by:
+        lines.append(f"Needed by: {needed_by}")
+    if specs:
+        lines.append(f"Packages: {', '.join(specs)}")
+    if dbs:
+        lines.append(f"Databases: {'; '.join(dbs)}")
+    lines.append("")
+    if specs:
+        if res["error"]:
+            lines.append(f"Dry run FAILED -- pip cannot resolve this: {res['error']}")
+        else:
+            lines.append("Dry run (into .venv-dev, nothing installed yet): would add "
+                         + (", ".join(res["new"]) or "nothing new"))
+            if res["changed"]:
+                lines.append("WOULD CHANGE packages already present: " + "; ".join(res["changed"])
+                             + ". Install refuses this unless you confirm.")
+        lines.append("Install puts it in .venv-dev only (what the gate and workers run). The pipeline's own "
+                     "conda env, and so end users, get it only through a reviewed environment.yml change; "
+                     "declare it in the PR that uses it.")
+    if dbs:
+        lines.append("Databases are not installed by this card: do the download on snarf, then press Done.")
+    title = "[Dependency] " + ", ".join((specs + dbs))[:90]
+    key = "dep-" + hashlib.sha1("|".join(sorted(specs + dbs)).encode()).hexdigest()[:12]
+    rc, out = await _kanban_ssh(
+        f"hermes kanban create {shlex.quote(title)} --body {shlex.quote(chr(10).join(lines))} "
+        f"--workspace scratch --initial-status blocked --idempotency-key {shlex.quote(key)} "
+        "--created-by looking-glass --json")
+    if rc != 0:
+        return JSONResponse({"ok": False, "error": out[-800:]}, status_code=502)
+    try:
+        cid = json.loads(out.strip()).get("id")
+    except ValueError:
+        cid = None
+    return JSONResponse({"ok": True, "task_id": cid, "resolve": res})
+
+
+async def _dep_card(task_id: str) -> tuple[dict | None, str | None]:
+    d = await _card_links(task_id)
+    t = d["task"]
+    if not t:
+        return None, "card not found"
+    if not (t.get("title") or "").startswith("[Dependency]"):
+        return None, "not a [Dependency] card"
+    if t.get("status") != "blocked":
+        return None, f"card is {t.get('status')}, expected blocked"
+    return t, None
+
+
+async def _dep_close(task_id: str, msg: str) -> None:
+    await asyncio.to_thread(
+        _kanban_api_call, "POST", f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+        json={"author": "looking-glass", "body": msg[:3500]})
+    await _kanban_ssh(f"hermes kanban archive {shlex.quote(task_id)}")
+
+
+@app.post("/api/dependency/install")
+async def dependency_install(request: Request) -> JSONResponse:
+    p = await request.json()
+    task_id = (p.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    if task_id in _DEP_INSTALLING:
+        return JSONResponse({"ok": False, "error": "already installing this card"}, status_code=409)
+    t, err = await _dep_card(task_id)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=409)
+    specs = _dep_card_fields(t.get("body") or "")["packages"]
+    if not specs or any(not _DEP_SPEC_RE.match(s) for s in specs):
+        return JSONResponse({"ok": False, "error": "no installable packages on this card (databases: use Done)"},
+                            status_code=409)
+    _DEP_INSTALLING.add(task_id)
+    try:
+        res = await _dep_resolve(specs)
+        if res["error"]:
+            return JSONResponse({"ok": False, "error": "pip cannot resolve: " + res["error"]}, status_code=409)
+        if res["changed"] and not p.get("allow_change"):
+            return JSONResponse({"ok": False, "needs_confirm": True, "changed": res["changed"],
+                                 "error": "would change packages already present: " + "; ".join(res["changed"])},
+                                status_code=409)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        backup = f"{_DEP_BACKUPS}/freeze-{stamp}-{task_id}.txt"
+        q = " ".join(shlex.quote(s) for s in specs)
+        pre = f"{_DEP_BACKUPS}/check-{stamp}-{task_id}.txt"
+        rc, out = await _fleet_ssh(
+            "snarf", f"mkdir -p {_DEP_BACKUPS} && {_DEP_PY} -m pip freeze --disable-pip-version-check > {backup} && "
+                     f"{_DEP_PY} -m pip check > {pre} 2>&1; "
+                     f"{_DEP_PY} -m pip install --disable-pip-version-check {q} > /tmp/dep-install.log 2>&1; "
+                     f"echo \"rc=$?\"; tail -n 3 /tmp/dep-install.log; echo ==CHECK==; "
+                     f"{_DEP_PY} -m pip check 2>&1 | grep -vxFf {pre}")
+        m = re.search(r"rc=(\d+)", out)
+        ok = bool(m) and m.group(1) == "0"
+        # Only conflicts the install INTRODUCED: pip check also reports problems that were already there.
+        check = out.split("==CHECK==", 1)[1].strip() if "==CHECK==" in out else ""
+        if not ok:
+            await asyncio.to_thread(
+                _kanban_api_call, "POST", f"/api/plugins/kanban/tasks/{quote(task_id)}/comments",
+                json={"author": "looking-glass", "body": f"Install FAILED. The pre-install freeze is {backup}.\n{out[-1200:]}"})
+            return JSONResponse({"ok": False, "error": out[-800:]}, status_code=502)
+        names = " ".join(n.split("==")[0] for n in res["new"])
+        await _dep_close(task_id, f"Installed into .venv-dev: {', '.join(res['new']) or 'already satisfied'}. "
+                                   f"New dependency conflicts (pip check, ignoring ones already present): "
+                                   f"{check or 'none'}. Rollback on snarf: .venv-dev/bin/python -m pip uninstall -y {names} "
+                                   f"(full pre-install freeze: {backup}).")
+        return JSONResponse({"ok": True, "installed": res["new"], "pip_check": check, "backup": backup})
+    finally:
+        _DEP_INSTALLING.discard(task_id)
+
+
+@app.post("/api/dependency/done")
+async def dependency_done(request: Request) -> JSONResponse:
+    """Retire a [Dependency] card whose database (or manual install) a human has now done."""
+    p = await request.json()
+    task_id = (p.get("task_id") or "").strip()
+    if not _TASK_ID_RE.match(task_id):
+        return JSONResponse({"ok": False, "error": "bad task id"}, status_code=400)
+    t, err = await _dep_card(task_id)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=409)
+    await _dep_close(task_id, "Marked done by a human: the dependency is in place.")
+    return JSONResponse({"ok": True})
+
+
 @app.post("/api/darkhelix/land-auto")
 async def darkhelix_land_auto(request: Request) -> JSONResponse:
     """The manual trigger: land THIS card the same way the background poller

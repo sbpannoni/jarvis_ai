@@ -690,6 +690,7 @@ footer{
 .kb-chip.kb-chain.review{color:var(--magenta); border-color:var(--magenta)}
 .kb-chip.kb-chain.fix{color:var(--amber); border-color:#7a5a1a}
 .kb-chip.kb-chain.applied{color:var(--green,#6e6); border-color:#2f7a3a}
+.kb-chip.kb-chain.dependency{color:var(--amber,#fb4); border-color:#8a6a1a}
 /* "Did it write code?" on a done card. no-diff is the one worth noticing, so it
    gets the alert colour; a real diff is quiet confirmation. */
 .kb-chip.kb-nodiff{color:var(--red, #f87171); border-color:#7a2f2f; font-variant-numeric:tabular-nums}

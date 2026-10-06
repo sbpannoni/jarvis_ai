@@ -264,6 +264,7 @@ function kbChainKind(t){
   const title = t.title || "";
   if(title.startsWith("[Review] ")) return {kind: "review", rest: title.slice(9)};
   if(title.startsWith("[Applied Fix] ")) return {kind: "applied", rest: title.slice(14)};
+  if(title.startsWith("[Dependency] ")) return {kind: "dependency", rest: title.slice(13)};
   if(title.startsWith("[Fix] ")){
     const rest = title.slice(6);
     const m = rest.match(/^(.*) \(attempt (\d+)\)$/);
@@ -276,6 +277,8 @@ function kbChainChip(c){
   if(!c) return "";
   if(c.kind === "applied")
     return `<span class="kb-chip kb-chain applied" title="The reviewer already applied this fix on its own branch: it passed the engine test gate and closure review. Not merged. Read the diff, then land the branch or discard it (commands are on the card).">APPLIED</span>`;
+  if(c.kind === "dependency")
+    return `<span class="kb-chip kb-chain dependency" title="A package or database the work needs. Never auto-approved or auto-landed: Install puts the packages in the project's dev venv (dry-run result is on the card); databases are a manual download, then Done.">DEPENDENCY</span>`;
   return c.kind === "review"
     ? `<span class="kb-chip kb-chain review" title="Review-chain review card: findings only, filed to triage. Never edits code">REVIEW</span>`
     : `<span class="kb-chip kb-chain fix" title="Review-chain fix card: dispatchable, the editor works it unsupervised once it is ready. Process it after it finishes to run the gates + closure review">FIX${c.attempt > 1 ? " #" + c.attempt : ""}</span>`;
@@ -558,7 +561,13 @@ function kbCardInner(t, opts){
     // Unblock retries the work. A blocked card can also be waiting on a DECISION (a
     // [Decision] card) or on land-or-discard ([Applied Fix]); for those there was no way
     // to say "no", so the card could only be unblocked into work nobody wanted.
-    ? ((chain && chain.kind === "applied")
+    ? ((chain && chain.kind === "dependency")
+        // Unblock would dispatch a worker at an install it cannot do (the gate venv is read-only to workers).
+        ? `<button class="btn kb-card-btn kb-primary" data-action="dep-install" data-id="${kanbanEsc(t.id)}"
+             title="pip install the packages listed on the card into the project's .venv-dev (freeze backup first, pip check after). Refuses if it would change a package already present, unless you confirm.">Install</button>
+           <button class="btn kb-card-btn" data-action="dep-done" data-id="${kanbanEsc(t.id)}"
+             title="You did the install or database download yourself: retire this card.">Done</button>`
+        : (chain && chain.kind === "applied")
         // Unblock would dispatch a worker to redo finished work; an applied fix is landed or discarded.
         ? `<button class="btn kb-card-btn kb-primary kb-land" data-action="land-applied" data-id="${kanbanEsc(t.id)}"
              title="Cherry-pick this fix onto current master, open a PR, wait for CI and squash-merge if green. The push runs the full test suite and lint first.">Land</button>`
@@ -1020,6 +1029,30 @@ async function kbLandApplied(panel, btn){
     btn.textContent = "landing → PR + CI…";
     btn.title = "Pushing (runs tests + lint), then PR, then CI, then squash-merge. A comment on the card shows each step; the card archives itself when it merges.";
   }catch(err){ btn.disabled = false; btn.textContent = "land failed — retry"; btn.title = err.message; }
+}
+
+/* [Dependency] card: Install runs pip into the project's dev venv on snarf; Done retires a card whose
+   database/manual install a human has finished. Install refuses to change a package already present
+   unless the answer to the second prompt is yes. */
+async function kbDependency(panel, btn){
+  const install = btn.dataset.action === "dep-install";
+  if(install && !confirm("Install the packages on this card into DARKHELIX's .venv-dev?\n\nA freeze backup is written first and pip check runs after. This changes the environment the test gate and workers use.")) return;
+  const call = async allow => {
+    const r = await fetch(install ? "/api/dependency/install" : "/api/dependency/done", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({task_id: btn.dataset.id, allow_change: allow}),
+    });
+    return [r.status, await r.json()];
+  };
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = install ? "installing…" : "…";
+  try{
+    let [st, j] = await call(false);
+    if(!j.ok && j.needs_confirm && confirm("This would CHANGE packages already present:\n\n" + j.changed.join("\n") + "\n\nInstall anyway?"))
+      [st, j] = await call(true);
+    if(!j.ok){ btn.disabled = false; btn.textContent = label; btn.title = j.error || ""; alert(j.error || "failed"); return; }
+    btn.textContent = install ? "installed ✓" : "done ✓";
+  }catch(err){ btn.disabled = false; btn.textContent = label; alert(err.message); }
 }
 
 async function kbLandCard(panel, btn){
@@ -1513,6 +1546,7 @@ function openKanbanBoard(){
         if(btn.dataset.action === "process-fix"){ kbProcessFix(panel, btn); return; }
         if(btn.dataset.action === "land"){ kbLandCard(panel, btn); return; }
         if(btn.dataset.action === "land-applied"){ kbLandApplied(panel, btn); return; }
+        if(btn.dataset.action === "dep-install" || btn.dataset.action === "dep-done"){ kbDependency(panel, btn); return; }
         if(btn.dataset.action === "promote-refs"){ kbPromoteRefs(panel, btn); return; }
         if(btn.dataset.action === "integrate"){ kbAgenticIntegrate(panel, btn); return; }
         if(btn.dataset.action === "archive-family"){ kbArchiveFamily(panel, btn); return; }
