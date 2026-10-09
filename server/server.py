@@ -1998,11 +1998,29 @@ MODEL_ROLE_LIVE = {"editor", "orchestrator", "reviewer"}
 # that actually WORKS kanban cards (kanban_worker), and the gateway default that
 # the voice/chat brain and un-pinned agents inherit (brain). Both are driven via
 # `hermes config set` on CT111 -- the vendor's own safe writer, no YAML hand-edit.
-KANBAN_WORKER_PROFILE = "darkhelix"
+# The kanban_worker seat is NOT one profile. Cards are worked by whichever
+# profile they are assigned to (coder, bioinformatics, darkhelix, ...), and each
+# profile carries its own model.default in ~/.hermes/profiles/<p>/config.yaml.
+# This used to set only a hardcoded `darkhelix`, so the map claimed a selection
+# that most profiles ignored -- the seat then ping-ponged between that model and
+# the engine's (2026-10-07: bioinformatics on qwen, coder + the engine on
+# deepseek, every swap killing an in-flight aider call). The profiles are now
+# discovered on CT111 at call time; hermes.seat_exclude_profiles in server.yaml
+# lists any that must NOT follow the map.
+HERMES_PROFILES_DIR = "/root/.hermes/profiles"
 EXTRA_SEAT_SETTERS = {
-    "kanban_worker": f"hermes -p {KANBAN_WORKER_PROFILE} config set model.default {{m}}",
     "brain": "hermes config set model.default {m}",
 }
+
+
+async def _hermes_worker_profiles() -> list[str]:
+    """Profiles on CT111 that follow the kanban_worker seat."""
+    rc, out = await _fleet_ssh("hermes", f"ls -1 {HERMES_PROFILES_DIR}")
+    if rc != 0:
+        raise RuntimeError(f"ls profiles exited {rc}: {out[-300:]}")
+    skip = set(((CFG.get("hermes") or {}).get("seat_exclude_profiles")) or [])
+    return [n for n in out.split() if re.fullmatch(r"[A-Za-z0-9_-]+", n) and n not in skip]
+
 
 HERMES_CONFIG_PATH = "/root/.hermes/config.yaml"
 HERMES_VENV_PY = "/usr/local/lib/hermes-agent/venv/bin/python3"
@@ -2148,9 +2166,23 @@ async def model_role_assignments() -> JSONResponse:
     def _last(s):
         return (s or "").strip().splitlines()[-1].strip() if (s or "").strip() else ""
     try:
-        rc_w, out_w = await _fleet_ssh("hermes", f"hermes -p {KANBAN_WORKER_PROFILE} config get model.default")
-        if rc_w == 0 and _last(out_w):
-            assignments["kanban_worker"] = _last(out_w)
+        profiles = await _hermes_worker_profiles()
+        got = await asyncio.gather(*[
+            _fleet_ssh("hermes", f"hermes -p {shlex.quote(pn)} config get model.default")
+            for pn in profiles], return_exceptions=True)
+        per = {}
+        for pn, res in zip(profiles, got):
+            if isinstance(res, Exception) or res[0] != 0 or not _last(res[1]):
+                per[pn] = None
+            else:
+                per[pn] = _last(res[1])
+        seen = [m for m in per.values() if m]
+        if seen:
+            # Majority value is what the dropdown shows; any disagreement is
+            # reported so the UI can say which profiles are NOT on it.
+            assignments["kanban_worker"] = max(set(seen), key=seen.count)
+            if len(set(per.values())) > 1:
+                assignments["_kanban_worker_profiles"] = per
     except Exception as exc:
         assignments["_kanban_worker_error"] = str(exc)
     try:
@@ -2190,6 +2222,18 @@ async def model_role_assignments() -> JSONResponse:
                 "backend": info.get("backend"), "loaded": bool(info.get("loaded")),
                 "in_seat_catalog": True,
             })
+    # transit_map.visible_models in server.yaml narrows the dropdowns to models
+    # something actually uses. Whatever is currently assigned to a role or a
+    # profile always stays listed, so a dropdown can never show a blank for a
+    # model that is really in effect. Unset = show everything (old behaviour).
+    visible = (CFG.get("transit_map") or {}).get("visible_models")
+    if visible:
+        keep = set(visible) | {v for k, v in assignments.items()
+                               if isinstance(v, str) and not k.startswith("_")}
+        for per in (assignments.get("_kanban_worker_profiles") or {}).values():
+            if per:
+                keep.add(per)
+        roster = [e for e in roster if e["id"] in keep]
     return JSONResponse({
         "assignments": assignments,
         "live_roles": sorted(MODEL_ROLE_LIVE),
@@ -2229,6 +2273,27 @@ async def set_model_role_assignment(request: Request) -> JSONResponse:
     # Extra seats (kanban_worker, brain): set via `hermes config set` on CT111.
     # Validate against what can actually be seated (roster or seat catalog) rather
     # than the coder roster only, since these aren't coder-engine roles.
+    if role == "kanban_worker":
+        seat = await _model_seat_catalog()
+        if model not in _CODER_ROSTER_BY_ID and not (seat and model in seat):
+            return JSONResponse({"ok": False, "error": f"unknown model id {model!r}"}, status_code=400)
+        try:
+            profiles = await _hermes_worker_profiles()
+            results = await asyncio.gather(*[
+                _fleet_ssh("hermes", f"hermes -p {shlex.quote(pn)} config set model.default {shlex.quote(model)}")
+                for pn in profiles], return_exceptions=True)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        failed = {pn: (str(r) if isinstance(r, Exception) else r[1][-200:])
+                  for pn, r in zip(profiles, results)
+                  if isinstance(r, Exception) or r[0] != 0}
+        if failed:
+            return JSONResponse({"ok": False, "error": f"not applied to: {failed}",
+                                 "applied": [pn for pn in profiles if pn not in failed]},
+                                status_code=502)
+        return JSONResponse({"ok": True, "assignments": {role: model}, "profiles": profiles,
+                             "live_roles": sorted(MODEL_ROLE_LIVE)})
+
     if role in EXTRA_SEAT_SETTERS:
         seat = await _model_seat_catalog()
         if model not in _CODER_ROSTER_BY_ID and not (seat and model in seat):

@@ -411,16 +411,26 @@ function transitRoleBar(roleData){
       ${(key === "editor" || key === "reviewer") ? transitTuningControl(assignments[key], tuning[assignments[key]]) : ""}
     </div>`;
   const ad = !!roleData.auto_dispatch;
+  // KANBAN WORKER applies to every Hermes profile, not one. If they disagree
+  // (an old per-profile edit, or a profile added later), say which and by how
+  // much instead of showing the majority as if it were the whole story.
+  const mixed = assignments._kanban_worker_profiles;
+  const mixedNote = mixed
+    ? `<div class="tm-seat-warning">⚠ profiles are NOT all on the KANBAN WORKER model: ${
+        Object.entries(mixed).map(([p, m]) => `${p}=${m || "unreadable"}`).join(", ")
+      } — choose a model above to set them all.</div>`
+    : "";
   return `
     <div class="tm-role-group"><div class="tm-role-grouplab">CODER ENGINE (snarf pipeline)</div>
       <div class="tm-role-bar">${engineRoles.map(r => roleItem(r, false)).join("")}</div></div>
-    <div class="tm-role-group"><div class="tm-role-grouplab">HERMES AGENTS (CT111) · share the one GPU seat</div>
+    <div class="tm-role-group"><div class="tm-role-grouplab">HERMES AGENTS (CT111) · share the one GPU seat · KANBAN WORKER sets every profile</div>
       <div class="tm-role-bar">${agentSeats.map(r => roleItem(r, true)).join("")}
         <label class="tm-autodispatch" title="ON: the gateway auto-decomposer works review findings on its own (grabs the GPU seat). OFF: a finding waits in triage for you to dispatch it.">
           <input type="checkbox" class="tm-autodispatch-box"${ad ? " checked" : ""}> auto-dispatch findings
           <span class="tm-autodispatch-status"></span>
         </label>
       </div></div>
+  ${mixedNote}
   <div class="tm-seat-warning" hidden></div>`;
 }
 
@@ -621,7 +631,19 @@ function wireProcessFixCardTrigger(panel){
   });
 }
 
-async function renderTransitMap(panel){
+// A refresh rebuilds the whole pane with innerHTML. That snapped the scroll
+// position back to the top, collapsed the line sections and killed any open
+// <select> -- so a dropdown that sat below the fold could never be reached: by
+// the time you had scrolled to it, the next 30s refresh had moved or closed it.
+// Skip the rebuild while the person is working in the pane, and restore scroll
+// and open sections when it does run.
+const TM_IDLE_MS = 60000;
+function transitPaneBusy(panel){
+  return Date.now() - (panel._tmLastInteract || 0) < TM_IDLE_MS;
+}
+
+async function renderTransitMap(panel, force){
+  if (!force && transitPaneBusy(panel)) return;
   try{
     const [r, roleR, tuneR] = await Promise.all([
       fetch("/api/coder-transit-map"),
@@ -643,6 +665,10 @@ async function renderTransitMap(panel){
     const orchCards = transitAssignedFirst((j.orchestrator.models || []).map(transitOrchestratorCard),
       j.orchestrator.models, asg.orchestrator, roleData.roster);
 
+    if (!force && transitPaneBusy(panel)) return;   // they started interacting while we fetched
+    const keepTop = panel.scrollTop;
+    const keepOpen = [...panel.querySelectorAll("details.tm-line-section")].map(d => d.open);
+    const keepWrapLeft = (panel.querySelector(".tm-svg-wrap") || {}).scrollLeft || 0;
     panel.innerHTML = `
       <div class="flow-head-bar">CODER-ENGINE TRANSIT MAP — editor ${editorGen}, reviewer ${reviewGen}, orchestrator ${orchGen}</div>
       ${transitRoleBar(roleData)}
@@ -682,6 +708,10 @@ async function renderTransitMap(panel){
     wireRoleBar(panel, roleData.roster);
     wireReviewTrigger(panel);
     wireProcessFixCardTrigger(panel);
+    panel.querySelectorAll("details.tm-line-section").forEach((d, i) => { if (keepOpen[i]) d.open = true; });
+    const wrap = panel.querySelector(".tm-svg-wrap");
+    if (wrap) wrap.scrollLeft = keepWrapLeft;
+    panel.scrollTop = keepTop;
   }catch(err){
     panel.innerHTML = `<div class="kv"><span class="err">transit map unavailable: ${err.message}</span></div>`;
   }
@@ -692,7 +722,12 @@ function openCoderTransitMap(){
     panel.innerHTML = `<div class="kv"><span>loading…</span></div>`;
     panel.classList.add("flow-pane");
     panel.classList.add("tm-pane");   // scrollable: the transit content is taller than the panel
-    renderTransitMap(panel);
+    // Any pointer/keyboard/scroll activity in the pane pauses the 30s refresh
+    // (see transitPaneBusy), so an open dropdown or a half-typed field survives.
+    const touch = () => { panel._tmLastInteract = Date.now(); };
+    ["pointerdown", "keydown", "focusin", "change", "wheel", "touchstart"].forEach(
+      ev => panel.addEventListener(ev, touch, {passive: true, capture: true}));
+    renderTransitMap(panel, true);
     const iv = setInterval(()=>renderTransitMap(panel), 30000);
     tab.onBeforeClose = () => clearInterval(iv);
   });
